@@ -318,7 +318,6 @@ impl OutputStyle {
 
 struct LogWriter {
     file: Mutex<std::fs::File>,
-    format: LogFormat,
 }
 
 impl LogWriter {
@@ -395,8 +394,8 @@ fn main() {
     let mut active: HashMap<ConnKey, ConnInfo> = HashMap::new();
     let mut stats = Stats::default();
 
-    let log_writer = open_log_writer(&args, &domain_label);
-    let log_format = log_writer.as_ref().map(|w| w.format).unwrap_or(LogFormat::Auto);
+    let resolved_log_format = log_format_for_output(args.json, args.log_format);
+    let log_writer = open_log_writer(&args, &domain_label, resolved_log_format);
 
     let sqlite = if args.no_sqlite {
         None
@@ -500,7 +499,7 @@ fn main() {
                         None,
                         args.json,
                         style,
-                        log_format_for_output(args.json, log_format),
+                        resolved_log_format,
                         log_writer.as_ref(),
                         sqlite.as_ref(),
                     );
@@ -570,7 +569,7 @@ fn main() {
                         duration_ms,
                         args.json,
                         style,
-                        log_format_for_output(args.json, log_format),
+                        resolved_log_format,
                         log_writer.as_ref(),
                         sqlite.as_ref(),
                     );
@@ -1703,13 +1702,17 @@ fn strip_ansi(s: &str) -> String {
     out
 }
 
-fn open_log_writer(args: &MonitorArgs, domain_label: &str) -> Option<Arc<LogWriter>> {
+fn open_log_writer(
+    args: &MonitorArgs,
+    domain_label: &str,
+    resolved_format: LogFormat,
+) -> Option<Arc<LogWriter>> {
     let path = if let Some(file) = &args.log_file {
         Some(file.clone())
     } else if let Some(dir) = &args.log_dir {
         let _ = fs::create_dir_all(dir);
         let ts = now_rfc3339().replace(':', "");
-        let ext = match args.log_format {
+        let ext = match resolved_format {
             LogFormat::Json => "jsonl",
             _ => "log",
         };
@@ -1732,7 +1735,6 @@ fn open_log_writer(args: &MonitorArgs, domain_label: &str) -> Option<Arc<LogWrit
 
     Some(Arc::new(LogWriter {
         file: Mutex::new(file),
-        format: args.log_format,
     }))
 }
 
