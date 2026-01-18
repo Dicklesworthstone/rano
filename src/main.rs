@@ -1,5 +1,6 @@
 use libc;
 use rusqlite::{params, Connection};
+use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::CStr;
@@ -9,10 +10,16 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 static RUNNING: AtomicBool = AtomicBool::new(true);
+
+const SQLITE_QUEUE_CAPACITY: usize = 10_000;
+const SQLITE_BATCH_SIZE: usize = 200;
+const SQLITE_FLUSH_INTERVAL_MS: u64 = 1000;
+const SQLITE_DROP_WARN_INTERVAL_SECS: u64 = 10;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ColorMode {
@@ -41,7 +48,6 @@ enum Theme {
     Mono,
 }
 
-
 struct Cli {
     command: Option<Command>,
     monitor: MonitorArgs,
@@ -49,6 +55,13 @@ struct Cli {
 
 enum Command {
     Update(UpdateCommand),
+}
+
+#[derive(Clone, Debug)]
+struct ConfigPaths {
+    kv_path: Option<PathBuf>,
+    toml_path: Option<PathBuf>,
+    use_config: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -180,12 +193,49 @@ impl Provider {
     }
 }
 
+#[derive(Clone, Debug)]
+struct ProviderMatcher {
+    anthropic: Vec<String>,
+    openai: Vec<String>,
+    google: Vec<String>,
+}
+
+impl Default for ProviderMatcher {
+    fn default() -> Self {
+        Self {
+            anthropic: vec!["claude".to_string(), "anthropic".to_string()],
+            openai: vec!["codex".to_string(), "openai".to_string()],
+            google: vec!["gemini".to_string(), "google".to_string()],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderMode {
+    Merge,
+    Replace,
+}
+
+#[derive(Debug, Deserialize)]
+struct TomlConfig {
+    providers: Option<ProvidersConfig>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ProvidersConfig {
+    mode: Option<String>,
+    anthropic: Option<Vec<String>>,
+    openai: Option<Vec<String>>,
+    google: Option<Vec<String>>,
+}
+
 #[derive(Default)]
 struct Stats {
     connects: u64,
     closes: u64,
     active: u64,
     peak_active: u64,
+    sqlite_dropped: u64,
     per_ip: BTreeMap<IpAddr, u64>,
     per_domain: BTreeMap<String, u64>,
     per_pid: BTreeMap<u32, u64>,
@@ -198,6 +248,7 @@ struct Stats {
     duration_ms_samples: u64,
 }
 
+#[derive(Clone)]
 struct RunContext {
     run_id: String,
     start_ts: String,
@@ -328,6 +379,92 @@ impl LogWriter {
     }
 }
 
+#[derive(Clone, Debug)]
+struct SqliteEvent {
+    ts: String,
+    run_id: String,
+    event: String,
+    key: ConnKey,
+    pid: u32,
+    comm: String,
+    cmdline: String,
+    provider: Provider,
+    domain: Option<String>,
+    duration_ms: Option<u64>,
+}
+
+enum SqliteMsg {
+    Event(SqliteEvent),
+    Shutdown {
+        run_id: String,
+        connects: u64,
+        closes: u64,
+    },
+}
+
+struct DropState {
+    last_warn: SystemTime,
+    dropped_since_warn: u64,
+}
+
+struct SqliteWriter {
+    sender: SyncSender<SqliteMsg>,
+    handle: Option<std::thread::JoinHandle<()>>,
+    dropped_total: Arc<std::sync::atomic::AtomicU64>,
+    drop_state: Mutex<DropState>,
+    log_writer: Option<Arc<LogWriter>>,
+}
+
+impl SqliteWriter {
+    fn enqueue(&self, event: SqliteEvent) {
+        match self.sender.try_send(SqliteMsg::Event(event)) {
+            Ok(_) => {}
+            Err(TrySendError::Full(_)) => {
+                self.record_drop(1);
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                self.record_drop(1);
+            }
+        }
+    }
+
+    fn shutdown(mut self, run_id: String, connects: u64, closes: u64) -> u64 {
+        let _ = self
+            .sender
+            .send(SqliteMsg::Shutdown { run_id, connects, closes });
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+        self.dropped_total.load(Ordering::Relaxed)
+    }
+
+    fn record_drop(&self, count: u64) {
+        let total = self.dropped_total.fetch_add(count, Ordering::Relaxed) + count;
+        let mut state = match self.drop_state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.dropped_since_warn += count;
+        let now = SystemTime::now();
+        let warn_due = now
+            .duration_since(state.last_warn)
+            .map(|d| d >= Duration::from_secs(SQLITE_DROP_WARN_INTERVAL_SECS))
+            .unwrap_or(true);
+        if warn_due {
+            let msg = format!(
+                "warning: sqlite queue full, dropped {} events (total {})",
+                state.dropped_since_warn, total
+            );
+            eprintln!("{}", msg);
+            if let Some(writer) = self.log_writer.as_ref() {
+                writer.write_line(&msg);
+            }
+            state.last_warn = now;
+            state.dropped_since_warn = 0;
+        }
+    }
+}
+
 struct DnsCacheEntry {
     value: Option<String>,
     stored_at: SystemTime,
@@ -359,6 +496,10 @@ fn main() {
         args.patterns = default_patterns();
     }
 
+    let cli_args: Vec<String> = env::args().collect();
+    let config_paths = find_config_flag(&cli_args);
+    let (provider_matcher, mut config_notes) = load_provider_matcher(&config_paths);
+
     let color_enabled = resolve_color_mode(args.color);
     let style = OutputStyle {
         color: color_enabled,
@@ -373,11 +514,7 @@ fn main() {
     if args.no_dns && domain_mode == DomainMode::Ptr {
         domain_notes.push("PTR lookups disabled (--no-dns); domains will be unknown.".to_string());
     }
-    let domain_note = if domain_notes.is_empty() {
-        None
-    } else {
-        Some(domain_notes.join(" "))
-    };
+    domain_notes.append(&mut config_notes);
     let ptr_enabled = domain_mode == DomainMode::Ptr && !args.no_dns;
     let domain_label = if domain_mode == DomainMode::Pcap {
         "pcap"
@@ -397,24 +534,16 @@ fn main() {
     let resolved_log_format = log_format_for_output(args.json, args.log_format);
     let log_writer = open_log_writer(&args, &domain_label, resolved_log_format);
 
-    let sqlite = if args.no_sqlite {
-        None
-    } else {
-        let conn = Connection::open(&args.sqlite_path).ok();
-        conn.map(|c| Arc::new(Mutex::new(c)))
-    };
-
     let run_ctx = RunContext::new(&args, domain_label);
 
-    if let Some(conn) = sqlite.as_ref() {
-        if let Ok(mut c) = conn.lock() {
-            let _ = init_sqlite(&mut c);
-            let _ = insert_session(&mut c, &run_ctx);
-        }
-    }
+    let sqlite_writer = if args.no_sqlite {
+        None
+    } else {
+        start_sqlite_writer(&args.sqlite_path, run_ctx.clone(), log_writer.clone())
+    };
 
     if !args.no_banner {
-        banner(&args, domain_label, domain_note.as_deref(), style, &log_writer);
+        banner(&args, domain_label, &domain_notes, style, &log_writer);
     }
 
     let mut last_stats = SystemTime::now();
@@ -431,7 +560,7 @@ fn main() {
             collect_descendants(&roots)
         };
         let inode_to_pid = map_inodes(&targets);
-        let pid_meta = build_pid_meta_map(&targets);
+        let pid_meta = build_pid_meta_map(&targets, &provider_matcher);
 
         let mut seen_keys: HashSet<ConnKey> = HashSet::new();
         let entries = gather_net_entries(args.include_udp);
@@ -486,8 +615,24 @@ fn main() {
                 };
                 active.insert(key.clone(), info);
 
+                let ts = now_rfc3339();
+                if let Some(writer) = sqlite_writer.as_ref() {
+                    writer.enqueue(SqliteEvent {
+                        ts: ts.clone(),
+                        run_id: run_ctx.run_id.clone(),
+                        event: "connect".to_string(),
+                        key: key.clone(),
+                        pid,
+                        comm: meta.comm.clone(),
+                        cmdline: meta.cmdline.clone(),
+                        provider: meta.provider,
+                        domain: domain.clone(),
+                        duration_ms: None,
+                    });
+                }
                 if !args.summary_only {
                     emit_event(
+                        &ts,
                         "connect",
                         &run_ctx.run_id,
                         &key,
@@ -501,23 +646,7 @@ fn main() {
                         style,
                         resolved_log_format,
                         log_writer.as_ref(),
-                        sqlite.as_ref(),
                     );
-                } else if let Some(conn) = sqlite.as_ref() {
-                    if let Ok(mut c) = conn.lock() {
-                        let _ = log_sqlite(
-                            &mut c,
-                            "connect",
-                            &run_ctx.run_id,
-                            &key,
-                            pid,
-                            &meta.comm,
-                            &meta.cmdline,
-                            meta.provider,
-                            domain.as_deref(),
-                            None,
-                        );
-                    }
                 }
 
                 stats.connects += 1;
@@ -556,8 +685,24 @@ fn main() {
                     .duration_since(info.opened_at)
                     .map(|d| d.as_millis() as u64)
                     .ok();
+                let ts = now_rfc3339();
+                if let Some(writer) = sqlite_writer.as_ref() {
+                    writer.enqueue(SqliteEvent {
+                        ts: ts.clone(),
+                        run_id: run_ctx.run_id.clone(),
+                        event: "close".to_string(),
+                        key: key.clone(),
+                        pid: info.pid,
+                        comm: info.comm.clone(),
+                        cmdline: info.cmdline.clone(),
+                        provider: info.provider,
+                        domain: info.domain.clone(),
+                        duration_ms,
+                    });
+                }
                 if !args.summary_only {
                     emit_event(
+                        &ts,
                         "close",
                         &run_ctx.run_id,
                         &key,
@@ -571,23 +716,7 @@ fn main() {
                         style,
                         resolved_log_format,
                         log_writer.as_ref(),
-                        sqlite.as_ref(),
                     );
-                } else if let Some(conn) = sqlite.as_ref() {
-                    if let Ok(mut c) = conn.lock() {
-                        let _ = log_sqlite(
-                            &mut c,
-                            "close",
-                            &run_ctx.run_id,
-                            &key,
-                            info.pid,
-                            &info.comm,
-                            &info.cmdline,
-                            info.provider,
-                            info.domain.as_deref(),
-                            duration_ms,
-                        );
-                    }
                 }
                 stats.closes += 1;
                 stats.active = stats.active.saturating_sub(1);
@@ -614,10 +743,8 @@ fn main() {
         std::thread::sleep(Duration::from_millis(args.interval_ms));
     }
 
-    if let Some(conn) = sqlite.as_ref() {
-        if let Ok(mut c) = conn.lock() {
-            let _ = finalize_session(&mut c, &run_ctx, &stats);
-        }
+    if let Some(writer) = sqlite_writer {
+        stats.sqlite_dropped = writer.shutdown(run_ctx.run_id.clone(), stats.connects, stats.closes);
     }
 
     summary(&stats, args.json, args.stats_top, style, log_writer.as_ref());
@@ -667,10 +794,10 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
         }
     }
 
-    let (config_path, use_config) = find_config_flag(argv);
+    let config = find_config_flag(argv);
     let mut args = MonitorArgs::default();
-    if use_config {
-        if let Some(path) = config_path.or_else(default_config_path) {
+    if config.use_config {
+        if let Some(path) = config.kv_path.clone().or_else(default_config_path) {
             if path.exists() {
                 apply_config_file(&path, &mut args)?;
             }
@@ -818,6 +945,9 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 i += 1;
             }
             "--config" => {
+                i += 2;
+            }
+            "--config-toml" => {
                 i += 2;
             }
             "--no-config" => {
@@ -988,8 +1118,9 @@ fn parse_theme(value: &str) -> Result<Theme, String> {
     }
 }
 
-fn find_config_flag(argv: &[String]) -> (Option<PathBuf>, bool) {
+fn find_config_flag(argv: &[String]) -> ConfigPaths {
     let mut config_path = None;
+    let mut toml_path = None;
     let mut use_config = true;
     let mut i = 0;
     while i < argv.len() {
@@ -1000,6 +1131,12 @@ fn find_config_flag(argv: &[String]) -> (Option<PathBuf>, bool) {
                 }
                 i += 2;
             }
+            "--config-toml" => {
+                if let Some(path) = argv.get(i + 1) {
+                    toml_path = Some(PathBuf::from(path));
+                }
+                i += 2;
+            }
             "--no-config" => {
                 use_config = false;
                 i += 1;
@@ -1007,7 +1144,11 @@ fn find_config_flag(argv: &[String]) -> (Option<PathBuf>, bool) {
             _ => i += 1,
         }
     }
-    (config_path, use_config)
+    ConfigPaths {
+        kv_path: config_path,
+        toml_path,
+        use_config,
+    }
 }
 
 fn default_config_path() -> Option<PathBuf> {
@@ -1093,9 +1234,201 @@ fn parse_bool(value: &str) -> Result<bool, String> {
     }
 }
 
+fn load_provider_matcher(config: &ConfigPaths) -> (ProviderMatcher, Vec<String>) {
+    let mut notes = Vec::new();
+    if !config.use_config {
+        return (ProviderMatcher::default(), notes);
+    }
+
+    let (paths, mut path_notes) = provider_config_paths(config);
+    notes.append(&mut path_notes);
+
+    let mut matcher = ProviderMatcher::default();
+    for path in paths {
+        let contents = match fs::read_to_string(&path) {
+            Ok(contents) => contents,
+            Err(err) => {
+                notes.push(format!(
+                    "provider config: failed to read {}: {}",
+                    path.display(),
+                    err
+                ));
+                continue;
+            }
+        };
+
+        let parsed: TomlConfig = match toml::from_str(&contents) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                notes.push(format!(
+                    "provider config: failed to parse {}: {}",
+                    path.display(),
+                    err
+                ));
+                continue;
+            }
+        };
+
+        let Some(providers) = parsed.providers else {
+            continue;
+        };
+
+        if let Err(err) = apply_provider_config(&mut matcher, providers) {
+            notes.push(format!("provider config: {}", err));
+        }
+    }
+
+    (matcher, notes)
+}
+
+fn provider_config_paths(config: &ConfigPaths) -> (Vec<PathBuf>, Vec<String>) {
+    let mut notes = Vec::new();
+    let mut paths = Vec::new();
+    let mut seen: HashSet<PathBuf> = HashSet::new();
+
+    for candidate in default_provider_config_paths() {
+        if candidate.exists() {
+            push_unique_path(&mut paths, &mut seen, candidate);
+        }
+    }
+
+    if let Some(path) = config.toml_path.as_ref() {
+        if path.exists() {
+            push_unique_path(&mut paths, &mut seen, path.clone());
+        } else {
+            notes.push(format!(
+                "provider config: --config-toml path not found: {}",
+                path.display()
+            ));
+        }
+    }
+
+    if let Ok(env_path) = env::var("RANO_CONFIG_TOML") {
+        let trimmed = env_path.trim();
+        if trimmed.is_empty() {
+            notes.push("provider config: RANO_CONFIG_TOML is set but empty".to_string());
+        } else {
+            let candidate = PathBuf::from(trimmed);
+            if candidate.exists() {
+                push_unique_path(&mut paths, &mut seen, candidate);
+            } else {
+                notes.push(format!(
+                    "provider config: RANO_CONFIG_TOML path not found: {}",
+                    candidate.display()
+                ));
+            }
+        }
+    }
+
+    (paths, notes)
+}
+
+fn default_provider_config_paths() -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    if let Some(home) = home_dir() {
+        paths.push(home.join(".rano.toml"));
+    }
+    if let Some(config_dir) = xdg_config_home() {
+        paths.push(config_dir.join("rano").join("rano.toml"));
+    }
+    if let Ok(cwd) = env::current_dir() {
+        paths.push(cwd.join("rano.toml"));
+    }
+    paths
+}
+
+fn push_unique_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
+    if seen.insert(path.clone()) {
+        paths.push(path);
+    }
+}
+
+fn xdg_config_home() -> Option<PathBuf> {
+    if let Ok(path) = env::var("XDG_CONFIG_HOME") {
+        if !path.trim().is_empty() {
+            return Some(PathBuf::from(path));
+        }
+    }
+    home_dir().map(|home| home.join(".config"))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    env::var("HOME").ok().map(PathBuf::from)
+}
+
+fn apply_provider_config(
+    matcher: &mut ProviderMatcher,
+    config: ProvidersConfig,
+) -> Result<(), String> {
+    let mode = match config.mode.as_deref() {
+        Some(value) => parse_provider_mode(value)?,
+        None => ProviderMode::Merge,
+    };
+
+    if mode == ProviderMode::Replace {
+        *matcher = ProviderMatcher {
+            anthropic: Vec::new(),
+            openai: Vec::new(),
+            google: Vec::new(),
+        };
+    }
+
+    if let Some(patterns) = config.anthropic {
+        let normalized = normalize_patterns(patterns);
+        matcher.anthropic = merge_patterns(matcher.anthropic.clone(), normalized, mode);
+    }
+    if let Some(patterns) = config.openai {
+        let normalized = normalize_patterns(patterns);
+        matcher.openai = merge_patterns(matcher.openai.clone(), normalized, mode);
+    }
+    if let Some(patterns) = config.google {
+        let normalized = normalize_patterns(patterns);
+        matcher.google = merge_patterns(matcher.google.clone(), normalized, mode);
+    }
+
+    Ok(())
+}
+
+fn merge_patterns(mut base: Vec<String>, mut add: Vec<String>, mode: ProviderMode) -> Vec<String> {
+    if mode == ProviderMode::Replace {
+        return add;
+    }
+    let mut seen: HashSet<String> = base.iter().cloned().collect();
+    for item in add.drain(..) {
+        if seen.insert(item.clone()) {
+            base.push(item);
+        }
+    }
+    base
+}
+
+fn normalize_patterns(input: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for item in input {
+        let trimmed = item.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lowered = trimmed.to_lowercase();
+        if seen.insert(lowered.clone()) {
+            out.push(lowered);
+        }
+    }
+    out
+}
+
+fn parse_provider_mode(value: &str) -> Result<ProviderMode, String> {
+    match value.to_lowercase().as_str() {
+        "merge" => Ok(ProviderMode::Merge),
+        "replace" => Ok(ProviderMode::Replace),
+        _ => Err("Invalid providers.mode (use merge|replace)".to_string()),
+    }
+}
+
 fn print_help() {
     println!(
-        "rano - AI CLI network observer\n\nUSAGE:\n  rano [options]\n  rano update [options]\n\nOPTIONS:\n  --pattern <str>           Process name or cmdline substring to match (repeatable)\n  --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n  --pid <pid>               Monitor a specific PID (repeatable)\n  --no-descendants          Do not include descendant processes\n  --interval-ms <ms>        Poll interval (default: 1000)\n  --json                    Emit JSON lines to stdout\n  --summary-only            Suppress live events, show summary only\n  --domain-mode <mode>      auto|ptr|pcap (default: auto)\n  --pcap                    Force pcap mode (falls back with warning)\n  --no-dns                  Disable PTR lookups\n  --include-udp             Include UDP sockets (default: true)\n  --no-udp                  Disable UDP sockets\n  --include-listening       Include listening TCP sockets\n  --log-file <path>         Append output to log file\n  --log-dir <path>          Write per-run log files into directory\n  --log-format <fmt>        auto|pretty|json for log files (default: auto)\n  --once                    Emit a single poll and exit\n  --color <mode>            auto|always|never (default: auto)\n  --no-color                Disable ANSI color\n  --theme <name>            vivid|mono (default: vivid)\n  --sqlite <path>           SQLite file for persistent logging\n  --no-sqlite               Disable SQLite logging\n  --stats-interval-ms <ms>  Live stats interval (0 disables)\n  --stats-width <n>         ASCII bar width\n  --stats-top <n>           Top-N domains/IPs in stats/summary\n  --no-banner               Suppress startup banner\n  --config <path>           Load config file (key=value format)\n  --no-config               Ignore config file\n  -h, --help                Show this help\n  -V, --version             Show version\n"
+        "rano - AI CLI network observer\n\nUSAGE:\n  rano [options]\n  rano update [options]\n\nOPTIONS:\n  --pattern <str>           Process name or cmdline substring to match (repeatable)\n  --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n  --pid <pid>               Monitor a specific PID (repeatable)\n  --no-descendants          Do not include descendant processes\n  --interval-ms <ms>        Poll interval (default: 1000)\n  --json                    Emit JSON lines to stdout\n  --summary-only            Suppress live events, show summary only\n  --domain-mode <mode>      auto|ptr|pcap (default: auto)\n  --pcap                    Force pcap mode (falls back with warning)\n  --no-dns                  Disable PTR lookups\n  --include-udp             Include UDP sockets (default: true)\n  --no-udp                  Disable UDP sockets\n  --include-listening       Include listening TCP sockets\n  --log-file <path>         Append output to log file\n  --log-dir <path>          Write per-run log files into directory\n  --log-format <fmt>        auto|pretty|json for log files (default: auto)\n  --once                    Emit a single poll and exit\n  --color <mode>            auto|always|never (default: auto)\n  --no-color                Disable ANSI color\n  --theme <name>            vivid|mono (default: vivid)\n  --sqlite <path>           SQLite file for persistent logging\n  --no-sqlite               Disable SQLite logging\n  --stats-interval-ms <ms>  Live stats interval (0 disables)\n  --stats-width <n>         ASCII bar width\n  --stats-top <n>           Top-N domains/IPs in stats/summary\n  --no-banner               Suppress startup banner\n  --config <path>           Load config file (key=value format)\n  --config-toml <path>      Load provider config (TOML)\n  --no-config               Ignore config files\n  -h, --help                Show this help\n  -V, --version             Show version\n"
     );
 }
 
@@ -1236,7 +1569,7 @@ fn system_time_to_rfc3339(t: SystemTime) -> String {
 fn banner(
     args: &MonitorArgs,
     domain_label: &str,
-    domain_note: Option<&str>,
+    notes: &[String],
     style: OutputStyle,
     log_writer: &Option<Arc<LogWriter>>,
 ) {
@@ -1268,7 +1601,7 @@ fn banner(
         println!("{}", line);
     }
 
-    if let Some(note) = domain_note {
+    for note in notes {
         let warning = format!("warning: {}", note);
         if args.json {
             eprintln!("{}", warning);
@@ -1295,6 +1628,7 @@ fn log_format_for_output(json_mode: bool, log_format: LogFormat) -> LogFormat {
 }
 
 fn emit_event(
+    ts: &str,
     event: &str,
     run_id: &str,
     key: &ConnKey,
@@ -1308,9 +1642,7 @@ fn emit_event(
     style: OutputStyle,
     log_format: LogFormat,
     log_writer: Option<&Arc<LogWriter>>,
-    sqlite: Option<&Arc<Mutex<Connection>>>,
 ) {
-    let ts = now_rfc3339();
     let proto = match key.proto {
         Proto::Tcp => "tcp",
         Proto::Udp => "udp",
@@ -1319,17 +1651,9 @@ fn emit_event(
     let remote = format!("{}:{}", key.remote_ip, key.remote_port);
     let dom = domain.unwrap_or("unknown");
 
-    if let Some(conn) = sqlite {
-        if let Ok(mut c) = conn.lock() {
-            let _ = log_sqlite(
-                &mut c, event, run_id, key, pid, comm, cmdline, provider, domain, duration_ms,
-            );
-        }
-    }
-
     if json_mode {
         let line = format_json_event(
-            &ts,
+            ts,
             run_id,
             event,
             pid,
@@ -1350,7 +1674,7 @@ fn emit_event(
     }
 
     let line_plain = format_pretty_event(
-        &ts,
+        ts,
         event,
         pid,
         comm,
@@ -1364,7 +1688,7 @@ fn emit_event(
     );
 
     let line_colored = format_pretty_event(
-        &ts,
+        ts,
         event,
         pid,
         comm,
@@ -1382,7 +1706,7 @@ fn emit_event(
     if let Some(writer) = log_writer {
         let output = match log_format {
             LogFormat::Json => format_json_event(
-                &ts,
+                ts,
                 run_id,
                 event,
                 pid,
@@ -1522,6 +1846,19 @@ fn summary(
         paint(&stats.active.to_string(), Some(AnsiColor::BrightCyan), true, false, style.color),
         stats.peak_active
     );
+    if stats.sqlite_dropped > 0 {
+        println!(
+            "  {} {}",
+            paint("sqlite_dropped", Some(AnsiColor::BrightWhite), true, false, style.color),
+            paint(
+                &stats.sqlite_dropped.to_string(),
+                Some(AnsiColor::BrightRed),
+                true,
+                false,
+                style.color
+            )
+        );
+    }
 
     if stats.duration_ms_samples > 0 {
         let avg = stats.duration_ms_total / stats.duration_ms_samples;
@@ -1570,8 +1907,8 @@ fn summary(
 
     if let Some(writer) = log_writer {
         let line = format!(
-            "summary connects={} closes={} active={} peak_active={}",
-            stats.connects, stats.closes, stats.active, stats.peak_active
+            "summary connects={} closes={} active={} peak_active={} sqlite_dropped={}",
+            stats.connects, stats.closes, stats.active, stats.peak_active, stats.sqlite_dropped
         );
         writer.write_line(&line);
     }
@@ -1585,6 +1922,7 @@ fn format_json_summary(stats: &Stats) -> String {
     push_json_num(&mut out, "closes", stats.closes as i64, false);
     push_json_num(&mut out, "active", stats.active as i64, false);
     push_json_num(&mut out, "peak_active", stats.peak_active as i64, false);
+    push_json_num(&mut out, "sqlite_dropped", stats.sqlite_dropped as i64, false);
     if stats.duration_ms_samples > 0 {
         let avg = stats.duration_ms_total / stats.duration_ms_samples;
         push_json_num(&mut out, "avg_duration_ms", avg as i64, false);
@@ -1736,6 +2074,168 @@ fn open_log_writer(
     Some(Arc::new(LogWriter {
         file: Mutex::new(file),
     }))
+}
+
+fn start_sqlite_writer(
+    sqlite_path: &str,
+    run_ctx: RunContext,
+    log_writer: Option<Arc<LogWriter>>,
+) -> Option<SqliteWriter> {
+    let (sender, receiver) = mpsc::sync_channel(SQLITE_QUEUE_CAPACITY);
+    let (ready_tx, ready_rx) = mpsc::sync_channel(1);
+    let dropped_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let log_clone = log_writer.clone();
+    let path = sqlite_path.to_string();
+    let handle = std::thread::spawn(move || {
+        sqlite_writer_loop(path, run_ctx, receiver, ready_tx, log_clone);
+    });
+
+    let start_result = match ready_rx.recv() {
+        Ok(result) => result,
+        Err(_) => Err("sqlite writer failed to start".to_string()),
+    };
+
+    if let Err(err) = start_result {
+        let msg = format!("warning: sqlite disabled ({})", err);
+        eprintln!("{}", msg);
+        if let Some(writer) = log_writer.as_ref() {
+            writer.write_line(&msg);
+        }
+        return None;
+    }
+
+    let last_warn = SystemTime::now()
+        .checked_sub(Duration::from_secs(SQLITE_DROP_WARN_INTERVAL_SECS))
+        .unwrap_or_else(SystemTime::now);
+
+    Some(SqliteWriter {
+        sender,
+        handle: Some(handle),
+        dropped_total,
+        drop_state: Mutex::new(DropState {
+            last_warn,
+            dropped_since_warn: 0,
+        }),
+        log_writer,
+    })
+}
+
+fn sqlite_writer_loop(
+    sqlite_path: String,
+    run_ctx: RunContext,
+    receiver: Receiver<SqliteMsg>,
+    ready_tx: SyncSender<Result<(), String>>,
+    log_writer: Option<Arc<LogWriter>>,
+) {
+    let mut conn = match Connection::open(&sqlite_path) {
+        Ok(conn) => conn,
+        Err(err) => {
+            let _ = ready_tx.send(Err(format!("sqlite open failed: {}", err)));
+            return;
+        }
+    };
+
+    if let Err(err) = init_sqlite(&mut conn) {
+        let _ = ready_tx.send(Err(format!("sqlite init failed: {}", err)));
+        return;
+    }
+
+    if let Err(err) = insert_session(&mut conn, &run_ctx) {
+        let _ = ready_tx.send(Err(format!("sqlite session insert failed: {}", err)));
+        return;
+    }
+
+    let _ = ready_tx.send(Ok(()));
+
+    let mut batch: Vec<SqliteEvent> = Vec::with_capacity(SQLITE_BATCH_SIZE);
+    let mut last_flush = SystemTime::now();
+    let flush_interval = Duration::from_millis(SQLITE_FLUSH_INTERVAL_MS);
+    let mut shutdown: Option<(String, u64, u64)> = None;
+
+    loop {
+        match receiver.recv_timeout(flush_interval) {
+            Ok(SqliteMsg::Event(event)) => {
+                batch.push(event);
+            }
+            Ok(SqliteMsg::Shutdown {
+                run_id,
+                connects,
+                closes,
+            }) => {
+                shutdown = Some((run_id, connects, closes));
+                break;
+            }
+            Err(RecvTimeoutError::Timeout) => {}
+            Err(RecvTimeoutError::Disconnected) => break,
+        }
+
+        let now = SystemTime::now();
+        if batch.len() >= SQLITE_BATCH_SIZE
+            || now
+                .duration_since(last_flush)
+                .map(|d| d >= flush_interval)
+                .unwrap_or(true)
+        {
+            if let Err(err) = write_sqlite_batch(&mut conn, &batch) {
+                let msg = format!("warning: sqlite batch write failed: {}", err);
+                eprintln!("{}", msg);
+                if let Some(writer) = log_writer.as_ref() {
+                    writer.write_line(&msg);
+                }
+            }
+            batch.clear();
+            last_flush = now;
+        }
+    }
+
+    while let Ok(msg) = receiver.try_recv() {
+        match msg {
+            SqliteMsg::Event(event) => batch.push(event),
+            SqliteMsg::Shutdown {
+                run_id,
+                connects,
+                closes,
+            } => {
+                shutdown = Some((run_id, connects, closes));
+            }
+        }
+    }
+
+    if let Err(err) = write_sqlite_batch(&mut conn, &batch) {
+        let msg = format!("warning: sqlite batch write failed: {}", err);
+        eprintln!("{}", msg);
+        if let Some(writer) = log_writer.as_ref() {
+            writer.write_line(&msg);
+        }
+    }
+
+    if let Some((run_id, connects, closes)) = shutdown {
+        if let Err(err) = finalize_session(&mut conn, &run_id, connects, closes) {
+            let msg = format!("warning: sqlite finalize failed: {}", err);
+            eprintln!("{}", msg);
+            if let Some(writer) = log_writer.as_ref() {
+                writer.write_line(&msg);
+            }
+        }
+    }
+}
+
+fn write_sqlite_batch(conn: &mut Connection, batch: &[SqliteEvent]) -> rusqlite::Result<()> {
+    if batch.is_empty() {
+        return Ok(());
+    }
+    conn.execute_batch("BEGIN")?;
+    for event in batch {
+        if let Err(err) = log_sqlite_event(conn, event) {
+            let _ = conn.execute_batch("ROLLBACK");
+            return Err(err);
+        }
+    }
+    if let Err(err) = conn.execute_batch("COMMIT") {
+        let _ = conn.execute_batch("ROLLBACK");
+        return Err(err);
+    }
+    Ok(())
 }
 
 fn self_update(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> {
@@ -2132,12 +2632,12 @@ fn map_inodes(targets: &HashSet<u32>) -> HashMap<u64, u32> {
     map
 }
 
-fn build_pid_meta_map(targets: &HashSet<u32>) -> HashMap<u32, PidMeta> {
+fn build_pid_meta_map(targets: &HashSet<u32>, matcher: &ProviderMatcher) -> HashMap<u32, PidMeta> {
     let mut map = HashMap::new();
     for pid in targets {
         let comm = read_comm(*pid).unwrap_or_else(|| "unknown".to_string());
         let cmdline = read_cmdline(*pid).unwrap_or_default();
-        let provider = provider_from_text(&comm, &cmdline);
+        let provider = provider_from_text(&comm, &cmdline, matcher);
         map.insert(
             *pid,
             PidMeta {
@@ -2150,13 +2650,13 @@ fn build_pid_meta_map(targets: &HashSet<u32>) -> HashMap<u32, PidMeta> {
     map
 }
 
-fn provider_from_text(comm: &str, cmdline: &str) -> Provider {
+fn provider_from_text(comm: &str, cmdline: &str, matcher: &ProviderMatcher) -> Provider {
     let text = format!("{} {}", comm.to_lowercase(), cmdline.to_lowercase());
-    if text.contains("claude") {
+    if matcher.anthropic.iter().any(|p| text.contains(p)) {
         Provider::Anthropic
-    } else if text.contains("codex") || text.contains("openai") {
+    } else if matcher.openai.iter().any(|p| text.contains(p)) {
         Provider::OpenAI
-    } else if text.contains("gemini") {
+    } else if matcher.google.iter().any(|p| text.contains(p)) {
         Provider::Google
     } else {
         Provider::Unknown
@@ -2421,11 +2921,11 @@ fn insert_session(conn: &mut Connection, ctx: &RunContext) -> rusqlite::Result<(
     Ok(())
 }
 
-fn finalize_session(conn: &mut Connection, ctx: &RunContext, stats: &Stats) -> rusqlite::Result<()> {
+fn finalize_session(conn: &mut Connection, run_id: &str, connects: u64, closes: u64) -> rusqlite::Result<()> {
     let end_ts = now_rfc3339();
     conn.execute(
         "UPDATE sessions SET end_ts = ?1, connects = ?2, closes = ?3 WHERE run_id = ?4",
-        params![end_ts, stats.connects as i64, stats.closes as i64, &ctx.run_id],
+        params![end_ts, connects as i64, closes as i64, run_id],
     )?;
     Ok(())
 }
@@ -2450,44 +2950,32 @@ fn ensure_column(
     Ok(())
 }
 
-fn log_sqlite(
-    conn: &mut Connection,
-    event: &str,
-    run_id: &str,
-    key: &ConnKey,
-    pid: u32,
-    comm: &str,
-    cmdline: &str,
-    provider: Provider,
-    domain: Option<&str>,
-    duration_ms: Option<u64>,
-) -> rusqlite::Result<()> {
-    let ts = now_rfc3339();
-    let proto = match key.proto {
+fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Result<()> {
+    let proto = match event.key.proto {
         Proto::Tcp => "tcp",
         Proto::Udp => "udp",
     };
-    let (is_private, ip_version) = ip_flags(key.remote_ip);
+    let (is_private, ip_version) = ip_flags(event.key.remote_ip);
     conn.execute(
         "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, remote_is_private, ip_version, duration_ms)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
         params![
-            ts,
-            run_id,
-            event,
-            provider.label(),
-            pid,
-            comm,
-            cmdline,
+            &event.ts,
+            &event.run_id,
+            &event.event,
+            event.provider.label(),
+            event.pid,
+            &event.comm,
+            &event.cmdline,
             proto,
-            key.local_ip.to_string(),
-            key.local_port as i64,
-            key.remote_ip.to_string(),
-            key.remote_port as i64,
-            domain.unwrap_or("unknown"),
+            event.key.local_ip.to_string(),
+            event.key.local_port as i64,
+            event.key.remote_ip.to_string(),
+            event.key.remote_port as i64,
+            event.domain.as_deref().unwrap_or("unknown"),
             if is_private { 1 } else { 0 },
             ip_version,
-            duration_ms.map(|v| v as i64),
+            event.duration_ms.map(|v| v as i64),
         ],
     )?;
     Ok(())
@@ -2621,4 +3109,64 @@ fn escape_json(input: &str) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn normalize_patterns_lowercases_and_dedupes() {
+        let patterns = vec![
+            " Claude ".to_string(),
+            "claude".to_string(),
+            "OpenAI".to_string(),
+            "".to_string(),
+        ];
+        let normalized = normalize_patterns(patterns);
+        assert_eq!(normalized, vec!["claude".to_string(), "openai".to_string()]);
+    }
+
+    #[test]
+    fn merge_mode_extends_defaults() {
+        let config = ProvidersConfig {
+            mode: Some("merge".to_string()),
+            anthropic: Some(vec!["custom".to_string()]),
+            openai: None,
+            google: None,
+        };
+        let mut matcher = ProviderMatcher::default();
+        apply_provider_config(&mut matcher, config).expect("config should apply");
+        assert!(matcher.anthropic.contains(&"claude".to_string()));
+        assert!(matcher.anthropic.contains(&"custom".to_string()));
+        assert!(matcher.openai.contains(&"codex".to_string()));
+    }
+
+    #[test]
+    fn replace_mode_overrides_defaults() {
+        let config = ProvidersConfig {
+            mode: Some("replace".to_string()),
+            anthropic: Some(vec!["only".to_string()]),
+            openai: None,
+            google: None,
+        };
+        let mut matcher = ProviderMatcher::default();
+        apply_provider_config(&mut matcher, config).expect("config should apply");
+        assert_eq!(matcher.anthropic, vec!["only".to_string()]);
+        assert!(matcher.openai.is_empty());
+        assert!(matcher.google.is_empty());
+    }
+
+    #[test]
+    fn provider_matcher_uses_custom_patterns() {
+        let matcher = ProviderMatcher {
+            anthropic: vec!["alpha".to_string()],
+            openai: vec!["beta".to_string()],
+            google: vec!["gamma".to_string()],
+        };
+        assert_eq!(
+            provider_from_text("beta-runner", "", &matcher),
+            Provider::OpenAI
+        );
+    }
 }

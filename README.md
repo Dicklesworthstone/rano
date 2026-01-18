@@ -124,6 +124,29 @@ log_dir=/tmp/rano-logs
 log_format=pretty
 ```
 
+### Provider config (TOML)
+
+You can override provider matching patterns with a `rano.toml` file. Configs are applied in order (later entries can override earlier ones):
+
+1. `~/.rano.toml`
+2. `~/.config/rano/rano.toml`
+3. `./rano.toml` (current working directory)
+4. `--config-toml <path>`
+5. `RANO_CONFIG_TOML` (explicit path)
+
+Schema:
+```
+[providers]
+mode = "merge" # or "replace"
+anthropic = ["claude", "anthropic"]
+openai = ["codex", "openai"]
+google = ["gemini", "google"]
+```
+
+`merge` appends to built-in defaults; `replace` resets patterns at that point.
+
+See `docs/provider-config.md` for schema and merge details.
+
 ## SQLite schema
 
 The `events` table stores per-connection events with process and network metadata, and `sessions` stores run metadata. Useful views include:
