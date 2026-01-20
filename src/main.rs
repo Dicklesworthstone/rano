@@ -4267,6 +4267,75 @@ mod tests {
     }
 
     #[test]
+    fn merge_mode_preserves_unspecified_providers() {
+        // When merging, providers not mentioned in config should keep defaults
+        let config = ProvidersConfig {
+            mode: Some("merge".to_string()),
+            anthropic: Some(vec!["acme-claude".to_string()]),
+            openai: None,  // Should keep default "codex", "openai"
+            google: None,  // Should keep default "gemini", "google"
+        };
+        let mut matcher = ProviderMatcher::default();
+        apply_provider_config(&mut matcher, config).expect("config should apply");
+        // anthropic should have both default + custom
+        assert!(matcher.anthropic.contains(&"claude".to_string()));
+        assert!(matcher.anthropic.contains(&"acme-claude".to_string()));
+        // openai and google should have defaults
+        assert!(matcher.openai.contains(&"codex".to_string()));
+        assert!(matcher.google.contains(&"gemini".to_string()));
+    }
+
+    #[test]
+    fn invalid_mode_returns_error() {
+        let config = ProvidersConfig {
+            mode: Some("invalid".to_string()),
+            anthropic: None,
+            openai: None,
+            google: None,
+        };
+        let mut matcher = ProviderMatcher::default();
+        let result = apply_provider_config(&mut matcher, config);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(err.contains("Invalid providers.mode"));
+    }
+
+    #[test]
+    fn empty_patterns_are_filtered_out() {
+        let config = ProvidersConfig {
+            mode: Some("replace".to_string()),
+            anthropic: Some(vec!["valid".to_string(), "".to_string(), "  ".to_string()]),
+            openai: None,
+            google: None,
+        };
+        let mut matcher = ProviderMatcher::default();
+        apply_provider_config(&mut matcher, config).expect("config should apply");
+        assert_eq!(matcher.anthropic, vec!["valid".to_string()]);
+    }
+
+    #[test]
+    fn provider_from_text_returns_unknown_for_no_match() {
+        let matcher = ProviderMatcher::default();
+        assert_eq!(
+            provider_from_text("random-process", "/usr/bin/random", &matcher),
+            Provider::Unknown
+        );
+    }
+
+    #[test]
+    fn provider_from_text_matches_case_insensitive() {
+        let matcher = ProviderMatcher::default();
+        assert_eq!(
+            provider_from_text("CLAUDE", "/usr/bin/CLAUDE", &matcher),
+            Provider::Anthropic
+        );
+        assert_eq!(
+            provider_from_text("Codex", "/usr/bin/Codex", &matcher),
+            Provider::OpenAI
+        );
+    }
+
+    #[test]
     fn build_summary_query_includes_filters() {
         let filter = ReportFilter {
             run_id: Some("run-1".to_string()),

@@ -96,7 +96,7 @@ head -n 12 "${E2E_LAST_OUTPUT_FILE}" | while IFS= read -r line; do
 done
 
 expected_pretty="$(cat tests/fixtures/report_latest.txt)"
-e2e_assert_last_eq "${expected_pretty}"$'\n'
+e2e_assert_last_eq "${expected_pretty}"$'\n\n'
 
 # JSON output + schema validation + golden
 
