@@ -55,6 +55,7 @@ struct Cli {
 
 enum Command {
     Update(UpdateCommand),
+    Report(ReportArgs),
 }
 
 #[derive(Clone, Debug)]
@@ -142,6 +143,33 @@ struct UpdateCommand {
     owner: Option<String>,
     repo: Option<String>,
     branch: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ReportArgs {
+    sqlite_path: String,
+    latest: bool,
+    run_id: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    json: bool,
+    top: usize,
+    color: ColorMode,
+}
+
+impl Default for ReportArgs {
+    fn default() -> Self {
+        Self {
+            sqlite_path: "observer.sqlite".to_string(),
+            latest: false,
+            run_id: None,
+            since: None,
+            until: None,
+            json: false,
+            top: 10,
+            color: ColorMode::Auto,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
@@ -486,12 +514,23 @@ fn main() {
         }
     };
 
-    if let Some(Command::Update(update)) = cli.command {
-        if let Err(err) = self_update(update) {
-            eprintln!("rano update failed: {}", err);
-            std::process::exit(1);
+    if let Some(command) = cli.command {
+        match command {
+            Command::Update(update) => {
+                if let Err(err) = self_update(update) {
+                    eprintln!("rano update failed: {}", err);
+                    std::process::exit(1);
+                }
+                return;
+            }
+            Command::Report(report_args) => {
+                if let Err(err) = run_report(report_args) {
+                    eprintln!("error: {}", err);
+                    std::process::exit(1);
+                }
+                return;
+            }
         }
-        return;
     }
 
     let mut args = cli.monitor;
@@ -778,6 +817,13 @@ fn parse_cli() -> Result<Cli, String> {
             let update = parse_update_args(&args[2..])?;
             Ok(Cli {
                 command: Some(Command::Update(update)),
+                monitor: MonitorArgs::default(),
+            })
+        }
+        "report" => {
+            let report = parse_report_args(&args[2..])?;
+            Ok(Cli {
+                command: Some(Command::Report(report)),
                 monitor: MonitorArgs::default(),
             })
         }
@@ -1096,6 +1142,88 @@ fn parse_update_args(argv: &[String]) -> Result<UpdateCommand, String> {
     }
 
     Ok(cmd)
+}
+
+fn parse_report_args(argv: &[String]) -> Result<ReportArgs, String> {
+    for arg in argv {
+        if arg == "-h" || arg == "--help" {
+            print_report_help();
+            std::process::exit(0);
+        }
+        if arg == "-V" || arg == "--version" {
+            print_version();
+            std::process::exit(0);
+        }
+    }
+
+    let mut args = ReportArgs::default();
+
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        match arg.as_str() {
+            "--sqlite" => {
+                i += 1;
+                let value = require_value(argv, i, "--sqlite")?;
+                args.sqlite_path = value.to_string();
+                i += 1;
+            }
+            "--latest" => {
+                args.latest = true;
+                i += 1;
+            }
+            "--run-id" => {
+                i += 1;
+                let value = require_value(argv, i, "--run-id")?;
+                args.run_id = Some(value.to_string());
+                i += 1;
+            }
+            "--since" => {
+                i += 1;
+                let value = require_value(argv, i, "--since")?;
+                args.since = Some(value.to_string());
+                i += 1;
+            }
+            "--until" => {
+                i += 1;
+                let value = require_value(argv, i, "--until")?;
+                args.until = Some(value.to_string());
+                i += 1;
+            }
+            "--json" => {
+                args.json = true;
+                i += 1;
+            }
+            "--top" => {
+                i += 1;
+                let value = require_value(argv, i, "--top")?;
+                args.top = parse_usize(value, "--top")?;
+                i += 1;
+            }
+            "--color" => {
+                i += 1;
+                let value = require_value(argv, i, "--color")?;
+                args.color = parse_color_mode(value)?;
+                i += 1;
+            }
+            "--no-color" => {
+                args.color = ColorMode::Never;
+                i += 1;
+            }
+            other => {
+                if other.starts_with('-') {
+                    return Err(format!("Unknown report flag: {}", other));
+                }
+                return Err(format!("Unexpected report argument: {}", other));
+            }
+        }
+    }
+
+    if args.latest && args.run_id.is_some() {
+        return Err("--latest and --run-id are mutually exclusive".to_string());
+    }
+
+    Ok(args)
 }
 
 fn require_value<'a>(argv: &'a [String], index: usize, flag: &str) -> Result<&'a str, String> {
@@ -1479,13 +1607,36 @@ fn parse_provider_mode(value: &str) -> Result<ProviderMode, String> {
 
 fn print_help() {
     println!(
-        "rano - AI CLI network observer\n\nUSAGE:\n  rano [options]\n  rano update [options]\n\nOPTIONS:\n  --pattern <str>           Process name or cmdline substring to match (repeatable)\n  --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n  --pid <pid>               Monitor a specific PID (repeatable)\n  --no-descendants          Do not include descendant processes\n  --interval-ms <ms>        Poll interval (default: 1000)\n  --json                    Emit JSON lines to stdout\n  --summary-only            Suppress live events, show summary only\n  --domain-mode <mode>      auto|ptr|pcap (default: auto)\n  --pcap                    Force pcap mode (falls back with warning)\n  --no-dns                  Disable PTR lookups\n  --include-udp             Include UDP sockets (default: true)\n  --no-udp                  Disable UDP sockets\n  --include-listening       Include listening TCP sockets\n  --log-file <path>         Append output to log file\n  --log-dir <path>          Write per-run log files into directory\n  --log-format <fmt>        auto|pretty|json for log files (default: auto)\n  --once                    Emit a single poll and exit\n  --color <mode>            auto|always|never (default: auto)\n  --no-color                Disable ANSI color\n  --theme <name>            vivid|mono (default: vivid)\n  --sqlite <path>           SQLite file for persistent logging\n  --no-sqlite               Disable SQLite logging\n  --db-batch-size <n>       SQLite batch size (events per transaction)\n  --db-flush-ms <ms>        SQLite flush interval in ms\n  --db-queue-max <n>        SQLite queue capacity (events)\n  --stats-interval-ms <ms>  Live stats interval (0 disables)\n  --stats-width <n>         ASCII bar width\n  --stats-top <n>           Top-N domains/IPs in stats/summary\n  --no-banner               Suppress startup banner\n  --config <path>           Load config file (key=value format)\n  --config-toml <path>      Load provider config (TOML)\n  --no-config               Ignore config files\n  -h, --help                Show this help\n  -V, --version             Show version\n"
+        "rano - AI CLI network observer\n\nUSAGE:\n  rano [options]\n  rano report [options]\n  rano update [options]\n\nCOMMANDS:\n  report    Query SQLite event history (use --help for details)\n  update    Update the rano binary\n\nOPTIONS:\n  --pattern <str>           Process name or cmdline substring to match (repeatable)\n  --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n  --pid <pid>               Monitor a specific PID (repeatable)\n  --no-descendants          Do not include descendant processes\n  --interval-ms <ms>        Poll interval (default: 1000)\n  --json                    Emit JSON lines to stdout\n  --summary-only            Suppress live events, show summary only\n  --domain-mode <mode>      auto|ptr|pcap (default: auto)\n  --pcap                    Force pcap mode (falls back with warning)\n  --no-dns                  Disable PTR lookups\n  --include-udp             Include UDP sockets (default: true)\n  --no-udp                  Disable UDP sockets\n  --include-listening       Include listening TCP sockets\n  --log-file <path>         Append output to log file\n  --log-dir <path>          Write per-run log files into directory\n  --log-format <fmt>        auto|pretty|json for log files (default: auto)\n  --once                    Emit a single poll and exit\n  --color <mode>            auto|always|never (default: auto)\n  --no-color                Disable ANSI color\n  --theme <name>            vivid|mono (default: vivid)\n  --sqlite <path>           SQLite file for persistent logging\n  --no-sqlite               Disable SQLite logging\n  --db-batch-size <n>       SQLite batch size (events per transaction)\n  --db-flush-ms <ms>        SQLite flush interval in ms\n  --db-queue-max <n>        SQLite queue capacity (events)\n  --stats-interval-ms <ms>  Live stats interval (0 disables)\n  --stats-width <n>         ASCII bar width\n  --stats-top <n>           Top-N domains/IPs in stats/summary\n  --no-banner               Suppress startup banner\n  --config <path>           Load config file (key=value format)\n  --config-toml <path>      Load provider config (TOML)\n  --no-config               Ignore config files\n  -h, --help                Show this help\n  -V, --version             Show version\n"
     );
 }
 
 fn print_update_help() {
     println!(
         "rano update - update the binary\n\nUSAGE:\n  rano update [options]\n\nOPTIONS:\n  --version <v>     Install a specific version (e.g., v0.2.0)\n  --system          Install system-wide (/usr/local/bin)\n  --easy-mode       Auto-update PATH in shell rc files\n  --dest <path>     Install destination directory\n  --from-source     Build from source instead of downloading binaries\n  --verify          Verify installation after update\n  --quiet           Suppress non-error output\n  --no-gum          Disable gum formatting in installer\n  --owner <owner>   GitHub owner/org override\n  --repo <repo>     GitHub repo override\n  --branch <name>   GitHub branch (default: main)\n  -h, --help        Show this help\n  -V, --version     Show version\n"
+    );
+}
+
+fn print_report_help() {
+    println!(
+        "rano report - query SQLite event history\n\n\
+USAGE:\n  rano report [options]\n\n\
+OPTIONS:\n\
+  --sqlite <path>   SQLite database path (default: observer.sqlite)\n\
+  --latest          Report on most recent session\n\
+  --run-id <id>     Report on specific session by run_id\n\
+  --since <ts>      Start of time range (RFC3339, date, or relative like 1h/24h/7d)\n\
+  --until <ts>      End of time range (RFC3339, exclusive)\n\
+  --json            Output as JSON\n\
+  --top <n>         Limit top-N entries (default: 10)\n\
+  --color <mode>    Color output: auto|always|never (default: auto)\n\
+  --no-color        Disable color output\n\
+  -h, --help        Show this help\n\
+  -V, --version     Show version\n\n\
+EXAMPLES:\n\
+  rano report --latest                # Most recent session\n\
+  rano report --since 24h             # Last 24 hours\n\
+  rano report --run-id xyz --json     # Specific session as JSON\n"
     );
 }
 
@@ -2865,6 +3016,579 @@ fn parse_ipv6(hex: &str) -> Option<Ipv6Addr> {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&chunk);
     }
     Some(Ipv6Addr::from(bytes))
+}
+
+// ============================================================================
+// Report Subcommand
+// ============================================================================
+
+fn run_report(args: ReportArgs) -> Result<(), String> {
+    let path = Path::new(&args.sqlite_path);
+    if !path.exists() {
+        return Err(format!("SQLite file not found: {}", args.sqlite_path));
+    }
+
+    let conn = Connection::open(path)
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+
+    // Check schema
+    let has_events = table_exists(&conn, "events")?;
+    if !has_events {
+        return Err("Database does not contain rano event data (missing events table)".to_string());
+    }
+    let has_sessions = table_exists(&conn, "sessions")?;
+
+    let color_enabled = resolve_color_mode(args.color);
+
+    // Determine run_id filter
+    let run_id = if let Some(id) = args.run_id.clone() {
+        Some(id)
+    } else if args.latest {
+        find_latest_session(&conn)?
+    } else {
+        None
+    };
+
+    // Parse time filters
+    let since = parse_time_filter(&args.since)?;
+    let until = parse_time_filter(&args.until)?;
+
+    // Build filter context for queries
+    let filter = ReportFilter {
+        run_id: run_id.clone(),
+        since,
+        until,
+    };
+
+    if args.json {
+        output_report_json(&conn, &filter, args.top, has_sessions)?;
+    } else {
+        output_report_pretty(&conn, &filter, args.top, has_sessions, color_enabled)?;
+    }
+
+    Ok(())
+}
+
+struct ReportFilter {
+    run_id: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+}
+
+fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, String> {
+    let sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
+    let result: Option<String> = conn
+        .query_row(sql, [table_name], |row| row.get(0))
+        .ok();
+    Ok(result.is_some())
+}
+
+fn find_latest_session(conn: &Connection) -> Result<Option<String>, String> {
+    let sql = "SELECT run_id FROM sessions ORDER BY start_ts DESC LIMIT 1";
+    match conn.query_row(sql, [], |row| row.get::<_, String>(0)) {
+        Ok(id) => Ok(Some(id)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => {
+            // No sessions table or no sessions, try events
+            let sql2 = "SELECT DISTINCT run_id FROM events WHERE run_id IS NOT NULL ORDER BY ts DESC LIMIT 1";
+            match conn.query_row(sql2, [], |row| row.get::<_, String>(0)) {
+                Ok(id) => Ok(Some(id)),
+                Err(_) => Ok(None),
+            }
+        }
+        Err(e) => Err(format!("Failed to query sessions: {}", e)),
+    }
+}
+
+fn parse_time_filter(input: &Option<String>) -> Result<Option<String>, String> {
+    let Some(s) = input else {
+        return Ok(None);
+    };
+
+    // Check for relative time formats: 1h, 24h, 7d, 30m
+    if let Some(ts) = parse_relative_time(s) {
+        return Ok(Some(ts));
+    }
+
+    // Check for RFC3339 format
+    if s.contains('T') && s.contains(':') {
+        return Ok(Some(s.clone()));
+    }
+
+    // Check for date-only format (YYYY-MM-DD)
+    if s.len() == 10 && s.chars().filter(|c| *c == '-').count() == 2 {
+        return Ok(Some(format!("{}T00:00:00Z", s)));
+    }
+
+    Err(format!("Invalid timestamp format: {} (use RFC3339, YYYY-MM-DD, or relative like 1h/24h/7d)", s))
+}
+
+fn parse_relative_time(s: &str) -> Option<String> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+
+    let (num_str, unit) = if s.ends_with('h') {
+        (&s[..s.len()-1], "h")
+    } else if s.ends_with('d') {
+        (&s[..s.len()-1], "d")
+    } else if s.ends_with('m') {
+        (&s[..s.len()-1], "m")
+    } else if s.ends_with('w') {
+        (&s[..s.len()-1], "w")
+    } else {
+        return None;
+    };
+
+    let num: u64 = num_str.parse().ok()?;
+    let secs = match unit {
+        "m" => num * 60,
+        "h" => num * 3600,
+        "d" => num * 86400,
+        "w" => num * 604800,
+        _ => return None,
+    };
+
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let target = now.as_secs().saturating_sub(secs);
+    let dt = UNIX_EPOCH + Duration::from_secs(target);
+    Some(system_time_to_rfc3339(dt))
+}
+
+fn output_report_json(
+    conn: &Connection,
+    filter: &ReportFilter,
+    top: usize,
+    has_sessions: bool,
+) -> Result<(), String> {
+    let mut out = String::from("{\n");
+
+    // Meta section
+    out.push_str("  \"meta\": {\n");
+    out.push_str(&format!("    \"generated_at\": \"{}\",\n", system_time_to_rfc3339(SystemTime::now())));
+    if let Some(ref run_id) = filter.run_id {
+        out.push_str(&format!("    \"run_id\": \"{}\",\n", run_id));
+    }
+    if let Some(ref since) = filter.since {
+        out.push_str(&format!("    \"since\": \"{}\",\n", since));
+    }
+    if let Some(ref until) = filter.until {
+        out.push_str(&format!("    \"until\": \"{}\",\n", until));
+    }
+    out.push_str("    \"version\": \"1.0\"\n");
+    out.push_str("  },\n");
+
+    // Session info (if available and filtering by run_id)
+    if has_sessions {
+        if let Some(ref run_id) = filter.run_id {
+            if let Some(session) = query_session(conn, run_id)? {
+                out.push_str("  \"session\": {\n");
+                out.push_str(&format!("    \"run_id\": \"{}\",\n", session.run_id));
+                out.push_str(&format!("    \"start_ts\": \"{}\",\n", session.start_ts));
+                if let Some(end) = &session.end_ts {
+                    out.push_str(&format!("    \"end_ts\": \"{}\",\n", end));
+                }
+                if let Some(host) = &session.host {
+                    out.push_str(&format!("    \"host\": \"{}\",\n", host));
+                }
+                if let Some(patterns) = &session.patterns {
+                    out.push_str(&format!("    \"patterns\": \"{}\",\n", patterns));
+                }
+                out.push_str(&format!("    \"connects\": {},\n", session.connects.unwrap_or(0)));
+                out.push_str(&format!("    \"closes\": {}\n", session.closes.unwrap_or(0)));
+                out.push_str("  },\n");
+            }
+        }
+    }
+
+    // Summary statistics
+    let summary = query_summary(conn, filter)?;
+    out.push_str("  \"summary\": {\n");
+    out.push_str(&format!("    \"total_events\": {},\n", summary.total_events));
+    out.push_str(&format!("    \"connects\": {},\n", summary.connects));
+    out.push_str(&format!("    \"closes\": {},\n", summary.closes));
+    out.push_str(&format!("    \"active\": {}\n", summary.connects.saturating_sub(summary.closes)));
+    out.push_str("  },\n");
+
+    // Provider breakdown
+    let providers = query_providers(conn, filter)?;
+    out.push_str("  \"providers\": [\n");
+    for (i, p) in providers.iter().enumerate() {
+        out.push_str(&format!(
+            "    {{\"provider\": \"{}\", \"events\": {}, \"connects\": {}, \"closes\": {}}}",
+            p.provider, p.events, p.connects, p.closes
+        ));
+        if i < providers.len() - 1 {
+            out.push_str(",");
+        }
+        out.push_str("\n");
+    }
+    out.push_str("  ],\n");
+
+    // Top domains
+    let domains = query_top_domains(conn, filter, top)?;
+    out.push_str("  \"top_domains\": [\n");
+    for (i, d) in domains.iter().enumerate() {
+        out.push_str(&format!(
+            "    {{\"domain\": \"{}\", \"events\": {}, \"provider\": \"{}\"}}",
+            d.domain, d.events, d.provider
+        ));
+        if i < domains.len() - 1 {
+            out.push_str(",");
+        }
+        out.push_str("\n");
+    }
+    out.push_str("  ],\n");
+
+    // Top IPs
+    let ips = query_top_ips(conn, filter, top)?;
+    out.push_str("  \"top_ips\": [\n");
+    for (i, ip) in ips.iter().enumerate() {
+        let domain_str = ip.domain.as_deref().unwrap_or("unknown");
+        out.push_str(&format!(
+            "    {{\"ip\": \"{}\", \"events\": {}, \"domain\": \"{}\"}}",
+            ip.ip, ip.events, domain_str
+        ));
+        if i < ips.len() - 1 {
+            out.push_str(",");
+        }
+        out.push_str("\n");
+    }
+    out.push_str("  ]\n");
+
+    out.push_str("}\n");
+    print!("{}", out);
+    Ok(())
+}
+
+fn output_report_pretty(
+    conn: &Connection,
+    filter: &ReportFilter,
+    top: usize,
+    has_sessions: bool,
+    color: bool,
+) -> Result<(), String> {
+    // Title
+    println!("\n{}", if color { "\x1b[1mrano report\x1b[0m" } else { "rano report" });
+    println!("{}", "=".repeat(60));
+
+    // Session info
+    if has_sessions {
+        if let Some(ref run_id) = filter.run_id {
+            if let Some(session) = query_session(conn, run_id)? {
+                println!("\n{}", if color { "\x1b[1;36mSession\x1b[0m" } else { "Session" });
+                println!("  Run ID:   {}", session.run_id);
+                println!("  Started:  {}", session.start_ts);
+                if let Some(end) = &session.end_ts {
+                    println!("  Ended:    {}", end);
+                }
+                if let Some(host) = &session.host {
+                    println!("  Host:     {}", host);
+                }
+                if let Some(patterns) = &session.patterns {
+                    println!("  Patterns: {}", patterns);
+                }
+            }
+        }
+    }
+
+    // Summary
+    let summary = query_summary(conn, filter)?;
+    println!("\n{}", if color { "\x1b[1;36mSummary\x1b[0m" } else { "Summary" });
+    println!("  Events:  {} total ({} connects, {} closes)",
+             summary.total_events, summary.connects, summary.closes);
+    println!("  Active:  {} connections", summary.connects.saturating_sub(summary.closes));
+
+    // Providers
+    let providers = query_providers(conn, filter)?;
+    if !providers.is_empty() {
+        println!("\n{}", if color { "\x1b[1;36mProviders\x1b[0m" } else { "Providers" });
+        let max_events = providers.iter().map(|p| p.events).max().unwrap_or(1);
+        for p in &providers {
+            let bar_width = 20;
+            let filled = if max_events > 0 {
+                (p.events as f64 / max_events as f64 * bar_width as f64) as usize
+            } else {
+                0
+            };
+            let bar: String = "█".repeat(filled) + &"░".repeat(bar_width - filled);
+            let provider_colored = if color {
+                match p.provider.as_str() {
+                    "anthropic" => format!("\x1b[35m{}\x1b[0m", p.provider),
+                    "openai" => format!("\x1b[92m{}\x1b[0m", p.provider),
+                    "google" => format!("\x1b[94m{}\x1b[0m", p.provider),
+                    _ => format!("\x1b[90m{}\x1b[0m", p.provider),
+                }
+            } else {
+                p.provider.clone()
+            };
+            println!("  {:12} │ {} │ {:>6} events", provider_colored, bar, p.events);
+        }
+    }
+
+    // Top Domains
+    let domains = query_top_domains(conn, filter, top)?;
+    if !domains.is_empty() {
+        println!("\n{}", if color { "\x1b[1;36mTop Domains\x1b[0m" } else { "Top Domains" });
+        for (i, d) in domains.iter().enumerate() {
+            println!("  {:2}. {:40} {:>6} events  [{}]", i + 1, d.domain, d.events, d.provider);
+        }
+    }
+
+    // Top IPs
+    let ips = query_top_ips(conn, filter, top)?;
+    if !ips.is_empty() {
+        println!("\n{}", if color { "\x1b[1;36mTop IPs\x1b[0m" } else { "Top IPs" });
+        for (i, ip) in ips.iter().enumerate() {
+            let domain = ip.domain.as_deref().unwrap_or("unknown");
+            println!("  {:2}. {:20} {:>6} events  ({})", i + 1, ip.ip, ip.events, domain);
+        }
+    }
+
+    println!();
+    Ok(())
+}
+
+// Report query helper structs
+struct SessionInfo {
+    run_id: String,
+    start_ts: String,
+    end_ts: Option<String>,
+    host: Option<String>,
+    patterns: Option<String>,
+    connects: Option<i64>,
+    closes: Option<i64>,
+}
+
+struct SummaryStats {
+    total_events: i64,
+    connects: i64,
+    closes: i64,
+}
+
+struct ProviderStats {
+    provider: String,
+    events: i64,
+    connects: i64,
+    closes: i64,
+}
+
+struct DomainStats {
+    domain: String,
+    events: i64,
+    provider: String,
+}
+
+struct IpStats {
+    ip: String,
+    events: i64,
+    domain: Option<String>,
+}
+
+fn query_session(conn: &Connection, run_id: &str) -> Result<Option<SessionInfo>, String> {
+    let sql = "SELECT run_id, start_ts, end_ts, host, patterns, connects, closes
+               FROM sessions WHERE run_id = ?";
+    match conn.query_row(sql, [run_id], |row| {
+        Ok(SessionInfo {
+            run_id: row.get(0)?,
+            start_ts: row.get(1)?,
+            end_ts: row.get(2).ok(),
+            host: row.get(3).ok(),
+            patterns: row.get(4).ok(),
+            connects: row.get(5).ok(),
+            closes: row.get(6).ok(),
+        })
+    }) {
+        Ok(s) => Ok(Some(s)),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+        Err(e) => Err(format!("Failed to query session: {}", e)),
+    }
+}
+
+fn query_summary(conn: &Connection, filter: &ReportFilter) -> Result<SummaryStats, String> {
+    let (sql, params) = build_summary_query(filter);
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+    conn.query_row(&sql, params_refs.as_slice(), |row| {
+        Ok(SummaryStats {
+            total_events: row.get(0)?,
+            connects: row.get(1)?,
+            closes: row.get(2)?,
+        })
+    }).map_err(|e| format!("Failed to query summary: {}", e))
+}
+
+fn build_summary_query(filter: &ReportFilter) -> (String, Vec<String>) {
+    let mut sql = String::from(
+        "SELECT COUNT(*) as total,
+                COALESCE(SUM(CASE WHEN event='connect' THEN 1 ELSE 0 END), 0) as connects,
+                COALESCE(SUM(CASE WHEN event='close' THEN 1 ELSE 0 END), 0) as closes
+         FROM events WHERE 1=1"
+    );
+    let mut params: Vec<String> = Vec::new();
+
+    if let Some(ref run_id) = filter.run_id {
+        sql.push_str(" AND run_id = ?");
+        params.push(run_id.clone());
+    }
+    if let Some(ref since) = filter.since {
+        sql.push_str(" AND ts >= ?");
+        params.push(since.clone());
+    }
+    if let Some(ref until) = filter.until {
+        sql.push_str(" AND ts < ?");
+        params.push(until.clone());
+    }
+
+    (sql, params)
+}
+
+fn query_providers(conn: &Connection, filter: &ReportFilter) -> Result<Vec<ProviderStats>, String> {
+    let (sql, params) = build_providers_query(filter);
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+    let mut stmt = conn.prepare(&sql)
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let rows = stmt.query_map(params_refs.as_slice(), |row| {
+        Ok(ProviderStats {
+            provider: row.get(0)?,
+            events: row.get(1)?,
+            connects: row.get(2)?,
+            closes: row.get(3)?,
+        })
+    }).map_err(|e| format!("Failed to query providers: {}", e))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| format!("Failed to read row: {}", e))?);
+    }
+    Ok(results)
+}
+
+fn build_providers_query(filter: &ReportFilter) -> (String, Vec<String>) {
+    let mut sql = String::from(
+        "SELECT provider,
+                COUNT(*) as events,
+                SUM(CASE WHEN event='connect' THEN 1 ELSE 0 END) as connects,
+                SUM(CASE WHEN event='close' THEN 1 ELSE 0 END) as closes
+         FROM events WHERE 1=1"
+    );
+    let mut params: Vec<String> = Vec::new();
+
+    if let Some(ref run_id) = filter.run_id {
+        sql.push_str(" AND run_id = ?");
+        params.push(run_id.clone());
+    }
+    if let Some(ref since) = filter.since {
+        sql.push_str(" AND ts >= ?");
+        params.push(since.clone());
+    }
+    if let Some(ref until) = filter.until {
+        sql.push_str(" AND ts < ?");
+        params.push(until.clone());
+    }
+
+    sql.push_str(" GROUP BY provider ORDER BY events DESC");
+    (sql, params)
+}
+
+fn query_top_domains(conn: &Connection, filter: &ReportFilter, top: usize) -> Result<Vec<DomainStats>, String> {
+    let (sql, params) = build_domains_query(filter, top);
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+    let mut stmt = conn.prepare(&sql)
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let rows = stmt.query_map(params_refs.as_slice(), |row| {
+        Ok(DomainStats {
+            domain: row.get(0)?,
+            events: row.get(1)?,
+            provider: row.get(2)?,
+        })
+    }).map_err(|e| format!("Failed to query domains: {}", e))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| format!("Failed to read row: {}", e))?);
+    }
+    Ok(results)
+}
+
+fn build_domains_query(filter: &ReportFilter, top: usize) -> (String, Vec<String>) {
+    let mut sql = String::from(
+        "SELECT COALESCE(domain, 'unknown') as domain,
+                COUNT(*) as events,
+                provider
+         FROM events WHERE domain IS NOT NULL AND domain != ''"
+    );
+    let mut params: Vec<String> = Vec::new();
+
+    if let Some(ref run_id) = filter.run_id {
+        sql.push_str(" AND run_id = ?");
+        params.push(run_id.clone());
+    }
+    if let Some(ref since) = filter.since {
+        sql.push_str(" AND ts >= ?");
+        params.push(since.clone());
+    }
+    if let Some(ref until) = filter.until {
+        sql.push_str(" AND ts < ?");
+        params.push(until.clone());
+    }
+
+    sql.push_str(&format!(" GROUP BY domain, provider ORDER BY events DESC LIMIT {}", top));
+    (sql, params)
+}
+
+fn query_top_ips(conn: &Connection, filter: &ReportFilter, top: usize) -> Result<Vec<IpStats>, String> {
+    let (sql, params) = build_ips_query(filter, top);
+    let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+    let mut stmt = conn.prepare(&sql)
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let rows = stmt.query_map(params_refs.as_slice(), |row| {
+        Ok(IpStats {
+            ip: row.get(0)?,
+            events: row.get(1)?,
+            domain: row.get(2).ok(),
+        })
+    }).map_err(|e| format!("Failed to query IPs: {}", e))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| format!("Failed to read row: {}", e))?);
+    }
+    Ok(results)
+}
+
+fn build_ips_query(filter: &ReportFilter, top: usize) -> (String, Vec<String>) {
+    let mut sql = String::from(
+        "SELECT remote_ip,
+                COUNT(*) as events,
+                domain
+         FROM events WHERE remote_ip IS NOT NULL"
+    );
+    let mut params: Vec<String> = Vec::new();
+
+    if let Some(ref run_id) = filter.run_id {
+        sql.push_str(" AND run_id = ?");
+        params.push(run_id.clone());
+    }
+    if let Some(ref since) = filter.since {
+        sql.push_str(" AND ts >= ?");
+        params.push(since.clone());
+    }
+    if let Some(ref until) = filter.until {
+        sql.push_str(" AND ts < ?");
+        params.push(until.clone());
+    }
+
+    sql.push_str(&format!(" GROUP BY remote_ip ORDER BY events DESC LIMIT {}", top));
+    (sql, params)
 }
 
 fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
