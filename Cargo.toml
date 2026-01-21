@@ -14,3 +14,6 @@ pcap = { version = "2.4", optional = true }
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.9"
+
+[dev-dependencies]
+tempfile = "3.20"
