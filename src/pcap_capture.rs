@@ -218,7 +218,9 @@ pub fn pcap_supported() -> bool {
 pub fn start_pcap_capture() -> Result<PcapHandle, String> {
     use pcap::{Capture, Device};
 
-    let device = Device::lookup().map_err(|e| format!("pcap device lookup failed: {e}"))?;
+    let device = Device::lookup()
+        .map_err(|e| format!("pcap device lookup failed: {e}"))?
+        .ok_or_else(|| "no default pcap device found".to_string())?;
     let mut cap = Capture::from_device(device)
         .map_err(|e| format!("pcap device open failed: {e}"))?
         .promisc(true)
@@ -229,7 +231,8 @@ pub fn start_pcap_capture() -> Result<PcapHandle, String> {
     cap.filter("udp port 53 or tcp port 53 or tcp port 443", true)
         .map_err(|e| format!("pcap filter failed: {e}"))?;
 
-    cap.setnonblock(true)
+    let cap = cap
+        .setnonblock()
         .map_err(|e| format!("pcap nonblock failed: {e}"))?;
 
     let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
@@ -246,7 +249,7 @@ pub fn start_pcap_capture() -> Result<PcapHandle, String> {
                     handle_transport_packet(tp, &sender);
                 }
             }
-            Err(pcap::Error::NoPacket) => {
+            Err(pcap::Error::TimeoutExpired) => {
                 std::thread::sleep(Duration::from_millis(10));
             }
             Err(_) => {
@@ -383,12 +386,10 @@ fn parse_ipv6_packet(data: &[u8], offset: usize) -> Option<TransportPacket<'_>> 
         return None;
     }
     let next_header = data[offset + 6];
-    let src_ip = IpAddr::V6(Ipv6Addr::from(
-        data[offset + 8..offset + 24].try_into().ok()?,
-    ));
-    let dst_ip = IpAddr::V6(Ipv6Addr::from(
-        data[offset + 24..offset + 40].try_into().ok()?,
-    ));
+    let src_bytes: [u8; 16] = data[offset + 8..offset + 24].try_into().ok()?;
+    let src_ip = IpAddr::V6(Ipv6Addr::from(src_bytes));
+    let dst_bytes: [u8; 16] = data[offset + 24..offset + 40].try_into().ok()?;
+    let dst_ip = IpAddr::V6(Ipv6Addr::from(dst_bytes));
     let l4_offset = offset + 40;
     match next_header {
         6 => parse_tcp_segment(data, l4_offset, src_ip, dst_ip),
