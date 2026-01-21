@@ -1,12 +1,5 @@
 # rano
 
-```
-      _ __ ___   __ _ _ __   ___
- ____| '__/ _ \ / _` | '_ \ / _ \
-|__  | | | (_) | (_| | | | | (_) |
-   |_|_|  \___/ \__,_|_| |_|\___/
-```
-
 <div align="center">
   <img src="rano_illustration.webp" alt="rano - network observer for AI CLI processes">
 </div>
