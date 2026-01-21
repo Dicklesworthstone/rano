@@ -992,6 +992,7 @@ struct SqliteEvent {
     ancestry_path: Option<String>,
     duration_ms: Option<u64>,
     alert: bool,
+    retry_count: Option<usize>,
 }
 
 enum SqliteMsg {
@@ -1282,6 +1283,7 @@ fn main() {
         alert_count: 0,
         suppressed_count: 0,
     };
+    let mut retry_tracker = RetryTracker::new(args.retry_threshold, args.retry_window_ms);
 
     let resolved_log_format = log_format_for_output(args.json, args.log_format);
     let log_writer = open_log_writer(&args, &domain_label, resolved_log_format);
@@ -1417,6 +1419,7 @@ fn main() {
                         ancestry_path: ancestry_path.clone(),
                         duration_ms: None,
                         alert: triggers_alert,
+                        retry_count: None,
                     });
                 }
                 if !args.summary_only {
@@ -1503,6 +1506,54 @@ fn main() {
                 let triggers_alert = would_trigger_duration_alert(&args.alert, duration_ms);
 
                 let ts = now_rfc3339();
+                // Track retry pattern on close events
+                let retry_warning = retry_tracker.track_connection(
+                    key.remote_ip,
+                    key.remote_port,
+                    info.pid,
+                );
+                let retry_count = retry_warning.as_ref().map(|w| w.count);
+
+                // Emit retry warning if detected
+                if let Some(ref warning) = retry_warning {
+                    if !args.summary_only {
+                        let ip_str = key.remote_ip.to_string();
+                        let domain_str = info.domain.as_deref().unwrap_or(&ip_str);
+                        let msg = format!(
+                            "\u{26A0} Retry pattern: {} connections to {}:{} in {}s",
+                            warning.count,
+                            domain_str,
+                            key.remote_port,
+                            warning.window_seconds
+                        );
+                        if args.json {
+                            eprintln!(
+                                r#"{{"type":"retry_warning","count":{},"endpoint":"{}:{}","window_seconds":{}}}"#,
+                                warning.count,
+                                warning.endpoint.0,
+                                warning.endpoint.1,
+                                warning.window_seconds
+                            );
+                        } else {
+                            let styled_msg = if style.color {
+                                format!("\x1b[33m{}\x1b[0m", msg)
+                            } else {
+                                msg
+                            };
+                            eprintln!("{}", styled_msg);
+                        }
+                        if let Some(ref writer) = log_writer {
+                            writer.write_line(&format!(
+                                "\u{26A0} Retry pattern: {} connections to {}:{} in {}s",
+                                warning.count,
+                                domain_str,
+                                key.remote_port,
+                                warning.window_seconds
+                            ));
+                        }
+                    }
+                }
+
                 if let Some(writer) = sqlite_writer.as_ref() {
                     writer.enqueue(SqliteEvent {
                         ts: ts.clone(),
@@ -1517,6 +1568,7 @@ fn main() {
                         ancestry_path: info.ancestry_path.clone(),
                         duration_ms,
                         alert: triggers_alert,
+                        retry_count,
                     });
                 }
                 if !args.summary_only {
@@ -6313,7 +6365,9 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
             ancestry_path TEXT,
             remote_is_private INTEGER,
             ip_version INTEGER,
-            duration_ms INTEGER
+            duration_ms INTEGER,
+            alert INTEGER,
+            retry_count INTEGER
         );
         CREATE TABLE IF NOT EXISTS sessions (
             run_id TEXT PRIMARY KEY,
@@ -6440,8 +6494,8 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
     };
     let (is_private, ip_version) = ip_flags(event.key.remote_ip);
     conn.execute(
-        "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, ancestry_path, remote_is_private, ip_version, duration_ms, alert)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
+        "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, ancestry_path, remote_is_private, ip_version, duration_ms, alert, retry_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         params![
             &event.ts,
             &event.run_id,
@@ -6461,6 +6515,7 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
             ip_version,
             event.duration_ms.map(|v| v as i64),
             if event.alert { 1 } else { 0 },
+            event.retry_count.map(|v| v as i64),
         ],
     )?;
     Ok(())
@@ -6861,6 +6916,7 @@ mod tests {
             ancestry_path: Some("init:1,testproc:1234".to_string()),
             duration_ms: if event == "close" { Some(1000) } else { None },
             alert: false,
+            retry_count: None,
         }
     }
 
