@@ -430,6 +430,7 @@ struct MonitorArgs {
     stats_cycle_ms: u64,
     no_banner: bool,
     theme: Theme,
+    session_name: Option<String>,
     alert: AlertConfig,
     /// Retry detection threshold (number of connections in window to trigger warning)
     retry_threshold: usize,
@@ -648,6 +649,7 @@ impl Default for MonitorArgs {
             stats_cycle_ms: 0,
             no_banner: false,
             theme: Theme::Vivid,
+            session_name: None,
             alert: AlertConfig::default(),
             retry_threshold: 3,
             retry_window_ms: 60000,
