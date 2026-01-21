@@ -1026,6 +1026,14 @@ fn main() {
                     opened_at: now,
                     last_seen: now,
                 };
+
+                // Check if this connection would trigger an alert (for SQLite flag)
+                let triggers_alert = would_trigger_connection_alert(
+                    &args.alert,
+                    domain.as_deref(),
+                    entry.remote_ip,
+                );
+
                 active.insert(key.clone(), info);
 
                 let ts = now_rfc3339();
@@ -1042,7 +1050,7 @@ fn main() {
                         domain: domain.clone(),
                         ancestry_path: ancestry_path.clone(),
                         duration_ms: None,
-                        alert: false,
+                        alert: triggers_alert,
                     });
                 }
                 if !args.summary_only {
@@ -1124,6 +1132,10 @@ fn main() {
                     .duration_since(info.opened_at)
                     .map(|d| d.as_millis() as u64)
                     .ok();
+
+                // Check if this close event would trigger a duration alert (for SQLite flag)
+                let triggers_alert = would_trigger_duration_alert(&args.alert, duration_ms);
+
                 let ts = now_rfc3339();
                 if let Some(writer) = sqlite_writer.as_ref() {
                     writer.enqueue(SqliteEvent {
@@ -1138,7 +1150,7 @@ fn main() {
                         domain: info.domain.clone(),
                         ancestry_path: info.ancestry_path.clone(),
                         duration_ms,
-                        alert: false,
+                        alert: triggers_alert,
                     });
                 }
                 if !args.summary_only {
@@ -2819,6 +2831,30 @@ fn format_pretty_alert(
     format!("{} {} | {} | {}{}", alert_prefix, ts, severity_str, kind_str, conn_str)
 }
 
+/// Check if a connection would trigger a connection-level alert (without emitting).
+/// Returns true if domain pattern or unknown domain alert would fire.
+fn would_trigger_connection_alert(
+    alert_config: &AlertConfig,
+    domain: Option<&str>,
+    _remote_ip: std::net::IpAddr,
+) -> bool {
+    if !alert_config.is_enabled() {
+        return false;
+    }
+
+    // Check domain patterns
+    if check_domain_patterns(domain, &alert_config.domain_patterns).is_some() {
+        return true;
+    }
+
+    // Check unknown domain
+    if alert_config.alert_unknown_domain && domain.is_none() {
+        return true;
+    }
+
+    false
+}
+
 /// Check connection-level alerts (domain pattern, unknown domain).
 fn check_connection_alerts(
     alert_config: &AlertConfig,
@@ -2899,6 +2935,22 @@ fn check_threshold_alerts(
             }
         }
     }
+}
+
+/// Check if a close event would trigger a duration alert (without emitting).
+fn would_trigger_duration_alert(
+    alert_config: &AlertConfig,
+    duration_ms: Option<u64>,
+) -> bool {
+    if !alert_config.is_enabled() {
+        return false;
+    }
+
+    if let (Some(threshold_ms), Some(ms)) = (alert_config.duration_threshold_ms, duration_ms) {
+        return ms > threshold_ms;
+    }
+
+    false
 }
 
 /// Check duration alerts on connection close.
@@ -6301,5 +6353,221 @@ mod tests {
             .query_row("SELECT COUNT(DISTINCT run_id) FROM events", [], |row| row.get(0))
             .expect("count query failed");
         assert_eq!(distinct_run_ids, 1);
+    }
+
+    // Alert system unit tests
+
+    #[test]
+    fn alert_domain_pattern_match() {
+        // Test glob pattern matching for domain alerts
+        assert!(glob_match("*.evil.com", "malware.evil.com"));
+        assert!(glob_match("*.evil.com", "sub.domain.evil.com"));
+        assert!(!glob_match("*.evil.com", "evil.com"));
+        assert!(!glob_match("*.evil.com", "noevil.com"));
+
+        // Test single-character wildcard
+        assert!(glob_match("api?.example.com", "api1.example.com"));
+        assert!(glob_match("api?.example.com", "api2.example.com"));
+        assert!(!glob_match("api?.example.com", "api12.example.com"));
+
+        // Test exact match (no wildcards)
+        assert!(glob_match("exact.domain.com", "exact.domain.com"));
+        assert!(!glob_match("exact.domain.com", "other.domain.com"));
+    }
+
+    #[test]
+    fn alert_config_is_enabled() {
+        // Empty config should be disabled
+        let empty_config = AlertConfig {
+            domain_patterns: vec![],
+            max_connections: None,
+            max_per_provider: None,
+            duration_threshold_ms: None,
+            alert_unknown_domain: false,
+            bell: false,
+            cooldown_ms: 10000,
+            no_alerts: false,
+        };
+        assert!(!empty_config.is_enabled());
+
+        // Config with domain pattern should be enabled
+        let domain_config = AlertConfig {
+            domain_patterns: vec!["*.evil.com".to_string()],
+            max_connections: None,
+            max_per_provider: None,
+            duration_threshold_ms: None,
+            alert_unknown_domain: false,
+            bell: false,
+            cooldown_ms: 10000,
+            no_alerts: false,
+        };
+        assert!(domain_config.is_enabled());
+
+        // Config with max_connections should be enabled
+        let conn_config = AlertConfig {
+            domain_patterns: vec![],
+            max_connections: Some(100),
+            max_per_provider: None,
+            duration_threshold_ms: None,
+            alert_unknown_domain: false,
+            bell: false,
+            cooldown_ms: 10000,
+            no_alerts: false,
+        };
+        assert!(conn_config.is_enabled());
+
+        // Config with no_alerts should be disabled regardless of other settings
+        let disabled_config = AlertConfig {
+            domain_patterns: vec!["*.evil.com".to_string()],
+            max_connections: Some(100),
+            max_per_provider: None,
+            duration_threshold_ms: None,
+            alert_unknown_domain: false,
+            bell: false,
+            cooldown_ms: 10000,
+            no_alerts: true,
+        };
+        assert!(!disabled_config.is_enabled());
+    }
+
+    #[test]
+    fn alert_would_trigger_connection_alert() {
+        let config = AlertConfig {
+            domain_patterns: vec!["*.malicious.com".to_string()],
+            max_connections: None,
+            max_per_provider: None,
+            duration_threshold_ms: None,
+            alert_unknown_domain: true,
+            bell: false,
+            cooldown_ms: 10000,
+            no_alerts: false,
+        };
+
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4));
+
+        // Domain pattern match should trigger
+        assert!(would_trigger_connection_alert(&config, Some("evil.malicious.com"), ip));
+
+        // Non-matching domain should not trigger
+        assert!(!would_trigger_connection_alert(&config, Some("safe.example.com"), ip));
+
+        // Unknown domain should trigger (when alert_unknown_domain is true)
+        assert!(would_trigger_connection_alert(&config, None, ip));
+    }
+
+    #[test]
+    fn alert_would_trigger_duration_alert() {
+        let config = AlertConfig {
+            domain_patterns: vec![],
+            max_connections: None,
+            max_per_provider: None,
+            duration_threshold_ms: Some(30000), // 30 seconds
+            alert_unknown_domain: false,
+            bell: false,
+            cooldown_ms: 10000,
+            no_alerts: false,
+        };
+
+        // Duration exceeding threshold should trigger
+        assert!(would_trigger_duration_alert(&config, Some(40000)));
+
+        // Duration at exactly threshold should not trigger (must exceed)
+        assert!(!would_trigger_duration_alert(&config, Some(30000)));
+
+        // Duration under threshold should not trigger
+        assert!(!would_trigger_duration_alert(&config, Some(10000)));
+
+        // No duration should not trigger
+        assert!(!would_trigger_duration_alert(&config, None));
+    }
+
+    #[test]
+    fn alert_cooldown_prevents_spam() {
+        let mut state = AlertState {
+            last_alert: HashMap::new(),
+            alert_count: 0,
+            suppressed_count: 0,
+        };
+
+        let sig = AlertSignature::MaxConnections;
+        let cooldown_ms = 10000; // 10 seconds
+
+        // First alert should emit
+        assert!(should_emit_alert(&mut state, &sig, cooldown_ms));
+        assert_eq!(state.alert_count, 1);
+        assert_eq!(state.suppressed_count, 0);
+
+        // Immediate second alert should be suppressed
+        assert!(!should_emit_alert(&mut state, &sig, cooldown_ms));
+        assert_eq!(state.alert_count, 1);
+        assert_eq!(state.suppressed_count, 1);
+
+        // Different alert type should still emit
+        let sig2 = AlertSignature::MaxPerProvider { provider: Provider::Anthropic };
+        assert!(should_emit_alert(&mut state, &sig2, cooldown_ms));
+        assert_eq!(state.alert_count, 2);
+    }
+
+    #[test]
+    fn alert_check_domain_patterns() {
+        let patterns = vec![
+            "*.evil.com".to_string(),
+            "malware.*.org".to_string(),
+        ];
+
+        // Match first pattern
+        let result = check_domain_patterns(Some("sub.evil.com"), &patterns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "*.evil.com");
+
+        // Match second pattern
+        let result = check_domain_patterns(Some("malware.distribution.org"), &patterns);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap(), "malware.*.org");
+
+        // No match
+        let result = check_domain_patterns(Some("safe.example.com"), &patterns);
+        assert!(result.is_none());
+
+        // None domain returns None (never matches patterns)
+        let result = check_domain_patterns(None, &patterns);
+        assert!(result.is_none());
+
+        // Empty patterns never match
+        let result = check_domain_patterns(Some("anything.com"), &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn alert_sqlite_stores_alert_flag() {
+        let mut conn = setup_test_db();
+
+        // Create event with alert=true
+        let mut alert_event = create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Unknown);
+        alert_event.alert = true;
+        alert_event.domain = Some("evil.malicious.com".to_string());
+
+        // Create event with alert=false
+        let normal_event = create_test_event("2026-01-20T12:00:01Z", "connect", Provider::Anthropic);
+
+        let batch = vec![alert_event, normal_event];
+        write_sqlite_batch(&mut conn, &batch).expect("batch write failed");
+
+        // Query and verify alert flags
+        let alert_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events WHERE alert = 1", [], |row| row.get(0))
+            .expect("count query failed");
+        assert_eq!(alert_count, 1);
+
+        let normal_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events WHERE alert = 0", [], |row| row.get(0))
+            .expect("count query failed");
+        assert_eq!(normal_count, 1);
+
+        // Verify the alert event has the expected domain
+        let alert_domain: String = conn
+            .query_row("SELECT domain FROM events WHERE alert = 1", [], |row| row.get(0))
+            .expect("domain query failed");
+        assert_eq!(alert_domain, "evil.malicious.com");
     }
 }

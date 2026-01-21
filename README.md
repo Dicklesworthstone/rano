@@ -268,6 +268,119 @@ rano report --latest --color always
 
 ---
 
+## Alert Thresholds
+
+rano can proactively alert you when connections match suspicious patterns or exceed thresholds. Alerts appear on stderr with distinct formatting so you can monitor without watching output constantly.
+
+### Quick Examples
+
+```bash
+# Watch for connections to suspicious domains
+rano --alert-domain "*.evil.com" --alert-domain "*.malware.org"
+
+# Alert when total connections exceed 100
+rano --alert-max-connections 100
+
+# Alert when any provider exceeds 50 connections
+rano --alert-max-per-provider 50
+
+# Alert on connections lasting longer than 30 seconds
+rano --alert-duration-ms 30000
+
+# Alert on unresolved domains (potential DNS tunneling)
+rano --alert-unknown-domain
+
+# Combine multiple alerts for security monitoring
+rano --alert-domain "*.suspicious.com" \
+     --alert-max-connections 200 \
+     --alert-unknown-domain \
+     --alert-bell
+```
+
+### Alert Flags
+
+| Flag | Description |
+|------|-------------|
+| `--alert-domain <pattern>` | Glob pattern for domains to watch (repeatable) |
+| `--alert-max-connections <N>` | Alert when total active connections exceed N |
+| `--alert-max-per-provider <N>` | Alert when any provider exceeds N connections |
+| `--alert-duration-ms <N>` | Alert on connections lasting longer than N ms |
+| `--alert-unknown-domain` | Alert on connections to unresolved IPs |
+| `--alert-bell` | Ring terminal bell on alert |
+| `--alert-cooldown-ms <N>` | Suppress duplicate alerts within N ms (default: 10000) |
+| `--no-alerts` | Disable all alerting |
+
+### Alert Output Format
+
+Alerts print to stderr with timestamps and details:
+
+```
+[ALERT] 2026-01-20T10:00:00Z | CRITICAL | domain_match | evil.malicious.com matched *.malicious.com
+[ALERT] 2026-01-20T10:00:01Z | WARNING | max_connections | 101/100 active connections
+[ALERT] 2026-01-20T10:00:02Z | WARNING | long_duration | 45000ms > 30000ms
+```
+
+In JSON mode, alerts are JSON objects on stderr:
+
+```json
+{"type":"alert","ts":"2026-01-20T10:00:00Z","kind":"domain_match","severity":"critical","pattern":"*.malicious.com","domain":"evil.malicious.com"}
+```
+
+### SQLite Alert Tracking
+
+Events that trigger alerts are stored with `alert=1` in SQLite for later analysis:
+
+```sql
+-- Find all alert-triggering events
+SELECT * FROM events WHERE alert = 1;
+
+-- Count alerts by domain
+SELECT domain, COUNT(*) as alerts FROM events WHERE alert = 1 GROUP BY domain;
+```
+
+### Use Cases
+
+**Security audit**: Watch for unexpected outbound connections during a code review session.
+
+```bash
+rano --pattern claude \
+     --alert-domain "*.unknown-cdn.com" \
+     --alert-unknown-domain \
+     --alert-max-connections 50
+```
+
+**Rate limit detection**: Identify when AI CLI tools are making too many connections.
+
+```bash
+rano --alert-max-per-provider 100 \
+     --alert-duration-ms 60000
+```
+
+**Compliance monitoring**: Log all connections that match suspicious patterns.
+
+```bash
+rano --alert-domain "*.cn" \
+     --alert-domain "*.ru" \
+     --sqlite /var/log/rano-audit.sqlite
+```
+
+### Troubleshooting
+
+**Alerts aren't firing**
+
+1. Verify the pattern matches: `rano --alert-domain "*.example.com" --once` should show the flag is accepted
+2. Check cooldown: default is 10 seconds. Use `--alert-cooldown-ms 1000` for more frequent alerts
+3. Ensure `--no-alerts` is not set
+4. For domain alerts, ensure DNS resolution is working (`--no-dns` disables it)
+
+**Too many alerts (spam)**
+
+1. Increase cooldown: `--alert-cooldown-ms 60000` (60 seconds)
+2. Narrow patterns: use more specific domain patterns
+3. Raise thresholds: increase `--alert-max-connections` value
+
+---
+
 ## Configuration
 
 Default path: `~/.config/rano/config.conf`
