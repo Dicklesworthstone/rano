@@ -1,0 +1,26 @@
+CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            run_id TEXT,
+            event TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            pid INTEGER,
+            comm TEXT,
+            cmdline TEXT,
+            proto TEXT,
+            local_ip TEXT,
+            local_port INTEGER,
+            remote_ip TEXT,
+            remote_port INTEGER,
+            domain TEXT,
+            ancestry_path TEXT,
+            remote_is_private INTEGER,
+            ip_version INTEGER,
+            duration_ms INTEGER
+        , alert INTEGER);
+CREATE INDEX idx_events_ts ON events(ts);
+CREATE INDEX idx_events_run_id ON events(run_id);
+CREATE INDEX idx_events_provider ON events(provider);
+CREATE INDEX idx_events_remote_ip ON events(remote_ip);
+CREATE INDEX idx_events_domain ON events(domain);
+CREATE INDEX idx_events_ancestry_path ON events(ancestry_path);

@@ -1,0 +1,247 @@
+== E2E Header ==
+  timestamp=2026-01-21T10:32:50Z
+  host=threadripperje
+  os=Linux threadripperje 6.17.0-8-generic #8-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov 14 21:44:46 UTC 2025 x86_64 GNU/Linux
+  rano_version=0.1.0
+  test_name=alert-thresholds
+  args=
+== Setup ==
+  rano=/tmp/cargo-target/debug/rano
+  test_sqlite=/tmp/rano-e2e-alerts-917175.sqlite
+  test_log=/tmp/rano-e2e-alerts-917175.log
+== Test 1: Alert CLI flags parsing ==
+== RUN 1: parse alert flags ==
+  cmd=/tmp/cargo-target/debug/rano --help
+  status=0
+  output (truncated):
+rano - AI CLI network observer
+
+USAGE:
+  rano [options]
+  rano report [options]
+  rano export [options]
+  rano update [options]
+
+COMMANDS:
+  report    Query SQLite event history (use --help for details)
+  export    Export SQLite event history
+  update    Update the rano binary
+
+OPTIONS:
+--pattern <str>           Process name or cmdline substring to match (repeatable)
+--exclude-pattern <str>   Exclude processes matching substring (repeatable)
+--pid <pid>               Monitor a specific PID (repeatable)
+--no-descendants          Do not include descendant processes
+--interval-ms <ms>        Poll interval (default: 1000)
+--json                    Emit JSON lines to stdout
+--summary-only            Suppress live events, show summary only
+--domain-mode <mode>      auto|ptr|pcap (default: auto)
+--pcap                    Force pcap mode (falls back with warning)
+--no-dns                  Disable PTR lookups
+--include-udp             Include UDP sockets (default: true)
+--no-udp                  Disable UDP sockets
+--include-listening       Include listening TCP sockets
+--show-ancestry           Include process ancestry chain in output
+--log-file <path>         Append output to log file
+--log-dir <path>          Write per-run log files into directory
+--log-format <fmt>        auto|pretty|json for log files (default: auto)
+--once                    Emit a single poll and exit
+--color <mode>            auto|always|never (default: auto)
+--no-color                Disable ANSI color
+--theme <name>            vivid|mono (default: vivid)
+--sqlite <path>           SQLite file for persistent logging
+--no-sqlite               Disable SQLite logging
+--db-batch-size <n>       SQLite batch size (events per transaction)
+--db-flush-ms <ms>        SQLite flush interval in ms
+--db-queue-max <n>        SQLite queue capacity (events)
+--stats-interval-ms <ms>  Live stats interval (0 disables)
+--stats-width <n>         ASCII bar width
+--stats-top <n>           Top-N domains/IPs in stats/summary
+--stats-view <name>       Stats view: provider|domain|port|process (repeatable)
+--stats-cycle-ms <ms>     Rotate stats views at this interval (0 disables)
+--no-banner               Suppress startup banner
+
+ALERT OPTIONS:
+--alert-domain <pattern>       Alert on domains matching glob pattern (repeatable)
+--alert-max-connections <n>    Alert when total active connections exceed N
+--alert-max-per-provider <n>   Alert when any provider exceeds N connections
+--alert-duration-ms <ms>       Alert on connections lasting longer than N ms
+--alert-unknown-domain         Alert on connections to unresolved domains
+--alert-bell                   Ring terminal bell on alerts
+--alert-cooldown-ms <ms>       Suppress duplicate alerts within window (default: 10000)
+--no-alerts                    Disable all alerting
+
+CONFIG:
+--config <path>           Load config file (key=value format)
+--config-toml <path>      Load provider config (TOML)
+--no-config               Ignore config files
+-h, --help                Show this help
+-V, --version             Show version
+
+EXAMPLES:
+rano --alert-domain '*.evil.com' --alert-max-connections 100
+rano --pattern claude --alert-unknown-domain
+
+== ASSERT status ==
+  expected=0
+  actual=0
+== ASSERT contains ==
+  expected substring=--alert-domain
+== ASSERT contains ==
+  expected substring=--alert-max-connections
+== ASSERT contains ==
+  expected substring=--alert-duration-ms
+== ASSERT contains ==
+  expected substring=--alert-unknown-domain
+== ASSERT contains ==
+  expected substring=--alert-bell
+== ASSERT contains ==
+  expected substring=--alert-cooldown-ms
+  PASS: All alert flags present in help
+== Test 2: Alert config with no matching processes ==
+== RUN 2: once with alert config ==
+  cmd=/tmp/cargo-target/debug/rano --pattern nonexistent-process-xyz --sqlite /tmp/rano-e2e-alerts-917175.sqlite --alert-domain *.malicious.com --alert-max-connections 100 --alert-duration-ms 60000 --once --no-banner
+  status=0
+  output (truncated):
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+  PASS: rano accepts alert configuration
+== Test 3: SQLite schema includes alert column ==
+== RUN 3: check schema ==
+  cmd=sqlite3 /tmp/rano-e2e-alerts-917175.sqlite .schema events
+  status=0
+  output (truncated):
+CREATE TABLE events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts TEXT NOT NULL,
+            run_id TEXT,
+            event TEXT NOT NULL,
+            provider TEXT NOT NULL,
+            pid INTEGER,
+            comm TEXT,
+            cmdline TEXT,
+            proto TEXT,
+            local_ip TEXT,
+            local_port INTEGER,
+            remote_ip TEXT,
+            remote_port INTEGER,
+            domain TEXT,
+            ancestry_path TEXT,
+            remote_is_private INTEGER,
+            ip_version INTEGER,
+            duration_ms INTEGER
+        , alert INTEGER);
+CREATE INDEX idx_events_ts ON events(ts);
+CREATE INDEX idx_events_run_id ON events(run_id);
+CREATE INDEX idx_events_provider ON events(provider);
+CREATE INDEX idx_events_remote_ip ON events(remote_ip);
+CREATE INDEX idx_events_domain ON events(domain);
+CREATE INDEX idx_events_ancestry_path ON events(ancestry_path);
+== ASSERT contains ==
+  expected substring=alert
+  PASS: SQLite events table has alert column
+== Test 4: JSON summary includes alert counts ==
+== RUN 4: json summary ==
+  cmd=/tmp/cargo-target/debug/rano --pattern nonexistent-process-xyz --sqlite /tmp/rano-e2e-alerts-917175.sqlite --json --once --no-banner
+  status=0
+  output (truncated):
+{"summary":{"connects":0,"closes":0,"active":0,"peak_active":0,"sqlite_dropped":0,"alerts":0,"alerts_suppressed":0,"per_ip":{},"per_domain":{},"per_pid":{},"per_comm":{},"per_provider":{},"domain_mode":"ptr"}}
+== ASSERT contains ==
+  expected substring=alerts
+== ASSERT contains ==
+  expected substring=alerts_suppressed
+  PASS: JSON summary includes alert count fields
+== Test 5: --no-alerts flag ==
+== RUN 5: no-alerts mode ==
+  cmd=/tmp/cargo-target/debug/rano --pattern nonexistent-process-xyz --alert-domain *.evil.com --no-alerts --once --no-banner
+  status=0
+  output (truncated):
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== ASSERT status ==
+  expected=0
+  actual=0
+  PASS: --no-alerts flag accepted
+== Test 6: Alert cooldown configuration ==
+== RUN 6: custom cooldown ==
+  cmd=/tmp/cargo-target/debug/rano --pattern nonexistent-process-xyz --alert-max-connections 10 --alert-cooldown-ms 5000 --once --no-banner
+  status=0
+  output (truncated):
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== ASSERT status ==
+  expected=0
+  actual=0
+  PASS: --alert-cooldown-ms flag accepted
+== Test 7: Multiple alert domain patterns ==
+== RUN 7: multiple domains ==
+  cmd=/tmp/cargo-target/debug/rano --pattern nonexistent-process-xyz --alert-domain *.evil.com --alert-domain *.malware.org --alert-domain bad.site.net --once --no-banner
+  status=0
+  output (truncated):
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== ASSERT status ==
+  expected=0
+  actual=0
+  PASS: Multiple --alert-domain flags accepted
+== Test 8: Combined alert configuration ==
+== RUN 8: all alert options ==
+  cmd=/tmp/cargo-target/debug/rano --pattern nonexistent-process-xyz --alert-domain *.suspicious.com --alert-max-connections 50 --alert-max-per-provider 20 --alert-duration-ms 30000 --alert-unknown-domain --alert-cooldown-ms 15000 --sqlite /tmp/rano-e2e-alerts-917175.sqlite --once --no-banner
+  status=0
+  output (truncated):
+Summary
+  connects 0
+  closes 0
+  active 0 (peak=0)
+== ASSERT status ==
+  expected=0
+  actual=0
+  PASS: All alert options combined work together
+== Test 9: SQLite alert column stores integers ==
+== RUN 9: check column type ==
+  cmd=sqlite3 /tmp/rano-e2e-alerts-917175.sqlite PRAGMA table_info(events);
+  status=0
+  output (truncated):
+0|id|INTEGER|0||1
+1|ts|TEXT|1||0
+2|run_id|TEXT|0||0
+3|event|TEXT|1||0
+4|provider|TEXT|1||0
+5|pid|INTEGER|0||0
+6|comm|TEXT|0||0
+7|cmdline|TEXT|0||0
+8|proto|TEXT|0||0
+9|local_ip|TEXT|0||0
+10|local_port|INTEGER|0||0
+11|remote_ip|TEXT|0||0
+12|remote_port|INTEGER|0||0
+13|domain|TEXT|0||0
+14|ancestry_path|TEXT|0||0
+15|remote_is_private|INTEGER|0||0
+16|ip_version|INTEGER|0||0
+17|duration_ms|INTEGER|0||0
+18|alert|INTEGER|0||0
+== ASSERT contains ==
+  expected substring=alert
+  PASS: Alert column present in SQLite schema
+== Summary ==
+  All E2E alert threshold tests passed
+  Tests verified:
+    - Alert CLI flags are recognized
+    - SQLite schema includes alert column
+    - JSON summary includes alert counts
+    - --no-alerts flag disables alerting
+    - Alert cooldown is configurable
+    - Multiple domain patterns supported
+    - Combined alert configuration works
+== E2E PASS ==
+  log=logs/e2e/alert-thresholds-20260121T103250Z.log
+  duration_seconds=1

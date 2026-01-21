@@ -1,0 +1,17 @@
+== E2E Header ==
+  timestamp=2026-01-21T10:32:37Z
+  host=threadripperje
+  os=Linux threadripperje 6.17.0-8-generic #8-Ubuntu SMP PREEMPT_DYNAMIC Fri Nov 14 21:44:46 UTC 2025 x86_64 GNU/Linux
+  rano_version=0.1.0
+  test_name=alert-thresholds
+  args=
+== Setup ==
+  rano=./target/debug/rano
+  test_sqlite=/tmp/rano-e2e-alerts-914996.sqlite
+  test_log=/tmp/rano-e2e-alerts-914996.log
+== E2E FAIL ==
+  reason=rano binary not found at ./target/debug/rano. Run 'cargo build' first.
+  log=logs/e2e/alert-thresholds-20260121T103237Z.log
+== E2E FAIL ==
+  reason=test script exited non-zero
+  log=logs/e2e/alert-thresholds-20260121T103237Z.log

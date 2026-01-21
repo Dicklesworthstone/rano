@@ -1,0 +1,68 @@
+rano - AI CLI network observer
+
+USAGE:
+  rano [options]
+  rano report [options]
+  rano export [options]
+  rano update [options]
+
+COMMANDS:
+  report    Query SQLite event history (use --help for details)
+  export    Export SQLite event history
+  update    Update the rano binary
+
+OPTIONS:
+--pattern <str>           Process name or cmdline substring to match (repeatable)
+--exclude-pattern <str>   Exclude processes matching substring (repeatable)
+--pid <pid>               Monitor a specific PID (repeatable)
+--no-descendants          Do not include descendant processes
+--interval-ms <ms>        Poll interval (default: 1000)
+--json                    Emit JSON lines to stdout
+--summary-only            Suppress live events, show summary only
+--domain-mode <mode>      auto|ptr|pcap (default: auto)
+--pcap                    Force pcap mode (falls back with warning)
+--no-dns                  Disable PTR lookups
+--include-udp             Include UDP sockets (default: true)
+--no-udp                  Disable UDP sockets
+--include-listening       Include listening TCP sockets
+--show-ancestry           Include process ancestry chain in output
+--log-file <path>         Append output to log file
+--log-dir <path>          Write per-run log files into directory
+--log-format <fmt>        auto|pretty|json for log files (default: auto)
+--once                    Emit a single poll and exit
+--color <mode>            auto|always|never (default: auto)
+--no-color                Disable ANSI color
+--theme <name>            vivid|mono (default: vivid)
+--sqlite <path>           SQLite file for persistent logging
+--no-sqlite               Disable SQLite logging
+--db-batch-size <n>       SQLite batch size (events per transaction)
+--db-flush-ms <ms>        SQLite flush interval in ms
+--db-queue-max <n>        SQLite queue capacity (events)
+--stats-interval-ms <ms>  Live stats interval (0 disables)
+--stats-width <n>         ASCII bar width
+--stats-top <n>           Top-N domains/IPs in stats/summary
+--stats-view <name>       Stats view: provider|domain|port|process (repeatable)
+--stats-cycle-ms <ms>     Rotate stats views at this interval (0 disables)
+--no-banner               Suppress startup banner
+
+ALERT OPTIONS:
+--alert-domain <pattern>       Alert on domains matching glob pattern (repeatable)
+--alert-max-connections <n>    Alert when total active connections exceed N
+--alert-max-per-provider <n>   Alert when any provider exceeds N connections
+--alert-duration-ms <ms>       Alert on connections lasting longer than N ms
+--alert-unknown-domain         Alert on connections to unresolved domains
+--alert-bell                   Ring terminal bell on alerts
+--alert-cooldown-ms <ms>       Suppress duplicate alerts within window (default: 10000)
+--no-alerts                    Disable all alerting
+
+CONFIG:
+--config <path>           Load config file (key=value format)
+--config-toml <path>      Load provider config (TOML)
+--no-config               Ignore config files
+-h, --help                Show this help
+-V, --version             Show version
+
+EXAMPLES:
+rano --alert-domain '*.evil.com' --alert-max-connections 100
+rano --pattern claude --alert-unknown-domain
+
