@@ -77,6 +77,45 @@ struct ConfigPaths {
     use_config: bool,
 }
 
+const PRESET_AUDIT: &str = "# Description: Security review / minimal noise\n\
+summary_only=true\n\
+stats_interval_ms=0\n\
+include_udp=false\n\
+no_dns=false\n\
+log_format=json\n";
+
+const PRESET_QUIET: &str = "# Description: Reduce terminal output\n\
+summary_only=true\n\
+stats_interval_ms=0\n\
+no_banner=true\n";
+
+const PRESET_LIVE: &str = "# Description: Real-time monitoring focus\n\
+stats_interval_ms=2000\n\
+stats_view=provider,domain\n\
+stats_cycle_ms=5000\n";
+
+const PRESET_VERBOSE: &str = "# Description: Maximum detail\n\
+include_udp=true\n\
+include_listening=true\n\
+stats_interval_ms=1000\n\
+stats_top=10\n";
+
+enum PresetSource {
+    Builtin,
+    User(PathBuf),
+}
+
+struct PresetInfo {
+    name: String,
+    description: String,
+    source: PresetSource,
+}
+
+struct PresetLoader {
+    builtin_presets: HashMap<&'static str, &'static str>,
+    user_preset_dirs: Vec<PathBuf>,
+}
+
 #[derive(Clone, Debug)]
 struct MonitorArgs {
     patterns: Vec<String>,
