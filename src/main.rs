@@ -14,6 +14,8 @@ use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+mod pcap_capture;
+
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 const SQLITE_QUEUE_CAPACITY: usize = 10_000;
@@ -46,6 +48,14 @@ enum LogFormat {
 enum Theme {
     Vivid,
     Mono,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatsView {
+    Provider,
+    Domain,
+    Port,
+    Process,
 }
 
 struct Cli {
@@ -91,7 +101,10 @@ struct MonitorArgs {
     db_queue_max: usize,
     stats_interval_ms: u64,
     stats_width: usize,
+    stats_width_set: bool,
     stats_top: usize,
+    stats_views: Vec<StatsView>,
+    stats_cycle_ms: u64,
     no_banner: bool,
     theme: Theme,
 }
@@ -123,7 +136,10 @@ impl Default for MonitorArgs {
             db_queue_max: SQLITE_QUEUE_CAPACITY,
             stats_interval_ms: 5000,
             stats_width: 40,
+            stats_width_set: false,
             stats_top: 5,
+            stats_views: Vec::new(),
+            stats_cycle_ms: 0,
             no_banner: false,
             theme: Theme::Vivid,
         }
@@ -271,6 +287,7 @@ struct Stats {
     peak_active: u64,
     sqlite_dropped: u64,
     per_ip: BTreeMap<IpAddr, u64>,
+    per_port: BTreeMap<u16, u64>,
     per_domain: BTreeMap<String, u64>,
     per_pid: BTreeMap<u32, u64>,
     per_comm: BTreeMap<String, u64>,
@@ -540,6 +557,9 @@ fn main() {
     if args.patterns.is_empty() && args.pids.is_empty() {
         args.patterns = default_patterns();
     }
+    if args.stats_views.is_empty() {
+        args.stats_views = vec![StatsView::Provider];
+    }
 
     let cli_args: Vec<String> = env::args().collect();
     let config_paths = find_config_flag(&cli_args);
@@ -551,16 +571,35 @@ fn main() {
         theme: args.theme,
     };
 
-    let (domain_mode, domain_note) = resolve_domain_mode(&args);
+    let (mut domain_mode, domain_note) = resolve_domain_mode(&args);
     let mut domain_notes: Vec<String> = Vec::new();
     if let Some(note) = domain_note {
         domain_notes.push(note);
     }
-    if args.no_dns && domain_mode == DomainMode::Ptr {
-        domain_notes.push("PTR lookups disabled (--no-dns); domains will be unknown.".to_string());
+
+    setup_signal_handler();
+
+    let mut pcap_handle: Option<pcap_capture::PcapHandle> = None;
+    if domain_mode == DomainMode::Pcap {
+        match pcap_capture::start_pcap_capture() {
+            Ok(handle) => {
+                pcap_handle = Some(handle);
+            }
+            Err(err) => {
+                domain_notes.push(format!("pcap capture unavailable: {}", err));
+                if let Some(hint) = pcap_permission_hint(&err) {
+                    domain_notes.push(hint.to_string());
+                }
+                domain_mode = DomainMode::Ptr;
+            }
+        }
+    }
+
+    let ptr_enabled = !args.no_dns;
+    if args.no_dns {
+        domain_notes.push("PTR lookups disabled (--no-dns); PTR fallback disabled.".to_string());
     }
     domain_notes.append(&mut config_notes);
-    let ptr_enabled = domain_mode == DomainMode::Ptr && !args.no_dns;
     let domain_label = if domain_mode == DomainMode::Pcap {
         "pcap"
     } else if ptr_enabled {
@@ -569,9 +608,8 @@ fn main() {
         "disabled"
     };
 
-    setup_signal_handler();
-
     let mut dns_cache: HashMap<IpAddr, DnsCacheEntry> = HashMap::new();
+    let mut domain_cache = pcap_handle.as_ref().map(|_| pcap_capture::DomainCache::new());
 
     let mut active: HashMap<ConnKey, ConnInfo> = HashMap::new();
     let mut stats = Stats::default();
@@ -592,10 +630,16 @@ fn main() {
     }
 
     let mut last_stats = SystemTime::now();
+    let mut last_cycle = SystemTime::now();
+    let mut stats_view_index: usize = 0;
 
     loop {
         if !RUNNING.load(Ordering::SeqCst) {
             break;
+        }
+
+        if let (Some(handle), Some(cache)) = (pcap_handle.as_ref(), domain_cache.as_mut()) {
+            handle.drain_into(cache);
         }
 
         let roots = find_root_pids(&args.patterns, &args.exclude_patterns, &args.pids);
@@ -638,7 +682,17 @@ fn main() {
             seen_keys.insert(key.clone());
 
             if !active.contains_key(&key) {
-                let domain = if ptr_enabled {
+                let domain = if let Some(cache) = domain_cache.as_mut() {
+                    cache
+                        .lookup(entry.remote_ip, entry.remote_port)
+                        .or_else(|| {
+                            if ptr_enabled {
+                                resolve_domain(entry.remote_ip, &mut dns_cache)
+                            } else {
+                                None
+                            }
+                        })
+                } else if ptr_enabled {
                     resolve_domain(entry.remote_ip, &mut dns_cache)
                 } else {
                     None
@@ -687,6 +741,7 @@ fn main() {
                         meta.provider,
                         domain.as_deref(),
                         None,
+                        domain_label,
                         args.json,
                         style,
                         resolved_log_format,
@@ -698,6 +753,7 @@ fn main() {
                 stats.active = stats.active.saturating_add(1);
                 stats.peak_active = stats.peak_active.max(stats.active);
                 *stats.per_ip.entry(entry.remote_ip).or_insert(0) += 1;
+                *stats.per_port.entry(entry.remote_port).or_insert(0) += 1;
                 *stats.per_pid.entry(pid).or_insert(0) += 1;
                 *stats.per_comm.entry(meta.comm.clone()).or_insert(0) += 1;
                 *stats.per_provider.entry(meta.provider).or_insert(0) += 1;
@@ -757,6 +813,7 @@ fn main() {
                         info.provider,
                         info.domain.as_deref(),
                         duration_ms,
+                        domain_label,
                         args.json,
                         style,
                         resolved_log_format,
@@ -776,7 +833,27 @@ fn main() {
         if args.stats_interval_ms > 0 && !args.json {
             if let Ok(elapsed) = now.duration_since(last_stats) {
                 if elapsed >= Duration::from_millis(args.stats_interval_ms) {
-                    print_stats(&stats, args.stats_width, args.stats_top, style);
+                    if args.stats_cycle_ms > 0
+                        && args.stats_views.len() > 1
+                        && !args.summary_only
+                    {
+                        let cycle_due = now
+                            .duration_since(last_cycle)
+                            .map(|d| d >= Duration::from_millis(args.stats_cycle_ms))
+                            .unwrap_or(true);
+                        if cycle_due {
+                            stats_view_index = (stats_view_index + 1) % args.stats_views.len();
+                            last_cycle = now;
+                        }
+                    }
+
+                    let width = resolve_stats_width(&args);
+                    let view = args
+                        .stats_views
+                        .get(stats_view_index)
+                        .copied()
+                        .unwrap_or(StatsView::Provider);
+                    print_stats(&stats, width, args.stats_top, style, view);
                     last_stats = now;
                 }
             }
@@ -792,7 +869,18 @@ fn main() {
         stats.sqlite_dropped = writer.shutdown(run_ctx.run_id.clone(), stats.connects, stats.closes);
     }
 
-    summary(&stats, args.json, args.stats_top, style, log_writer.as_ref());
+    if let Some(handle) = pcap_handle.take() {
+        handle.shutdown();
+    }
+
+    summary(
+        &stats,
+        args.json,
+        args.stats_top,
+        style,
+        domain_label,
+        log_writer.as_ref(),
+    );
 }
 
 fn parse_cli() -> Result<Cli, String> {
@@ -1002,6 +1090,7 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 i += 1;
                 let value = require_value(argv, i, "--stats-width")?;
                 args.stats_width = parse_usize(value, "--stats-width")?;
+                args.stats_width_set = true;
                 i += 1;
             }
             "--stats-top" => {
@@ -1011,6 +1100,19 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 if args.stats_top == 0 {
                     return Err("--stats-top must be >= 1".to_string());
                 }
+                i += 1;
+            }
+            "--stats-view" => {
+                i += 1;
+                let value = require_value(argv, i, "--stats-view")?;
+                let view = parse_stats_view(value)?;
+                args.stats_views.push(view);
+                i += 1;
+            }
+            "--stats-cycle-ms" => {
+                i += 1;
+                let value = require_value(argv, i, "--stats-cycle-ms")?;
+                args.stats_cycle_ms = parse_u64(value, "--stats-cycle-ms")?;
                 i += 1;
             }
             "--no-banner" => {
@@ -1279,6 +1381,16 @@ fn parse_theme(value: &str) -> Result<Theme, String> {
     }
 }
 
+fn parse_stats_view(value: &str) -> Result<StatsView, String> {
+    match value.to_lowercase().as_str() {
+        "provider" => Ok(StatsView::Provider),
+        "domain" => Ok(StatsView::Domain),
+        "port" => Ok(StatsView::Port),
+        "process" => Ok(StatsView::Process),
+        _ => Err("Invalid --stats-view (use provider|domain|port|process)".to_string()),
+    }
+}
+
 fn find_config_flag(argv: &[String]) -> ConfigPaths {
     let mut config_path = None;
     let mut toml_path = None;
@@ -1382,8 +1494,17 @@ fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> 
                 }
             }
             "stats_interval_ms" => args.stats_interval_ms = parse_u64(value, "stats_interval_ms")?,
-            "stats_width" => args.stats_width = parse_usize(value, "stats_width")?,
+            "stats_width" => {
+                args.stats_width = parse_usize(value, "stats_width")?;
+                args.stats_width_set = true;
+            }
             "stats_top" => args.stats_top = parse_usize(value, "stats_top")?,
+            "stats_view" => {
+                push_stats_views(&mut args.stats_views, value)?;
+            }
+            "stats_cycle_ms" => {
+                args.stats_cycle_ms = parse_u64(value, "stats_cycle_ms")?;
+            }
             "no_banner" => args.no_banner = parse_bool(value)?,
             "theme" => args.theme = parse_theme(value)?,
             _ => {
@@ -1403,6 +1524,18 @@ fn push_list_value(target: &mut Vec<String>, value: &str) {
             target.push(trimmed.to_string());
         }
     }
+}
+
+fn push_stats_views(target: &mut Vec<StatsView>, value: &str) -> Result<(), String> {
+    for part in value.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let view = parse_stats_view(trimmed)?;
+        target.push(view);
+    }
+    Ok(())
 }
 
 fn parse_bool(value: &str) -> Result<bool, String> {
@@ -1607,7 +1740,7 @@ fn parse_provider_mode(value: &str) -> Result<ProviderMode, String> {
 
 fn print_help() {
     println!(
-        "rano - AI CLI network observer\n\nUSAGE:\n  rano [options]\n  rano report [options]\n  rano update [options]\n\nCOMMANDS:\n  report    Query SQLite event history (use --help for details)\n  update    Update the rano binary\n\nOPTIONS:\n  --pattern <str>           Process name or cmdline substring to match (repeatable)\n  --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n  --pid <pid>               Monitor a specific PID (repeatable)\n  --no-descendants          Do not include descendant processes\n  --interval-ms <ms>        Poll interval (default: 1000)\n  --json                    Emit JSON lines to stdout\n  --summary-only            Suppress live events, show summary only\n  --domain-mode <mode>      auto|ptr|pcap (default: auto)\n  --pcap                    Force pcap mode (falls back with warning)\n  --no-dns                  Disable PTR lookups\n  --include-udp             Include UDP sockets (default: true)\n  --no-udp                  Disable UDP sockets\n  --include-listening       Include listening TCP sockets\n  --log-file <path>         Append output to log file\n  --log-dir <path>          Write per-run log files into directory\n  --log-format <fmt>        auto|pretty|json for log files (default: auto)\n  --once                    Emit a single poll and exit\n  --color <mode>            auto|always|never (default: auto)\n  --no-color                Disable ANSI color\n  --theme <name>            vivid|mono (default: vivid)\n  --sqlite <path>           SQLite file for persistent logging\n  --no-sqlite               Disable SQLite logging\n  --db-batch-size <n>       SQLite batch size (events per transaction)\n  --db-flush-ms <ms>        SQLite flush interval in ms\n  --db-queue-max <n>        SQLite queue capacity (events)\n  --stats-interval-ms <ms>  Live stats interval (0 disables)\n  --stats-width <n>         ASCII bar width\n  --stats-top <n>           Top-N domains/IPs in stats/summary\n  --no-banner               Suppress startup banner\n  --config <path>           Load config file (key=value format)\n  --config-toml <path>      Load provider config (TOML)\n  --no-config               Ignore config files\n  -h, --help                Show this help\n  -V, --version             Show version\n"
+        "rano - AI CLI network observer\n\nUSAGE:\n  rano [options]\n  rano report [options]\n  rano update [options]\n\nCOMMANDS:\n  report    Query SQLite event history (use --help for details)\n  update    Update the rano binary\n\nOPTIONS:\n  --pattern <str>           Process name or cmdline substring to match (repeatable)\n  --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n  --pid <pid>               Monitor a specific PID (repeatable)\n  --no-descendants          Do not include descendant processes\n  --interval-ms <ms>        Poll interval (default: 1000)\n  --json                    Emit JSON lines to stdout\n  --summary-only            Suppress live events, show summary only\n  --domain-mode <mode>      auto|ptr|pcap (default: auto)\n  --pcap                    Force pcap mode (falls back with warning)\n  --no-dns                  Disable PTR lookups\n  --include-udp             Include UDP sockets (default: true)\n  --no-udp                  Disable UDP sockets\n  --include-listening       Include listening TCP sockets\n  --log-file <path>         Append output to log file\n  --log-dir <path>          Write per-run log files into directory\n  --log-format <fmt>        auto|pretty|json for log files (default: auto)\n  --once                    Emit a single poll and exit\n  --color <mode>            auto|always|never (default: auto)\n  --no-color                Disable ANSI color\n  --theme <name>            vivid|mono (default: vivid)\n  --sqlite <path>           SQLite file for persistent logging\n  --no-sqlite               Disable SQLite logging\n  --db-batch-size <n>       SQLite batch size (events per transaction)\n  --db-flush-ms <ms>        SQLite flush interval in ms\n  --db-queue-max <n>        SQLite queue capacity (events)\n  --stats-interval-ms <ms>  Live stats interval (0 disables)\n  --stats-width <n>         ASCII bar width\n  --stats-top <n>           Top-N domains/IPs in stats/summary\n  --stats-view <name>       Stats view: provider|domain|port|process (repeatable)\n  --stats-cycle-ms <ms>     Rotate stats views at this interval (0 disables)\n  --no-banner               Suppress startup banner\n  --config <path>           Load config file (key=value format)\n  --config-toml <path>      Load provider config (TOML)\n  --no-config               Ignore config files\n  -h, --help                Show this help\n  -V, --version             Show version\n"
     );
 }
 
@@ -1652,6 +1785,21 @@ fn resolve_color_mode(mode: ColorMode) -> bool {
     }
 }
 
+fn resolve_stats_width(args: &MonitorArgs) -> usize {
+    if args.stats_width_set {
+        return args.stats_width.max(1);
+    }
+    if stdout_is_tty() {
+        if let Ok(columns) = env::var("COLUMNS") {
+            if let Ok(cols) = columns.trim().parse::<usize>() {
+                let width = cols.saturating_sub(40).clamp(20, 80);
+                return width.max(1);
+            }
+        }
+    }
+    args.stats_width.max(1)
+}
+
 fn stdout_is_tty() -> bool {
     #[cfg(unix)]
     unsafe {
@@ -1690,12 +1838,13 @@ fn default_patterns() -> Vec<String> {
 fn resolve_domain_mode(args: &MonitorArgs) -> (DomainMode, Option<String>) {
     let wants_pcap = args.pcap || matches!(args.domain_mode, DomainMode::Pcap);
     if wants_pcap {
-        let reason = if is_root() {
-            "pcap capture not available in this build; falling back to PTR.".to_string()
-        } else {
-            "pcap capture requires elevated privileges and libpcap; falling back to PTR.".to_string()
-        };
-        return (DomainMode::Ptr, Some(reason));
+        if !pcap_capture::pcap_supported() {
+            return (
+                DomainMode::Ptr,
+                Some("pcap feature not enabled; falling back to PTR.".to_string()),
+            );
+        }
+        return (DomainMode::Pcap, None);
     }
 
     match args.domain_mode {
@@ -1703,19 +1852,18 @@ fn resolve_domain_mode(args: &MonitorArgs) -> (DomainMode, Option<String>) {
         DomainMode::Ptr => (DomainMode::Ptr, None),
         DomainMode::Pcap => (
             DomainMode::Ptr,
-            Some("pcap capture not available; falling back to PTR.".to_string()),
+            Some("pcap capture requested; falling back to PTR.".to_string()),
         ),
     }
 }
 
-#[cfg(unix)]
-fn is_root() -> bool {
-    unsafe { libc::geteuid() == 0 }
-}
-
-#[cfg(not(unix))]
-fn is_root() -> bool {
-    false
+fn pcap_permission_hint(err: &str) -> Option<&'static str> {
+    let lower = err.to_lowercase();
+    if lower.contains("permission") || lower.contains("denied") || lower.contains("not permitted") {
+        Some("pcap capture requires elevated privileges (sudo or CAP_NET_RAW).")
+    } else {
+        None
+    }
 }
 
 fn setup_signal_handler() {
@@ -1840,6 +1988,7 @@ fn emit_event(
     provider: Provider,
     domain: Option<&str>,
     duration_ms: Option<u64>,
+    domain_mode: &str,
     json_mode: bool,
     style: OutputStyle,
     log_format: LogFormat,
@@ -1866,6 +2015,7 @@ fn emit_event(
             &local,
             &remote,
             dom,
+            domain_mode,
             duration_ms,
         );
         println!("{}", line);
@@ -1919,6 +2069,7 @@ fn emit_event(
                 &local,
                 &remote,
                 dom,
+                domain_mode,
                 duration_ms,
             ),
             _ => strip_ansi(&line_plain),
@@ -1993,6 +2144,7 @@ fn format_json_event(
     local: &str,
     remote: &str,
     domain: &str,
+    domain_mode: &str,
     duration_ms: Option<u64>,
 ) -> String {
     let mut out = String::new();
@@ -2008,6 +2160,7 @@ fn format_json_event(
     push_json_str(&mut out, "local", local, false);
     push_json_str(&mut out, "remote", remote, false);
     push_json_str(&mut out, "domain", domain, false);
+    push_json_str(&mut out, "domain_mode", domain_mode, false);
     if let Some(ms) = duration_ms {
         push_json_num(&mut out, "duration_ms", ms as i64, false);
     }
@@ -2020,10 +2173,11 @@ fn summary(
     json_mode: bool,
     stats_top: usize,
     style: OutputStyle,
+    domain_mode: &str,
     log_writer: Option<&Arc<LogWriter>>,
 ) {
     if json_mode {
-        let line = format_json_summary(stats);
+        let line = format_json_summary(stats, domain_mode);
         println!("{}", line);
         if let Some(writer) = log_writer {
             writer.write_line(&line);
@@ -2116,7 +2270,7 @@ fn summary(
     }
 }
 
-fn format_json_summary(stats: &Stats) -> String {
+fn format_json_summary(stats: &Stats, domain_mode: &str) -> String {
     let mut out = String::new();
     out.push('{');
     out.push_str("\"summary\":{");
@@ -2135,6 +2289,7 @@ fn format_json_summary(stats: &Stats) -> String {
     push_json_map_u32(&mut out, "per_pid", &stats.per_pid, false);
     push_json_map_str(&mut out, "per_comm", &stats.per_comm, false);
     push_json_map_provider(&mut out, "per_provider", &stats.per_provider, false);
+    push_json_str(&mut out, "domain_mode", domain_mode, false);
     out.push('}');
     out.push('}');
     out
@@ -2147,7 +2302,25 @@ fn top_n_string<K: ToString + Ord>(map: &BTreeMap<K, u64>, n: usize) -> Vec<(Str
     items
 }
 
-fn print_stats(stats: &Stats, width: usize, top: usize, style: OutputStyle) {
+fn print_stats(stats: &Stats, width: usize, top: usize, style: OutputStyle, view: StatsView) {
+    match view {
+        StatsView::Provider => print_provider_stats(stats, width, style),
+        StatsView::Domain => {
+            let items = top_n_string(&stats.per_domain, top);
+            print_stats_list("domain", &items, width, style, 48);
+        }
+        StatsView::Port => {
+            let items = top_n_string(&stats.per_port, top);
+            print_stats_list("port", &items, width, style, 8);
+        }
+        StatsView::Process => {
+            let items = top_n_string(&stats.per_comm, top);
+            print_stats_list("process", &items, width, style, 24);
+        }
+    }
+}
+
+fn print_provider_stats(stats: &Stats, width: usize, style: OutputStyle) {
     let total = stats
         .per_provider
         .values()
@@ -2161,7 +2334,10 @@ fn print_stats(stats: &Stats, width: usize, top: usize, style: OutputStyle) {
         Provider::Google,
         Provider::Unknown,
     ];
-    println!("{}", paint("Live Provider Stats", style.accent(), true, false, style.color));
+    println!(
+        "{}",
+        paint("Live Stats [provider]", style.accent(), true, false, style.color)
+    );
     for provider in providers {
         let count = *stats.per_provider.get(&provider).unwrap_or(&0);
         let bar_len = ((count as f64 / total as f64) * width as f64).round() as usize;
@@ -2203,26 +2379,49 @@ fn print_stats(stats: &Stats, width: usize, top: usize, style: OutputStyle) {
             0
         }
     );
+}
 
-    let top_domains = top_n_string(&stats.per_domain, top);
-    if !top_domains.is_empty() {
-        let parts = top_domains
-            .iter()
-            .map(|(d, c)| format!("{}({})", d, c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("  top domains: {}", parts);
+fn print_stats_list(
+    title: &str,
+    items: &[(String, u64)],
+    width: usize,
+    style: OutputStyle,
+    label_width: usize,
+) {
+    println!(
+        "{}",
+        paint(
+            &format!("Live Stats [{}]", title),
+            style.accent(),
+            true,
+            false,
+            style.color
+        )
+    );
+    if items.is_empty() {
+        println!("  (no data)");
+        return;
     }
+    let max = items
+        .iter()
+        .map(|(_, count)| *count)
+        .max()
+        .unwrap_or(1)
+        .max(1);
+    for (label, count) in items {
+        let bar = render_stats_bar(*count, max, width, style);
+        let label = truncate_ascii(label, label_width);
+        println!("  {:>6} {} {}", count, bar, label);
+    }
+}
 
-    let top_ips = top_n_string(&stats.per_ip, top);
-    if !top_ips.is_empty() {
-        let parts = top_ips
-            .iter()
-            .map(|(d, c)| format!("{}({})", d, c))
-            .collect::<Vec<_>>()
-            .join(", ");
-        println!("  top ips: {}", parts);
+fn render_stats_bar(count: u64, max: u64, width: usize, style: OutputStyle) -> String {
+    if width == 0 {
+        return String::new();
     }
+    let bar_len = ((count as f64 / max as f64) * width as f64).round() as usize;
+    let bar_plain = format!("{:width$}", "█".repeat(bar_len), width = width);
+    paint(&bar_plain, style.accent(), false, false, style.color)
 }
 
 fn strip_ansi(s: &str) -> String {
