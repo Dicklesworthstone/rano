@@ -225,34 +225,17 @@ pub fn start_pcap_capture() -> Result<PcapHandle, String> {
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty());
 
-    let mut cap = if let Some(path) = offline_path.as_ref() {
-        Capture::from_file(path).map_err(|e| format!("pcap file open failed: {e}"))?
-    } else {
-        let device = Device::lookup()
-            .map_err(|e| format!("pcap device lookup failed: {e}"))?
-            .ok_or_else(|| "no default pcap device found".to_string())?;
-        Capture::from_device(device)
-            .map_err(|e| format!("pcap device open failed: {e}"))?
-            .promisc(true)
-            .immediate_mode(true)
-            .open()
-            .map_err(|e| format!("pcap capture open failed: {e}"))?
-    };
-
-    cap.filter("udp port 53 or tcp port 53 or tcp port 443", true)
-        .map_err(|e| format!("pcap filter failed: {e}"))?;
-
-    let is_offline = offline_path.is_some();
-    if !is_offline {
-        cap = cap
-            .setnonblock()
-            .map_err(|e| format!("pcap nonblock failed: {e}"))?;
-    }
-
     let (sender, receiver) = mpsc::sync_channel(CHANNEL_CAPACITY);
     let stop = Arc::new(AtomicBool::new(false));
 
-    if is_offline {
+    // Handle offline (file) capture separately from live capture
+    // because pcap crate uses different types: Capture<Offline> vs Capture<Active>
+    if let Some(path) = offline_path {
+        let mut cap =
+            Capture::from_file(&path).map_err(|e| format!("pcap file open failed: {e}"))?;
+        cap.filter("udp port 53 or tcp port 53 or tcp port 443", true)
+            .map_err(|e| format!("pcap filter failed: {e}"))?;
+
         loop {
             match cap.next_packet() {
                 Ok(packet) => {
@@ -275,6 +258,24 @@ pub fn start_pcap_capture() -> Result<PcapHandle, String> {
             handle: None,
         });
     }
+
+    // Live capture mode
+    let device = Device::lookup()
+        .map_err(|e| format!("pcap device lookup failed: {e}"))?
+        .ok_or_else(|| "no default pcap device found".to_string())?;
+    let mut cap = Capture::from_device(device)
+        .map_err(|e| format!("pcap device open failed: {e}"))?
+        .promisc(true)
+        .immediate_mode(true)
+        .open()
+        .map_err(|e| format!("pcap capture open failed: {e}"))?;
+
+    cap.filter("udp port 53 or tcp port 53 or tcp port 443", true)
+        .map_err(|e| format!("pcap filter failed: {e}"))?;
+
+    cap = cap
+        .setnonblock()
+        .map_err(|e| format!("pcap nonblock failed: {e}"))?;
 
     let stop_thread = stop.clone();
     let handle = std::thread::spawn(move || loop {

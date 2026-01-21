@@ -40,3 +40,50 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+  # ============================================================
+  # PCAP FEATURE BUILD/TEST MATRIX
+  # Tests the optional pcap feature for DNS/SNI domain attribution
+  # ============================================================
+  check-pcap:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install libpcap-dev
+        run: sudo apt-get update && sudo apt-get install -y libpcap-dev
+
+      - name: Cache cargo registry and target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-pcap-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-pcap-
+
+      - name: "[pcap] Build with pcap feature"
+        run: |
+          echo "::group::Building with --features pcap"
+          cargo build --features pcap
+          echo "::endgroup::"
+
+      - name: "[pcap] Run clippy with pcap feature"
+        run: |
+          echo "::group::Clippy with --features pcap"
+          cargo clippy --features pcap --all-targets -- -D warnings
+          echo "::endgroup::"
+
+      - name: "[pcap] Run tests with pcap feature (offline fixtures)"
+        run: |
+          echo "::group::Tests with --features pcap (no root required)"
+          cargo test --features pcap
+          echo "::endgroup::"
+          echo "✅ pcap feature tests passed"
