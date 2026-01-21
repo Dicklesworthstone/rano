@@ -355,7 +355,8 @@ struct ConnInfo {
     cmdline: String,
     provider: Provider,
     domain: Option<String>,
-    ancestry: Option<String>,
+    ancestry: Option<Vec<String>>,
+    ancestry_path: Option<String>,
     opened_at: SystemTime,
     last_seen: SystemTime,
 }
@@ -587,7 +588,9 @@ struct SqliteEvent {
     cmdline: String,
     provider: Provider,
     domain: Option<String>,
+    ancestry_path: Option<String>,
     duration_ms: Option<u64>,
+    alert: bool,
 }
 
 enum SqliteMsg {
@@ -733,21 +736,40 @@ fn read_ancestry(pid: u32) -> Vec<(u32, String)> {
 }
 
 fn format_ancestry(chain: &[(u32, String)]) -> String {
+    let list = format_ancestry_list(chain);
+    truncate_ancestry_list(&list).join(" \u{2192} ")
+}
+
+fn format_ancestry_list(chain: &[(u32, String)]) -> Vec<String> {
     if chain.is_empty() {
-        return String::new();
+        return Vec::new();
     }
-    let mut parts: Vec<String> = chain
+    chain
         .iter()
         .map(|(pid, comm)| format!("{}({})", comm, pid))
-        .collect();
-    if parts.len() <= 1 {
-        return parts.pop().unwrap_or_default();
+        .collect()
+}
+
+fn truncate_ancestry_list(list: &[String]) -> Vec<String> {
+    if list.is_empty() {
+        return Vec::new();
     }
-    if parts.len() > 5 {
-        let tail = parts[parts.len().saturating_sub(2)..].join(" \u{2192} ");
-        return format!("... \u{2192} {}", tail);
+    if list.len() <= 1 {
+        return vec![list[0].clone()];
     }
-    parts.join(" \u{2192} ")
+    if list.len() > 5 {
+        let tail = list[list.len().saturating_sub(2)..].to_vec();
+        return vec![String::from("..."), tail[0].clone(), tail[1].clone()];
+    }
+    list.to_vec()
+}
+
+fn ancestry_chain_to_path(chain: &[(u32, String)]) -> String {
+    let mut out = Vec::with_capacity(chain.len());
+    for (pid, comm) in chain {
+        out.push(format!("{}:{}", comm, pid));
+    }
+    out.join(",")
 }
 
 fn main() {
@@ -944,10 +966,14 @@ fn main() {
                     cmdline: "".to_string(),
                     provider: Provider::Unknown,
                 });
-                let ancestry = if args.show_ancestry {
-                    Some(format_ancestry(&ancestry_cache.get_or_compute(pid)))
+                let (ancestry, ancestry_path) = if args.show_ancestry {
+                    let chain = ancestry_cache.get_or_compute(pid);
+                    (
+                        Some(format_ancestry_list(&chain)),
+                        Some(ancestry_chain_to_path(&chain)),
+                    )
                 } else {
-                    None
+                    (None, None)
                 };
 
                 let info = ConnInfo {
@@ -957,6 +983,7 @@ fn main() {
                     provider: meta.provider,
                     domain: domain.clone(),
                     ancestry: ancestry.clone(),
+                    ancestry_path: ancestry_path.clone(),
                     opened_at: now,
                     last_seen: now,
                 };
@@ -974,7 +1001,9 @@ fn main() {
                         cmdline: meta.cmdline.clone(),
                         provider: meta.provider,
                         domain: domain.clone(),
+                        ancestry_path: ancestry_path.clone(),
                         duration_ms: None,
+                        alert: false,
                     });
                 }
                 if !args.summary_only {
@@ -1068,7 +1097,9 @@ fn main() {
                         cmdline: info.cmdline.clone(),
                         provider: info.provider,
                         domain: info.domain.clone(),
+                        ancestry_path: info.ancestry_path.clone(),
                         duration_ms,
+                        alert: false,
                     });
                 }
                 if !args.summary_only {
@@ -1162,6 +1193,8 @@ fn main() {
         style,
         domain_label,
         log_writer.as_ref(),
+        alert_state.alert_count,
+        alert_state.suppressed_count,
     );
 }
 
@@ -1298,6 +1331,10 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
             }
             "--include-listening" => {
                 args.include_listening = true;
+                i += 1;
+            }
+            "--show-ancestry" => {
+                args.show_ancestry = true;
                 i += 1;
             }
             "--log-file" => {
@@ -1932,6 +1969,7 @@ fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> 
             "no_dns" => args.no_dns = parse_bool(value)?,
             "include_udp" => args.include_udp = parse_bool(value)?,
             "include_listening" => args.include_listening = parse_bool(value)?,
+            "show_ancestry" => args.show_ancestry = parse_bool(value)?,
             "log_file" => args.log_file = Some(PathBuf::from(value)),
             "log_dir" => args.log_dir = Some(PathBuf::from(value)),
             "log_format" => args.log_format = parse_log_format(value)?,
@@ -2247,6 +2285,7 @@ OPTIONS:\n\
   --include-udp             Include UDP sockets (default: true)\n\
   --no-udp                  Disable UDP sockets\n\
   --include-listening       Include listening TCP sockets\n\
+  --show-ancestry           Include process ancestry chain in output\n\
   --log-file <path>         Append output to log file\n\
   --log-dir <path>          Write per-run log files into directory\n\
   --log-format <fmt>        auto|pretty|json for log files (default: auto)\n\
@@ -2863,7 +2902,7 @@ fn emit_event(
     cmdline: &str,
     provider: Provider,
     domain: Option<&str>,
-    ancestry: Option<&str>,
+    ancestry: Option<&[String]>,
     duration_ms: Option<u64>,
     domain_mode: &str,
     json_mode: bool,
@@ -2969,7 +3008,7 @@ fn format_pretty_event(
     remote: &str,
     domain: &str,
     provider: Provider,
-    ancestry: Option<&str>,
+    ancestry: Option<&[String]>,
     duration_ms: Option<u64>,
     style: Option<OutputStyle>,
 ) -> String {
@@ -2992,7 +3031,13 @@ fn format_pretty_event(
         false,
         style.color,
     );
-    let pid_text = paint(&format!("pid={}", pid), Some(AnsiColor::BrightCyan), true, false, style.color);
+    let pid_text = paint(
+        &format!("pid={}", pid),
+        Some(AnsiColor::BrightCyan),
+        true,
+        false,
+        style.color,
+    );
     let comm_text = paint(comm, Some(AnsiColor::BrightWhite), true, false, style.color);
     let proto_text = paint(proto, Some(AnsiColor::BrightMagenta), true, false, style.color);
     let domain_text = if domain == "unknown" {
@@ -3007,23 +3052,29 @@ fn format_pretty_event(
     };
 
     let duration_text = duration_ms.map(|ms| format!(" dur={}ms", ms)).unwrap_or_default();
-    let ancestry_text = ancestry
-        .map(|value| format!(" | ancestry={}", value))
-        .unwrap_or_default();
+    let process_text = if let Some(chain) = ancestry {
+        if chain.is_empty() {
+            format!("{} | {}", pid_text, comm_text)
+        } else {
+            let display = truncate_ancestry_list(chain);
+            let joined = display.join(" \u{2192} ");
+            paint(&joined, Some(AnsiColor::BrightWhite), true, false, style.color)
+        }
+    } else {
+        format!("{} | {}", pid_text, comm_text)
+    };
 
     format!(
-        "{} | {} | {} | {} | {} | {} | {} -> {} | domain={}{}{}",
+        "{} | {} | {} | {} | {} | {} -> {} | domain={}{}",
         ts_text,
         event_text,
         provider_text,
-        pid_text,
-        comm_text,
+        process_text,
         proto_text,
         local,
         remote,
         domain_text,
         duration_text,
-        ancestry_text
     )
 }
 
@@ -3040,7 +3091,7 @@ fn format_json_event(
     remote: &str,
     domain: &str,
     domain_mode: &str,
-    ancestry: Option<&str>,
+    ancestry: Option<&[String]>,
     duration_ms: Option<u64>,
 ) -> String {
     let mut out = String::new();
@@ -3057,8 +3108,8 @@ fn format_json_event(
     push_json_str(&mut out, "remote", remote, false);
     push_json_str(&mut out, "domain", domain, false);
     push_json_str(&mut out, "domain_mode", domain_mode, false);
-    if let Some(value) = ancestry {
-        push_json_str(&mut out, "ancestry", value, false);
+    if let Some(list) = ancestry {
+        push_json_array(&mut out, "ancestry", list, false);
     }
     if let Some(ms) = duration_ms {
         push_json_num(&mut out, "duration_ms", ms as i64, false);
@@ -3074,9 +3125,11 @@ fn summary(
     style: OutputStyle,
     domain_mode: &str,
     log_writer: Option<&Arc<LogWriter>>,
+    alert_count: u64,
+    suppressed_count: u64,
 ) {
     if json_mode {
-        let line = format_json_summary(stats, domain_mode);
+        let line = format_json_summary(stats, domain_mode, alert_count, suppressed_count);
         println!("{}", line);
         if let Some(writer) = log_writer {
             writer.write_line(&line);
@@ -3107,6 +3160,25 @@ fn summary(
             paint("sqlite_dropped", Some(AnsiColor::BrightWhite), true, false, style.color),
             paint(
                 &stats.sqlite_dropped.to_string(),
+                Some(AnsiColor::BrightRed),
+                true,
+                false,
+                style.color
+            )
+        );
+    }
+
+    if alert_count > 0 || suppressed_count > 0 {
+        let alert_text = if suppressed_count > 0 {
+            format!("{} ({} suppressed)", alert_count, suppressed_count)
+        } else {
+            alert_count.to_string()
+        };
+        println!(
+            "  {} {}",
+            paint("alerts", Some(AnsiColor::BrightWhite), true, false, style.color),
+            paint(
+                &alert_text,
                 Some(AnsiColor::BrightRed),
                 true,
                 false,
@@ -3162,14 +3234,14 @@ fn summary(
 
     if let Some(writer) = log_writer {
         let line = format!(
-            "summary connects={} closes={} active={} peak_active={} sqlite_dropped={}",
-            stats.connects, stats.closes, stats.active, stats.peak_active, stats.sqlite_dropped
+            "summary connects={} closes={} active={} peak_active={} sqlite_dropped={} alerts={} suppressed={}",
+            stats.connects, stats.closes, stats.active, stats.peak_active, stats.sqlite_dropped, alert_count, suppressed_count
         );
         writer.write_line(&line);
     }
 }
 
-fn format_json_summary(stats: &Stats, domain_mode: &str) -> String {
+fn format_json_summary(stats: &Stats, domain_mode: &str, alert_count: u64, suppressed_count: u64) -> String {
     let mut out = String::new();
     out.push('{');
     out.push_str("\"summary\":{");
@@ -3178,6 +3250,8 @@ fn format_json_summary(stats: &Stats, domain_mode: &str) -> String {
     push_json_num(&mut out, "active", stats.active as i64, false);
     push_json_num(&mut out, "peak_active", stats.peak_active as i64, false);
     push_json_num(&mut out, "sqlite_dropped", stats.sqlite_dropped as i64, false);
+    push_json_num(&mut out, "alerts", alert_count as i64, false);
+    push_json_num(&mut out, "alerts_suppressed", suppressed_count as i64, false);
     if stats.duration_ms_samples > 0 {
         let avg = stats.duration_ms_total / stats.duration_ms_samples;
         push_json_num(&mut out, "avg_duration_ms", avg as i64, false);
@@ -4496,6 +4570,13 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     }
     let has_sessions = table_exists(&conn, "sessions")?;
     check_report_schema(&conn, &args.sqlite_path, has_sessions)?;
+    let has_ancestry = column_exists(&conn, "events", "ancestry_path")?;
+    if !has_ancestry {
+        eprintln!(
+            "warning: ancestry_path column missing; ancestry report section will be unavailable. {}",
+            schema_hint(&args.sqlite_path)
+        );
+    }
 
     let color_enabled = resolve_color_mode(args.color);
 
@@ -4520,9 +4601,16 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     };
 
     if args.json {
-        output_report_json(&conn, &filter, args.top, has_sessions)?;
+        output_report_json(&conn, &filter, args.top, has_sessions, has_ancestry)?;
     } else {
-        output_report_pretty(&conn, &filter, args.top, has_sessions, color_enabled)?;
+        output_report_pretty(
+            &conn,
+            &filter,
+            args.top,
+            has_sessions,
+            has_ancestry,
+            color_enabled,
+        )?;
     }
 
     Ok(())
@@ -4707,6 +4795,7 @@ fn output_report_json(
     filter: &ReportFilter,
     top: usize,
     has_sessions: bool,
+    has_ancestry: bool,
 ) -> Result<(), String> {
     let mut out = String::from("{\n");
 
@@ -4804,7 +4893,26 @@ fn output_report_json(
         }
         out.push_str("\n");
     }
-    out.push_str("  ]\n");
+    out.push_str("  ]");
+
+    if has_ancestry {
+        let roots = query_ancestry_roots(conn, filter, top, has_ancestry)?;
+        out.push_str(",\n  \"ancestry_roots\": [\n");
+        for (i, root) in roots.iter().enumerate() {
+            out.push_str(&format!(
+                "    {{\"root\": \"{}\", \"connects\": {}}}",
+                escape_json(&root.root),
+                root.connects
+            ));
+            if i < roots.len() - 1 {
+                out.push_str(",");
+            }
+            out.push_str("\n");
+        }
+        out.push_str("  ]\n");
+    } else {
+        out.push('\n');
+    }
 
     out.push_str("}\n");
     print!("{}", out);
@@ -4816,6 +4924,7 @@ fn output_report_pretty(
     filter: &ReportFilter,
     top: usize,
     has_sessions: bool,
+    has_ancestry: bool,
     color: bool,
 ) -> Result<(), String> {
     // Title
@@ -4925,6 +5034,20 @@ fn output_report_pretty(
                 connects_width = connects_width,
                 closes_width = closes_width
             );
+        }
+    }
+
+    // Spawned From (ancestry roots)
+    if has_ancestry {
+        let roots = query_ancestry_roots(conn, filter, top, has_ancestry)?;
+        if !roots.is_empty() {
+            println!(
+                "\n{}",
+                if color { "\x1b[1;36mSpawned From\x1b[0m" } else { "Spawned From" }
+            );
+            for root in roots {
+                println!("  {}: {} connections", root.root, root.connects);
+            }
         }
     }
 
@@ -5145,6 +5268,11 @@ struct ProviderStats {
     closes: i64,
 }
 
+struct AncestryRootStats {
+    root: String,
+    connects: i64,
+}
+
 struct DomainStats {
     domain: String,
     events: i64,
@@ -5266,6 +5394,71 @@ fn build_providers_query(filter: &ReportFilter) -> (String, Vec<String>) {
     (sql, params)
 }
 
+fn query_ancestry_roots(
+    conn: &Connection,
+    filter: &ReportFilter,
+    top: usize,
+    has_ancestry: bool,
+) -> Result<Vec<AncestryRootStats>, String> {
+    if !has_ancestry {
+        return Ok(Vec::new());
+    }
+    let (sql, params) = build_ancestry_roots_query(filter, top);
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Failed to prepare query: {}", e))?;
+
+    let rows = stmt
+        .query_map(params_refs.as_slice(), |row| {
+            let root_seg: String = row.get(0)?;
+            let connects: i64 = row.get(1)?;
+            let root = root_seg
+                .split_once(':')
+                .map(|(comm, _)| comm.to_string())
+                .unwrap_or(root_seg);
+            Ok(AncestryRootStats { root, connects })
+        })
+        .map_err(|e| format!("Failed to query ancestry roots: {}", e))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(row.map_err(|e| format!("Failed to read row: {}", e))?);
+    }
+    Ok(results)
+}
+
+fn build_ancestry_roots_query(filter: &ReportFilter, top: usize) -> (String, Vec<String>) {
+    let root_seg = "CASE \
+        WHEN instr(ancestry_path, ',') > 0 THEN substr(ancestry_path, 1, instr(ancestry_path, ',') - 1) \
+        ELSE ancestry_path END";
+    let mut sql = format!(
+        "SELECT {root_seg} as root_seg,
+                SUM(CASE WHEN event='connect' THEN 1 ELSE 0 END) as connects
+         FROM events WHERE ancestry_path IS NOT NULL AND ancestry_path != ''",
+        root_seg = root_seg
+    );
+    let mut params: Vec<String> = Vec::new();
+
+    if let Some(ref run_id) = filter.run_id {
+        sql.push_str(" AND run_id = ?");
+        params.push(run_id.clone());
+    }
+    if let Some(ref since) = filter.since {
+        sql.push_str(" AND ts >= ?");
+        params.push(since.clone());
+    }
+    if let Some(ref until) = filter.until {
+        sql.push_str(" AND ts < ?");
+        params.push(until.clone());
+    }
+
+    sql.push_str(&format!(" GROUP BY root_seg ORDER BY connects DESC LIMIT {}", top));
+    (sql, params)
+}
+
 fn query_top_domains(conn: &Connection, filter: &ReportFilter, top: usize) -> Result<Vec<DomainStats>, String> {
     let (sql, params) = build_domains_query(filter, top);
     let params_refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
@@ -5382,6 +5575,7 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
             remote_ip TEXT,
             remote_port INTEGER,
             domain TEXT,
+            ancestry_path TEXT,
             remote_is_private INTEGER,
             ip_version INTEGER,
             duration_ms INTEGER
@@ -5405,6 +5599,7 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
         CREATE INDEX IF NOT EXISTS idx_events_provider ON events(provider);
         CREATE INDEX IF NOT EXISTS idx_events_remote_ip ON events(remote_ip);
         CREATE INDEX IF NOT EXISTS idx_events_domain ON events(domain);
+        CREATE INDEX IF NOT EXISTS idx_events_ancestry_path ON events(ancestry_path);
         CREATE VIEW IF NOT EXISTS provider_counts AS
             SELECT provider,
                    COUNT(*) AS events,
@@ -5450,6 +5645,8 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
     )?;
     ensure_column(conn, "events", "run_id", "TEXT")?;
     ensure_column(conn, "events", "duration_ms", "INTEGER")?;
+    ensure_column(conn, "events", "ancestry_path", "TEXT")?;
+    ensure_column(conn, "events", "alert", "INTEGER")?;
     Ok(())
 }
 
@@ -5508,8 +5705,8 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
     };
     let (is_private, ip_version) = ip_flags(event.key.remote_ip);
     conn.execute(
-        "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, remote_is_private, ip_version, duration_ms)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, ancestry_path, remote_is_private, ip_version, duration_ms, alert)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         params![
             &event.ts,
             &event.run_id,
@@ -5524,9 +5721,11 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
             event.key.remote_ip.to_string(),
             event.key.remote_port as i64,
             event.domain.as_deref().unwrap_or("unknown"),
+            event.ancestry_path.as_deref().unwrap_or(""),
             if is_private { 1 } else { 0 },
             ip_version,
             event.duration_ms.map(|v| v as i64),
+            if event.alert { 1 } else { 0 },
         ],
     )?;
     Ok(())
@@ -5558,6 +5757,24 @@ fn push_json_num(out: &mut String, key: &str, value: i64, first: bool) {
     out.push_str(key);
     out.push_str("\":");
     out.push_str(&value.to_string());
+}
+
+fn push_json_array(out: &mut String, key: &str, values: &[String], first: bool) {
+    if !first {
+        out.push(',');
+    }
+    out.push('"');
+    out.push_str(key);
+    out.push_str("\":[");
+    for (idx, value) in values.iter().enumerate() {
+        if idx > 0 {
+            out.push(',');
+        }
+        out.push('"');
+        out.push_str(&escape_json(value));
+        out.push('"');
+    }
+    out.push(']');
 }
 
 fn push_json_map_str(out: &mut String, key: &str, map: &BTreeMap<String, u64>, first: bool) {
@@ -5801,6 +6018,20 @@ mod tests {
     }
 
     #[test]
+    fn truncate_ancestry_list_limits_depth() {
+        let list = vec![
+            "a(1)".to_string(),
+            "b(2)".to_string(),
+            "c(3)".to_string(),
+            "d(4)".to_string(),
+            "e(5)".to_string(),
+            "f(6)".to_string(),
+        ];
+        let truncated = truncate_ancestry_list(&list);
+        assert_eq!(truncated, vec!["...".to_string(), "e(5)".to_string(), "f(6)".to_string()]);
+    }
+
+    #[test]
     fn provider_from_text_matches_case_insensitive() {
         let matcher = ProviderMatcher::default();
         assert_eq!(
@@ -5892,7 +6123,9 @@ mod tests {
             cmdline: "/usr/bin/testproc".to_string(),
             provider,
             domain: Some("test.example.com".to_string()),
+            ancestry_path: Some("init:1,testproc:1234".to_string()),
             duration_ms: if event == "close" { Some(1000) } else { None },
+            alert: false,
         }
     }
 
