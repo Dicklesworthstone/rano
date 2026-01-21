@@ -521,6 +521,81 @@ struct AlertState {
     suppressed_count: u64,
 }
 
+/// Warning returned when a retry pattern is detected
+#[derive(Clone, Debug)]
+struct RetryWarning {
+    /// Number of connections in the window
+    count: usize,
+    /// Window duration in seconds
+    window_seconds: f64,
+    /// The endpoint (remote IP and port)
+    endpoint: (IpAddr, u16),
+}
+
+/// Tracks connection attempts per (remote_ip, remote_port, pid) for retry detection
+struct RetryTracker {
+    /// Recent connection timestamps: (remote_ip, remote_port, pid) -> Vec<Instant>
+    recent: HashMap<(IpAddr, u16, u32), Vec<Instant>>,
+    /// Number of connections that trigger a warning
+    threshold: usize,
+    /// Time window in milliseconds
+    window_ms: u64,
+}
+
+impl RetryTracker {
+    fn new(threshold: usize, window_ms: u64) -> Self {
+        Self {
+            recent: HashMap::new(),
+            threshold,
+            window_ms,
+        }
+    }
+
+    /// Track a connection close event and return a warning if retry pattern detected.
+    /// Call this after a close event to detect rapid reconnection patterns.
+    fn track_connection(
+        &mut self,
+        remote_ip: IpAddr,
+        remote_port: u16,
+        pid: u32,
+    ) -> Option<RetryWarning> {
+        let key = (remote_ip, remote_port, pid);
+        let now = Instant::now();
+        let window = Duration::from_millis(self.window_ms);
+
+        // Get or create the entry
+        let timestamps = self.recent.entry(key).or_insert_with(Vec::new);
+
+        // Add current timestamp
+        timestamps.push(now);
+
+        // Prune entries older than window_ms
+        timestamps.retain(|ts| now.duration_since(*ts) < window);
+
+        // Check if count >= threshold
+        if timestamps.len() >= self.threshold {
+            Some(RetryWarning {
+                count: timestamps.len(),
+                window_seconds: self.window_ms as f64 / 1000.0,
+                endpoint: (remote_ip, remote_port),
+            })
+        } else {
+            None
+        }
+    }
+
+    /// Prune old entries from all tracked endpoints (call periodically for memory management)
+    fn prune_stale(&mut self) {
+        let now = Instant::now();
+        let window = Duration::from_millis(self.window_ms);
+
+        self.recent.retain(|_, timestamps| {
+            timestamps.retain(|ts| now.duration_since(*ts) < window);
+            !timestamps.is_empty()
+        });
+    }
+}
+
 impl Default for MonitorArgs {
     fn default() -> Self {
         Self {
