@@ -8,6 +8,10 @@
 ```
 
 <div align="center">
+  <img src="rano_illustration.webp" alt="rano - network observer for AI CLI processes">
+</div>
+
+<div align="center">
 
 [![CI](https://github.com/lumera-ai/rano/actions/workflows/ci.yml/badge.svg)](https://github.com/lumera-ai/rano/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/lumera-ai/rano?sort=semver)](https://github.com/lumera-ai/rano/releases)
