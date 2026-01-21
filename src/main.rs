@@ -5,14 +5,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
+use std::io::{BufWriter, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod pcap_capture;
 
@@ -22,6 +22,7 @@ const SQLITE_QUEUE_CAPACITY: usize = 10_000;
 const SQLITE_BATCH_SIZE: usize = 200;
 const SQLITE_FLUSH_INTERVAL_MS: u64 = 1000;
 const SQLITE_DROP_WARN_INTERVAL_SECS: u64 = 10;
+const ANCESTRY_CACHE_TTL_SECS: u64 = 30;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ColorMode {
@@ -66,6 +67,7 @@ struct Cli {
 enum Command {
     Update(UpdateCommand),
     Report(ReportArgs),
+    Export(ExportArgs),
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +91,7 @@ struct MonitorArgs {
     no_dns: bool,
     include_udp: bool,
     include_listening: bool,
+    show_ancestry: bool,
     log_file: Option<PathBuf>,
     log_dir: Option<PathBuf>,
     log_format: LogFormat,
@@ -227,6 +230,7 @@ impl Default for MonitorArgs {
             no_dns: false,
             include_udp: true,
             include_listening: false,
+            show_ancestry: false,
             log_file: None,
             log_dir: None,
             log_format: LogFormat::Auto,
@@ -292,6 +296,43 @@ impl Default for ReportArgs {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExportFormat {
+    Csv,
+    Jsonl,
+}
+
+#[derive(Clone, Debug)]
+struct ExportArgs {
+    format: ExportFormat,
+    sqlite_path: String,
+    since: Option<String>,
+    until: Option<String>,
+    run_id: Option<String>,
+    providers: Vec<String>,
+    domain_patterns: Vec<String>,
+    fields: Option<Vec<String>>,
+    no_header: bool,
+    output: Option<PathBuf>,
+}
+
+impl Default for ExportArgs {
+    fn default() -> Self {
+        Self {
+            format: ExportFormat::Csv,
+            sqlite_path: "observer.sqlite".to_string(),
+            since: None,
+            until: None,
+            run_id: None,
+            providers: Vec::new(),
+            domain_patterns: Vec::new(),
+            fields: None,
+            no_header: false,
+            output: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 enum Proto {
     Tcp,
@@ -314,6 +355,7 @@ struct ConnInfo {
     cmdline: String,
     provider: Provider,
     domain: Option<String>,
+    ancestry: Option<String>,
     opened_at: SystemTime,
     last_seen: SystemTime,
 }
@@ -625,6 +667,89 @@ struct DnsCacheEntry {
     stored_at: SystemTime,
 }
 
+struct AncestryCache {
+    cache: HashMap<u32, (Vec<(u32, String)>, Instant)>,
+    ttl: Duration,
+}
+
+impl AncestryCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            cache: HashMap::new(),
+            ttl,
+        }
+    }
+
+    fn get_or_compute(&mut self, pid: u32) -> Vec<(u32, String)> {
+        let now = Instant::now();
+        if let Some((chain, stored_at)) = self.cache.get(&pid) {
+            let expired = now.duration_since(*stored_at) >= self.ttl;
+            let cached_comm = chain.last().map(|(_, comm)| comm.as_str());
+            let current_comm = read_comm(pid);
+            let comm_matches = match (cached_comm, current_comm.as_deref()) {
+                (Some(cached), Some(current)) => cached == current,
+                _ => false,
+            };
+            if !expired && comm_matches {
+                return chain.clone();
+            }
+        }
+
+        let chain = read_ancestry(pid);
+        self.cache.insert(pid, (chain.clone(), now));
+        chain
+    }
+}
+
+fn read_ancestry(pid: u32) -> Vec<(u32, String)> {
+    let mut chain = Vec::new();
+    let mut current = pid;
+    let mut seen: HashSet<u32> = HashSet::new();
+
+    loop {
+        if !seen.insert(current) {
+            break;
+        }
+        let comm = read_comm(current).unwrap_or_else(|| "unknown".to_string());
+        chain.push((current, comm));
+        let Some(ppid) = read_ppid(current) else {
+            break;
+        };
+        if ppid == 0 {
+            break;
+        }
+        if ppid == 1 {
+            if seen.insert(ppid) {
+                let comm = read_comm(ppid).unwrap_or_else(|| "unknown".to_string());
+                chain.push((ppid, comm));
+            }
+            break;
+        }
+        current = ppid;
+    }
+
+    chain.reverse();
+    chain
+}
+
+fn format_ancestry(chain: &[(u32, String)]) -> String {
+    if chain.is_empty() {
+        return String::new();
+    }
+    let mut parts: Vec<String> = chain
+        .iter()
+        .map(|(pid, comm)| format!("{}({})", comm, pid))
+        .collect();
+    if parts.len() <= 1 {
+        return parts.pop().unwrap_or_default();
+    }
+    if parts.len() > 5 {
+        let tail = parts[parts.len().saturating_sub(2)..].join(" \u{2192} ");
+        return format!("... \u{2192} {}", tail);
+    }
+    parts.join(" \u{2192} ")
+}
+
 fn main() {
     let cli = match parse_cli() {
         Ok(cli) => cli,
@@ -646,6 +771,13 @@ fn main() {
             }
             Command::Report(report_args) => {
                 if let Err(err) = run_report(report_args) {
+                    eprintln!("error: {}", err);
+                    std::process::exit(1);
+                }
+                return;
+            }
+            Command::Export(export_args) => {
+                if let Err(err) = run_export(export_args) {
                     eprintln!("error: {}", err);
                     std::process::exit(1);
                 }
@@ -714,6 +846,7 @@ fn main() {
 
     let mut dns_cache: HashMap<IpAddr, DnsCacheEntry> = HashMap::new();
     let mut domain_cache = pcap_handle.as_ref().map(|_| pcap_capture::DomainCache::new());
+    let mut ancestry_cache = AncestryCache::new(Duration::from_secs(ANCESTRY_CACHE_TTL_SECS));
 
     let mut active: HashMap<ConnKey, ConnInfo> = HashMap::new();
     let mut stats = Stats::default();
@@ -811,6 +944,11 @@ fn main() {
                     cmdline: "".to_string(),
                     provider: Provider::Unknown,
                 });
+                let ancestry = if args.show_ancestry {
+                    Some(format_ancestry(&ancestry_cache.get_or_compute(pid)))
+                } else {
+                    None
+                };
 
                 let info = ConnInfo {
                     pid,
@@ -818,6 +956,7 @@ fn main() {
                     cmdline: meta.cmdline.clone(),
                     provider: meta.provider,
                     domain: domain.clone(),
+                    ancestry: ancestry.clone(),
                     opened_at: now,
                     last_seen: now,
                 };
@@ -849,6 +988,7 @@ fn main() {
                         &meta.cmdline,
                         meta.provider,
                         domain.as_deref(),
+                        ancestry.as_deref(),
                         None,
                         domain_label,
                         args.json,
@@ -942,6 +1082,7 @@ fn main() {
                         &info.cmdline,
                         info.provider,
                         info.domain.as_deref(),
+                        info.ancestry.as_deref(),
                         duration_ms,
                         domain_label,
                         args.json,
@@ -1053,6 +1194,13 @@ fn parse_cli() -> Result<Cli, String> {
             let report = parse_report_args(&args[2..])?;
             Ok(Cli {
                 command: Some(Command::Report(report)),
+                monitor: MonitorArgs::default(),
+            })
+        }
+        "export" => {
+            let export = parse_export_args(&args[2..])?;
+            Ok(Cli {
+                command: Some(Command::Export(export)),
                 monitor: MonitorArgs::default(),
             })
         }
@@ -1523,6 +1671,100 @@ fn parse_report_args(argv: &[String]) -> Result<ReportArgs, String> {
     Ok(args)
 }
 
+fn parse_export_args(argv: &[String]) -> Result<ExportArgs, String> {
+    for arg in argv {
+        if arg == "-h" || arg == "--help" {
+            print_export_help();
+            std::process::exit(0);
+        }
+        if arg == "-V" || arg == "--version" {
+            print_version();
+            std::process::exit(0);
+        }
+    }
+
+    let mut args = ExportArgs::default();
+    let mut format_set = false;
+
+    let mut i = 0;
+    while i < argv.len() {
+        let arg = &argv[i];
+        match arg.as_str() {
+            "--format" => {
+                i += 1;
+                let value = require_value(argv, i, "--format")?;
+                args.format = parse_export_format(value)?;
+                format_set = true;
+                i += 1;
+            }
+            "--sqlite" => {
+                i += 1;
+                let value = require_value(argv, i, "--sqlite")?;
+                args.sqlite_path = value.to_string();
+                i += 1;
+            }
+            "--since" => {
+                i += 1;
+                let value = require_value(argv, i, "--since")?;
+                args.since = Some(value.to_string());
+                i += 1;
+            }
+            "--until" => {
+                i += 1;
+                let value = require_value(argv, i, "--until")?;
+                args.until = Some(value.to_string());
+                i += 1;
+            }
+            "--run-id" => {
+                i += 1;
+                let value = require_value(argv, i, "--run-id")?;
+                args.run_id = Some(value.to_string());
+                i += 1;
+            }
+            "--provider" => {
+                i += 1;
+                let value = require_value(argv, i, "--provider")?;
+                args.providers.push(value.to_string());
+                i += 1;
+            }
+            "--domain" => {
+                i += 1;
+                let value = require_value(argv, i, "--domain")?;
+                args.domain_patterns.push(value.to_string());
+                i += 1;
+            }
+            "--fields" => {
+                i += 1;
+                let value = require_value(argv, i, "--fields")?;
+                args.fields = Some(parse_fields_list(value)?);
+                i += 1;
+            }
+            "--no-header" => {
+                args.no_header = true;
+                i += 1;
+            }
+            "--output" | "-o" => {
+                i += 1;
+                let value = require_value(argv, i, "--output")?;
+                args.output = Some(PathBuf::from(value));
+                i += 1;
+            }
+            other => {
+                if other.starts_with('-') {
+                    return Err(format!("Unknown export flag: {}", other));
+                }
+                return Err(format!("Unexpected export argument: {}", other));
+            }
+        }
+    }
+
+    if !format_set {
+        return Err("--format is required (use csv or jsonl)".to_string());
+    }
+
+    Ok(args)
+}
+
 fn require_value<'a>(argv: &'a [String], index: usize, flag: &str) -> Result<&'a str, String> {
     argv.get(index)
         .map(|v| v.as_str())
@@ -1568,12 +1810,39 @@ fn parse_log_format(value: &str) -> Result<LogFormat, String> {
     }
 }
 
+fn parse_export_format(value: &str) -> Result<ExportFormat, String> {
+    match value.to_lowercase().as_str() {
+        "csv" => Ok(ExportFormat::Csv),
+        "jsonl" => Ok(ExportFormat::Jsonl),
+        _ => Err("Invalid --format (use csv|jsonl)".to_string()),
+    }
+}
+
 fn parse_theme(value: &str) -> Result<Theme, String> {
     match value.to_lowercase().as_str() {
         "vivid" => Ok(Theme::Vivid),
         "mono" => Ok(Theme::Mono),
         _ => Err("Invalid --theme (use vivid|mono)".to_string()),
     }
+}
+
+fn parse_fields_list(value: &str) -> Result<Vec<String>, String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for part in value.split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lowered = trimmed.to_lowercase();
+        if seen.insert(lowered.clone()) {
+            out.push(lowered);
+        }
+    }
+    if out.is_empty() {
+        return Err("--fields must include at least one field".to_string());
+    }
+    Ok(out)
 }
 
 fn parse_stats_view(value: &str) -> Result<StatsView, String> {
@@ -1962,8 +2231,8 @@ fn parse_provider_mode(value: &str) -> Result<ProviderMode, String> {
 fn print_help() {
     println!(
         "rano - AI CLI network observer\n\n\
-USAGE:\n  rano [options]\n  rano report [options]\n  rano update [options]\n\n\
-COMMANDS:\n  report    Query SQLite event history (use --help for details)\n  update    Update the rano binary\n\n\
+USAGE:\n  rano [options]\n  rano report [options]\n  rano export [options]\n  rano update [options]\n\n\
+COMMANDS:\n  report    Query SQLite event history (use --help for details)\n  export    Export SQLite event history\n  update    Update the rano binary\n\n\
 OPTIONS:\n\
   --pattern <str>           Process name or cmdline substring to match (repeatable)\n\
   --exclude-pattern <str>   Exclude processes matching substring (repeatable)\n\
@@ -2043,6 +2312,31 @@ EXAMPLES:\n\
   rano report --latest                # Most recent session\n\
   rano report --since 24h             # Last 24 hours\n\
   rano report --run-id xyz --json     # Specific session as JSON\n"
+    );
+}
+
+fn print_export_help() {
+    println!(
+        "rano export - export SQLite event history\n\n\
+USAGE:\n  rano export [options]\n\n\
+OPTIONS:\n\
+  --format <fmt>    Output format: csv|jsonl (required)\n\
+  --sqlite <path>   SQLite database path (default: observer.sqlite)\n\
+  --since <ts>      Start of time range (RFC3339, date, or relative like 1h/24h/7d)\n\
+  --until <ts>      End of time range (RFC3339, exclusive)\n\
+  --run-id <id>     Export specific session by run_id\n\
+  --provider <name> Filter by provider (repeatable)\n\
+  --domain <glob>   Filter by domain glob pattern (repeatable)\n\
+  --fields <list>   Comma-separated field list override\n\
+  --no-header       Omit header row (CSV only)\n\
+  --output <path>   Output file (default: stdout)\n\
+  -o <path>         Shorthand for --output\n\
+  -h, --help        Show this help\n\
+  -V, --version     Show version\n\n\
+EXAMPLES:\n\
+  rano export --format csv\n\
+  rano export --format jsonl --since 24h\n\
+  rano export --format csv --fields ts,provider,remote_ip,domain\n"
     );
 }
 
@@ -2569,6 +2863,7 @@ fn emit_event(
     cmdline: &str,
     provider: Provider,
     domain: Option<&str>,
+    ancestry: Option<&str>,
     duration_ms: Option<u64>,
     domain_mode: &str,
     json_mode: bool,
@@ -2598,6 +2893,7 @@ fn emit_event(
             &remote,
             dom,
             domain_mode,
+            ancestry,
             duration_ms,
         );
         println!("{}", line);
@@ -2617,6 +2913,7 @@ fn emit_event(
         &remote,
         dom,
         provider,
+        ancestry,
         duration_ms,
         None,
     );
@@ -2631,6 +2928,7 @@ fn emit_event(
         &remote,
         dom,
         provider,
+        ancestry,
         duration_ms,
         Some(style),
     );
@@ -2652,6 +2950,7 @@ fn emit_event(
                 &remote,
                 dom,
                 domain_mode,
+                ancestry,
                 duration_ms,
             ),
             _ => strip_ansi(&line_plain),
@@ -2670,6 +2969,7 @@ fn format_pretty_event(
     remote: &str,
     domain: &str,
     provider: Provider,
+    ancestry: Option<&str>,
     duration_ms: Option<u64>,
     style: Option<OutputStyle>,
 ) -> String {
@@ -2707,10 +3007,23 @@ fn format_pretty_event(
     };
 
     let duration_text = duration_ms.map(|ms| format!(" dur={}ms", ms)).unwrap_or_default();
+    let ancestry_text = ancestry
+        .map(|value| format!(" | ancestry={}", value))
+        .unwrap_or_default();
 
     format!(
-        "{} | {} | {} | {} | {} | {} | {} -> {} | domain={}{}",
-        ts_text, event_text, provider_text, pid_text, comm_text, proto_text, local, remote, domain_text, duration_text
+        "{} | {} | {} | {} | {} | {} | {} -> {} | domain={}{}{}",
+        ts_text,
+        event_text,
+        provider_text,
+        pid_text,
+        comm_text,
+        proto_text,
+        local,
+        remote,
+        domain_text,
+        duration_text,
+        ancestry_text
     )
 }
 
@@ -2727,6 +3040,7 @@ fn format_json_event(
     remote: &str,
     domain: &str,
     domain_mode: &str,
+    ancestry: Option<&str>,
     duration_ms: Option<u64>,
 ) -> String {
     let mut out = String::new();
@@ -2743,6 +3057,9 @@ fn format_json_event(
     push_json_str(&mut out, "remote", remote, false);
     push_json_str(&mut out, "domain", domain, false);
     push_json_str(&mut out, "domain_mode", domain_mode, false);
+    if let Some(value) = ancestry {
+        push_json_str(&mut out, "ancestry", value, false);
+    }
     if let Some(ms) = duration_ms {
         push_json_num(&mut out, "duration_ms", ms as i64, false);
     }
@@ -3797,6 +4114,363 @@ fn parse_ipv6(hex: &str) -> Option<Ipv6Addr> {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&chunk);
     }
     Some(Ipv6Addr::from(bytes))
+}
+
+// ============================================================================
+// Export Subcommand
+// ============================================================================
+
+const EXPORT_FIELDS: &[&str] = &[
+    "ts",
+    "run_id",
+    "event",
+    "provider",
+    "pid",
+    "comm",
+    "cmdline",
+    "proto",
+    "local_ip",
+    "local_port",
+    "remote_ip",
+    "remote_port",
+    "domain",
+    "duration_ms",
+];
+
+const PROVIDER_LABELS: &[&str] = &["anthropic", "openai", "google", "unknown"];
+
+#[derive(Clone, Copy)]
+enum FieldType {
+    String,
+    Integer,
+}
+
+#[derive(Clone, Debug)]
+enum FieldValue {
+    String(String),
+    Integer(i64),
+    Null,
+}
+
+struct ExportFilter {
+    run_id: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    providers: Vec<String>,
+    domain_patterns: Vec<String>,
+}
+
+fn run_export(args: ExportArgs) -> Result<(), String> {
+    let path = Path::new(&args.sqlite_path);
+    if !path.exists() {
+        return Err(format!("SQLite file not found: {}", args.sqlite_path));
+    }
+
+    let conn = Connection::open(path)
+        .map_err(|e| format!("Failed to open database: {}", e))?;
+
+    let has_events = table_exists(&conn, "events")?;
+    if !has_events {
+        return Err(format!(
+            "Database does not contain rano event data (missing events table). {}",
+            schema_hint(&args.sqlite_path)
+        ));
+    }
+
+    let fields = match args.fields.clone() {
+        Some(fields) => fields,
+        None => default_export_fields(),
+    };
+    validate_fields(&fields)?;
+
+    let since = parse_time_filter(&args.since)?;
+    let until = parse_time_filter(&args.until)?;
+
+    let providers = normalize_providers(&args.providers)?;
+    let domain_patterns = normalize_domain_patterns(&args.domain_patterns)?;
+
+    let filter = ExportFilter {
+        run_id: args.run_id.clone(),
+        since,
+        until,
+        providers,
+        domain_patterns,
+    };
+
+    let (sql, params) = build_export_query(&filter, &fields);
+
+    setup_signal_handler();
+
+    let mut writer = open_export_output(&args.output)?;
+    if args.format == ExportFormat::Csv && !args.no_header {
+        let header = format_csv_header(&fields);
+        writer
+            .write_all(header.as_bytes())
+            .map_err(|e| format!("Write error: {}", e))?;
+    }
+
+    let mut stmt = conn
+        .prepare(&sql)
+        .map_err(|e| format!("Query error: {}", e))?;
+    let params_refs: Vec<&dyn rusqlite::ToSql> =
+        params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let mut rows = stmt
+        .query(params_refs.as_slice())
+        .map_err(|e| format!("Query error: {}", e))?;
+
+    let mut row_count: usize = 0;
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("Failed to read row: {}", e))?
+    {
+        if !RUNNING.load(Ordering::SeqCst) {
+            break;
+        }
+        let values =
+            row_to_values(row, &fields).map_err(|e| format!("Failed to read row: {}", e))?;
+        let line = match args.format {
+            ExportFormat::Csv => format_csv_row(&values),
+            ExportFormat::Jsonl => format_jsonl_row(&values),
+        };
+        writer
+            .write_all(line.as_bytes())
+            .map_err(|e| format!("Write error: {}", e))?;
+        row_count += 1;
+        if row_count % 1000 == 0 {
+            writer
+                .flush()
+                .map_err(|e| format!("Write error: {}", e))?;
+        }
+    }
+
+    writer
+        .flush()
+        .map_err(|e| format!("Write error: {}", e))?;
+    Ok(())
+}
+
+fn default_export_fields() -> Vec<String> {
+    EXPORT_FIELDS.iter().map(|f| f.to_string()).collect()
+}
+
+fn validate_fields(fields: &[String]) -> Result<(), String> {
+    if fields.is_empty() {
+        return Err("At least one field must be selected".to_string());
+    }
+    for field in fields {
+        if !EXPORT_FIELDS.contains(&field.as_str()) {
+            return Err(format!(
+                "Unknown field '{}'. Valid fields: {}",
+                field,
+                EXPORT_FIELDS.join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn normalize_providers(values: &[String]) -> Result<Vec<String>, String> {
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err("Invalid --provider value (empty)".to_string());
+        }
+        let lowered = trimmed.to_lowercase();
+        if !PROVIDER_LABELS.contains(&lowered.as_str()) {
+            return Err(format!(
+                "Invalid provider '{}'. Use: {}",
+                trimmed,
+                PROVIDER_LABELS.join(", ")
+            ));
+        }
+        if seen.insert(lowered.clone()) {
+            out.push(lowered);
+        }
+    }
+    Ok(out)
+}
+
+fn normalize_domain_patterns(values: &[String]) -> Result<Vec<String>, String> {
+    if values.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for value in values {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err("Invalid --domain value (empty)".to_string());
+        }
+        let lowered = trimmed.to_lowercase();
+        if seen.insert(lowered.clone()) {
+            out.push(lowered);
+        }
+    }
+    Ok(out)
+}
+
+fn field_type(field: &str) -> FieldType {
+    match field {
+        "pid" | "local_port" | "remote_port" | "duration_ms" => FieldType::Integer,
+        _ => FieldType::String,
+    }
+}
+
+fn row_to_values(
+    row: &rusqlite::Row<'_>,
+    fields: &[String],
+) -> rusqlite::Result<Vec<(String, FieldValue)>> {
+    let mut out = Vec::with_capacity(fields.len());
+    for (idx, field) in fields.iter().enumerate() {
+        let value = match field_type(field.as_str()) {
+            FieldType::String => {
+                let raw: Option<String> = row.get(idx)?;
+                raw.map(FieldValue::String).unwrap_or(FieldValue::Null)
+            }
+            FieldType::Integer => {
+                let raw: Option<i64> = row.get(idx)?;
+                raw.map(FieldValue::Integer).unwrap_or(FieldValue::Null)
+            }
+        };
+        out.push((field.clone(), value));
+    }
+    Ok(out)
+}
+
+fn format_csv_header(fields: &[String]) -> String {
+    let mut line = fields.join(",");
+    line.push_str("\r\n");
+    line
+}
+
+fn format_csv_row(values: &[(String, FieldValue)]) -> String {
+    let mut parts = Vec::with_capacity(values.len());
+    for (_, value) in values {
+        let text = match value {
+            FieldValue::String(s) => s.clone(),
+            FieldValue::Integer(n) => n.to_string(),
+            FieldValue::Null => String::new(),
+        };
+        parts.push(csv_escape(&text));
+    }
+    let mut line = parts.join(",");
+    line.push_str("\r\n");
+    line
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.is_empty() {
+        return String::new();
+    }
+    let needs_quotes = value.contains(',')
+        || value.contains('"')
+        || value.contains('\n')
+        || value.contains('\r');
+    if needs_quotes {
+        let escaped = value.replace('"', "\"\"");
+        format!("\"{}\"", escaped)
+    } else {
+        value.to_string()
+    }
+}
+
+fn format_jsonl_row(values: &[(String, FieldValue)]) -> String {
+    let mut map: BTreeMap<&str, &FieldValue> = BTreeMap::new();
+    for (name, value) in values {
+        map.insert(name.as_str(), value);
+    }
+
+    let mut parts: Vec<String> = Vec::new();
+    for (name, value) in map {
+        let json_value = match value {
+            FieldValue::String(s) => Some(format!("\"{}\"", escape_json(s))),
+            FieldValue::Integer(n) => Some(n.to_string()),
+            FieldValue::Null => None,
+        };
+        if let Some(value_str) = json_value {
+            parts.push(format!("\"{}\":{}", name, value_str));
+        }
+    }
+
+    let mut line = String::from("{");
+    line.push_str(&parts.join(","));
+    line.push('}');
+    line.push('\n');
+    line
+}
+
+fn build_export_query(filter: &ExportFilter, fields: &[String]) -> (String, Vec<String>) {
+    let field_list = fields.join(", ");
+    let mut sql = format!("SELECT {} FROM events WHERE 1=1", field_list);
+    let mut params: Vec<String> = Vec::new();
+
+    if let Some(ref run_id) = filter.run_id {
+        sql.push_str(" AND run_id = ?");
+        params.push(run_id.clone());
+    }
+    if let Some(ref since) = filter.since {
+        sql.push_str(" AND ts >= ?");
+        params.push(since.clone());
+    }
+    if let Some(ref until) = filter.until {
+        sql.push_str(" AND ts < ?");
+        params.push(until.clone());
+    }
+
+    if !filter.providers.is_empty() {
+        let placeholders: Vec<&str> = filter.providers.iter().map(|_| "?").collect();
+        sql.push_str(&format!(
+            " AND LOWER(provider) IN ({})",
+            placeholders.join(",")
+        ));
+        params.extend(filter.providers.clone());
+    }
+
+    if !filter.domain_patterns.is_empty() {
+        let conditions: Vec<String> = filter
+            .domain_patterns
+            .iter()
+            .map(|_| "LOWER(domain) LIKE ? ESCAPE '\\\\'".to_string())
+            .collect();
+        sql.push_str(&format!(" AND ({})", conditions.join(" OR ")));
+        for pattern in &filter.domain_patterns {
+            params.push(glob_to_sql_like(pattern));
+        }
+    }
+
+    sql.push_str(" ORDER BY ts ASC");
+    (sql, params)
+}
+
+fn glob_to_sql_like(pattern: &str) -> String {
+    let mut out = String::new();
+    for ch in pattern.chars() {
+        match ch {
+            '%' | '_' | '\\' => {
+                out.push('\\');
+                out.push(ch);
+            }
+            '*' => out.push('%'),
+            '?' => out.push('_'),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn open_export_output(path: &Option<PathBuf>) -> Result<Box<dyn Write>, String> {
+    if let Some(output_path) = path {
+        let file = fs::File::create(output_path)
+            .map_err(|e| format!("Failed to create output file: {}", e))?;
+        Ok(Box::new(BufWriter::new(file)))
+    } else {
+        Ok(Box::new(BufWriter::new(std::io::stdout())))
+    }
 }
 
 // ============================================================================
@@ -5101,6 +5775,29 @@ mod tests {
             provider_from_text("random-process", "/usr/bin/random", &matcher),
             Provider::Unknown
         );
+    }
+
+    #[test]
+    fn csv_escape_quotes_and_commas() {
+        assert_eq!(csv_escape("plain"), "plain");
+        assert_eq!(csv_escape("a,b"), "\"a,b\"");
+        assert_eq!(csv_escape("say \"hi\""), "\"say \"\"hi\"\"\"");
+        assert_eq!(csv_escape("line1\nline2"), "\"line1\nline2\"");
+        assert_eq!(csv_escape(""), "");
+    }
+
+    #[test]
+    fn glob_to_sql_like_converts_wildcards() {
+        assert_eq!(glob_to_sql_like("api.*"), "api.%");
+        assert_eq!(glob_to_sql_like("a?c"), "a_c");
+        assert_eq!(glob_to_sql_like("100%"), "100\\%");
+        assert_eq!(glob_to_sql_like("x_y"), "x\\_y");
+    }
+
+    #[test]
+    fn validate_fields_rejects_unknown() {
+        let fields = vec!["ts".to_string(), "nope".to_string()];
+        assert!(validate_fields(&fields).is_err());
     }
 
     #[test]
