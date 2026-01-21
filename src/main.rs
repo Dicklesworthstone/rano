@@ -17,8 +17,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod config_validation;
 mod pcap_capture;
 
-use config_validation::{validate_config_file, validate_toml_config, ConfigValidator};
-
 static RUNNING: AtomicBool = AtomicBool::new(true);
 
 const SQLITE_QUEUE_CAPACITY: usize = 10_000;
@@ -4708,7 +4706,7 @@ fn run_config(args: ConfigArgs) -> i32 {
 }
 
 fn run_config_check() -> i32 {
-    use config_validation::{validate_config_file, validate_toml_config, ConfigValidator};
+    use config_validation::ConfigValidator;
 
     let mut validator = ConfigValidator::new();
     let mut checked_any = false;
