@@ -7821,4 +7821,78 @@ mod tests {
         assert!(names.contains(&"live".to_string()));
         assert!(names.contains(&"verbose".to_string()));
     }
+
+    #[test]
+    fn test_retry_detection_triggers_at_threshold() {
+        let mut tracker = RetryTracker::new(3, 60000);
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
+        let port = 443;
+        let pid = 1234;
+
+        // First two connections should not trigger warning
+        let w1 = tracker.track_connection(ip, port, pid);
+        assert!(w1.is_none(), "First connection should not trigger warning");
+
+        let w2 = tracker.track_connection(ip, port, pid);
+        assert!(w2.is_none(), "Second connection should not trigger warning");
+
+        // Third connection (at threshold) should trigger warning
+        let w3 = tracker.track_connection(ip, port, pid);
+        assert!(w3.is_some(), "Third connection should trigger warning");
+        let warning = w3.unwrap();
+        assert_eq!(warning.count, 3);
+        assert_eq!(warning.endpoint, (ip, port));
+        assert_eq!(warning.window_seconds, 60.0);
+    }
+
+    #[test]
+    fn test_retry_detection_window_expiry() {
+        // Use a 100ms window for testing
+        let mut tracker = RetryTracker::new(3, 100);
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
+        let port = 443;
+        let pid = 1234;
+
+        // Add two connections
+        tracker.track_connection(ip, port, pid);
+        tracker.track_connection(ip, port, pid);
+
+        // Wait for window to expire
+        std::thread::sleep(std::time::Duration::from_millis(150));
+
+        // This should be treated as first connection after expiry
+        let w = tracker.track_connection(ip, port, pid);
+        assert!(w.is_none(), "Connection after window expiry should not trigger warning");
+    }
+
+    #[test]
+    fn test_retry_detection_per_endpoint() {
+        let mut tracker = RetryTracker::new(3, 60000);
+        let ip1 = std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8));
+        let ip2 = std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 1, 1, 1));
+        let port1 = 443;
+        let port2 = 80;
+        let pid1 = 1234;
+        let pid2 = 5678;
+
+        // Different IPs should be tracked separately
+        tracker.track_connection(ip1, port1, pid1);
+        tracker.track_connection(ip1, port1, pid1);
+        tracker.track_connection(ip2, port1, pid1);
+        let w = tracker.track_connection(ip2, port1, pid1);
+        assert!(w.is_none(), "Different IPs should not cross-trigger");
+
+        // Different ports should be tracked separately
+        tracker.track_connection(ip1, port2, pid1);
+        let w2 = tracker.track_connection(ip1, port1, pid1);
+        assert!(w2.is_some(), "Same IP:port should trigger");
+        assert_eq!(w2.unwrap().count, 3);
+
+        // Different PIDs should be tracked separately
+        tracker.track_connection(ip1, port1, pid2);
+        tracker.track_connection(ip1, port1, pid2);
+        let w3 = tracker.track_connection(ip1, port1, pid2);
+        assert!(w3.is_some(), "Same endpoint with different PID should trigger at threshold");
+        assert_eq!(w3.unwrap().count, 3);
+    }
 }
