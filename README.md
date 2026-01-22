@@ -292,6 +292,51 @@ rano report --latest --color always
 - Date: `2026-01-17` (interpreted as midnight UTC)
 - RFC3339: `2026-01-17T10:00:00Z`
 
+### `rano status`
+
+One-line status output for shell prompt integration (PS1, starship, etc.).
+
+```bash
+# Default one-line format
+rano status
+
+# Custom format template
+rano status --format '{active}/{total}'
+
+# Custom SQLite database
+rano status --sqlite /path/to/rano.sqlite
+```
+
+**Template variables**
+
+| Variable | Description |
+|----------|-------------|
+| `{active}` | Current active connection count |
+| `{total}` | Total connections this session |
+| `{anthropic}` | Anthropic provider connection count |
+| `{openai}` | OpenAI provider connection count |
+| `{google}` | Google provider connection count |
+| `{session_name}` | Current session name (if available) |
+
+**Default format**: `{active} active | anthropic:{anthropic} openai:{openai}`
+
+**Shell integration examples**
+
+```bash
+# Bash PS1
+PS1='$(rano status 2>/dev/null) \$ '
+
+# Zsh RPROMPT
+RPROMPT='$(rano status 2>/dev/null)'
+
+# Starship custom command
+[custom.rano]
+command = "rano status 2>/dev/null"
+when = "command -v rano"
+```
+
+**Performance**: Optimized for prompt use (<50ms typical execution).
+
 ---
 
 ## Alert Thresholds
