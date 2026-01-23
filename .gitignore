@@ -1,4 +1,8 @@
 /target
+target-*/
+
+# Logs
+logs/
 
 # bv (beads viewer) local config and caches
 .bv/
