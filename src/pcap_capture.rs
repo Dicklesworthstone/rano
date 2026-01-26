@@ -36,6 +36,7 @@ pub enum DomainSource {
 #[derive(Clone, Debug)]
 pub struct DomainMapping {
     pub hostname: String,
+    #[allow(dead_code)]
     pub source: DomainSource,
     captured_at: SystemTime,
     ttl: Duration,
@@ -332,6 +333,7 @@ enum TransportProto {
 #[cfg(feature = "pcap")]
 #[derive(Debug)]
 struct TransportPacket<'a> {
+    #[allow(dead_code)]
     src_ip: IpAddr,
     dst_ip: IpAddr,
     src_port: u16,
@@ -658,7 +660,10 @@ fn parse_dns_name(packet: &[u8], offset: &mut usize, depth: usize) -> Option<Str
             let ptr = (((len & 0x3F) as usize) << 8) | packet[pos + 1] as usize;
             if !jumped {
                 *offset = pos + 2;
-                jumped = true;
+                #[allow(unused_assignments)]
+                {
+                    jumped = true;
+                }
             }
             let mut new_offset = ptr;
             let name = parse_dns_name(packet, &mut new_offset, depth + 1)?;

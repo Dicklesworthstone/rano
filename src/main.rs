@@ -3480,8 +3480,8 @@ fn setup_signal_handler() {
         extern "C" fn handle(_sig: i32) {
             RUNNING.store(false, Ordering::SeqCst);
         }
-        libc::signal(libc::SIGINT, handle as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, handle as libc::sighandler_t);
+        libc::signal(libc::SIGINT, handle as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, handle as *const () as libc::sighandler_t);
     }
 }
 
