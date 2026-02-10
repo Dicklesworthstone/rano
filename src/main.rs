@@ -5214,7 +5214,7 @@ fn reverse_dns(ip: IpAddr) -> Option<String> {
                     sin_family: libc::AF_INET as u8,
                     sin_port: 0,
                     sin_addr: libc::in_addr {
-                        s_addr: u32::from_be_bytes(octets),
+                        s_addr: u32::from_ne_bytes(octets),
                     },
                     sin_zero: [0; 8],
                 };
@@ -5230,7 +5230,7 @@ fn reverse_dns(ip: IpAddr) -> Option<String> {
                     sin_family: libc::AF_INET as u16,
                     sin_port: 0,
                     sin_addr: libc::in_addr {
-                        s_addr: u32::from_be_bytes(octets),
+                        s_addr: u32::from_ne_bytes(octets),
                     },
                     sin_zero: [0; 8],
                 };
