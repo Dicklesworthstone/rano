@@ -292,6 +292,29 @@ rano report --latest --color always
 - Date: `2026-01-17` (interpreted as midnight UTC)
 - RFC3339: `2026-01-17T10:00:00Z`
 
+### `rano diff`
+
+Compare two monitoring sessions and highlight behavioral changes.
+
+```bash
+# Compare two run IDs
+rano diff --old "abc123" --new "def456"
+
+# Lower significance threshold and output JSON
+rano diff --old "abc123" --new "def456" --threshold 25 --json
+
+# Compare named sessions
+rano diff --old "morning-claude-audit-2026-01-20" --new "afternoon-claude-audit-2026-01-20"
+```
+
+**Diff sections**
+
+- **New domains**: domains present in new session but not old
+- **Removed domains**: domains present in old session but not new
+- **Changed domains**: domains whose counts change above threshold
+- **New processes**: process names that appear only in new session
+- **Provider changes**: significant per-provider count shifts
+
 ### `rano status`
 
 One-line status output for shell prompt integration (PS1, starship, etc.).
