@@ -206,7 +206,7 @@ rano --once
 --once                    # Single poll and exit
 --color <auto|always|never>
 --no-color                # Disable ANSI color
---theme <vivid|mono>
+--theme <vivid|mono|colorblind>
 --no-banner
 --config <path>           # Load key=value config
 --no-config
