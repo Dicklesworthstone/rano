@@ -11,6 +11,12 @@ env:
   RUST_BACKTRACE: 1
 
 jobs:
+  workflow-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: rhysd/actionlint@v1
+
   check:
     runs-on: ubuntu-latest
     steps:
