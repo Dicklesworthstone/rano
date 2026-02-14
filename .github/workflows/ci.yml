@@ -50,6 +50,9 @@ jobs:
       - name: Run help-command E2E
         run: scripts/e2e/run.sh help-command tests/e2e/help-command.sh
 
+      - name: Run diff-command E2E
+        run: scripts/e2e/run.sh diff-command tests/e2e/diff-command.sh
+
   # ============================================================
   # PCAP FEATURE BUILD/TEST MATRIX
   # Tests the optional pcap feature for DNS/SNI domain attribution
