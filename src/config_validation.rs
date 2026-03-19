@@ -256,43 +256,41 @@ fn validate_config_value(
         | "no_banner"
         | "alert_unknown_domain"
         | "alert_bell"
-        | "no_alerts" => {
-            if !is_valid_bool(value) {
-                result.add_error(
-                    path,
-                    Some(line),
-                    format!(
-                        "'{}' must be a boolean (true/false/yes/no/1/0), got '{}'",
-                        key, value
-                    ),
-                );
-            }
+        | "no_alerts"
+            if !is_valid_bool(value) =>
+        {
+            result.add_error(
+                path,
+                Some(line),
+                format!(
+                    "'{}' must be a boolean (true/false/yes/no/1/0), got '{}'",
+                    key, value
+                ),
+            );
         }
 
         // Positive integer values
-        "pid" => {
-            if value.parse::<u32>().is_err() {
-                result.add_error(
-                    path,
-                    Some(line),
-                    format!(
-                        "'{}' must be a valid process ID (positive integer), got '{}'",
-                        key, value
-                    ),
-                );
-            }
+        "pid" if value.parse::<u32>().is_err() => {
+            result.add_error(
+                path,
+                Some(line),
+                format!(
+                    "'{}' must be a valid process ID (positive integer), got '{}'",
+                    key, value
+                ),
+            );
         }
 
         // Positive u64 values
         "interval_ms" | "db_flush_ms" | "stats_interval_ms" | "stats_cycle_ms"
-        | "alert_cooldown_ms" => {
-            if value.parse::<u64>().is_err() {
-                result.add_error(
-                    path,
-                    Some(line),
-                    format!("'{}' must be a non-negative integer, got '{}'", key, value),
-                );
-            }
+        | "alert_cooldown_ms"
+            if value.parse::<u64>().is_err() =>
+        {
+            result.add_error(
+                path,
+                Some(line),
+                format!("'{}' must be a non-negative integer, got '{}'", key, value),
+            );
         }
 
         // Positive u64 values that must be >= 1
@@ -328,75 +326,65 @@ fn validate_config_value(
         },
 
         // Non-negative usize values
-        "stats_width" | "stats_top" => {
-            if value.parse::<usize>().is_err() {
-                result.add_error(
-                    path,
-                    Some(line),
-                    format!("'{}' must be a non-negative integer, got '{}'", key, value),
-                );
-            }
+        "stats_width" | "stats_top" if value.parse::<usize>().is_err() => {
+            result.add_error(
+                path,
+                Some(line),
+                format!("'{}' must be a non-negative integer, got '{}'", key, value),
+            );
         }
 
         // Enum values
-        "domain_mode" => {
-            if !VALID_DOMAIN_MODES.contains(&value.to_lowercase().as_str()) {
-                result.add_error(
-                    path,
-                    Some(line),
-                    format!(
-                        "'{}' must be one of [{}], got '{}'",
-                        key,
-                        VALID_DOMAIN_MODES.join(", "),
-                        value
-                    ),
-                );
-            }
+        "domain_mode" if !VALID_DOMAIN_MODES.contains(&value.to_lowercase().as_str()) => {
+            result.add_error(
+                path,
+                Some(line),
+                format!(
+                    "'{}' must be one of [{}], got '{}'",
+                    key,
+                    VALID_DOMAIN_MODES.join(", "),
+                    value
+                ),
+            );
         }
 
-        "log_format" => {
-            if !VALID_LOG_FORMATS.contains(&value.to_lowercase().as_str()) {
-                result.add_error(
-                    path,
-                    Some(line),
-                    format!(
-                        "'{}' must be one of [{}], got '{}'",
-                        key,
-                        VALID_LOG_FORMATS.join(", "),
-                        value
-                    ),
-                );
-            }
+        "log_format" if !VALID_LOG_FORMATS.contains(&value.to_lowercase().as_str()) => {
+            result.add_error(
+                path,
+                Some(line),
+                format!(
+                    "'{}' must be one of [{}], got '{}'",
+                    key,
+                    VALID_LOG_FORMATS.join(", "),
+                    value
+                ),
+            );
         }
 
-        "color" => {
-            if !VALID_COLOR_MODES.contains(&value.to_lowercase().as_str()) {
-                result.add_error(
-                    path,
-                    Some(line),
-                    format!(
-                        "'{}' must be one of [{}], got '{}'",
-                        key,
-                        VALID_COLOR_MODES.join(", "),
-                        value
-                    ),
-                );
-            }
+        "color" if !VALID_COLOR_MODES.contains(&value.to_lowercase().as_str()) => {
+            result.add_error(
+                path,
+                Some(line),
+                format!(
+                    "'{}' must be one of [{}], got '{}'",
+                    key,
+                    VALID_COLOR_MODES.join(", "),
+                    value
+                ),
+            );
         }
 
-        "theme" => {
-            if !VALID_THEMES.contains(&value.to_lowercase().as_str()) {
-                result.add_error(
-                    path,
-                    Some(line),
-                    format!(
-                        "'{}' must be one of [{}], got '{}'",
-                        key,
-                        VALID_THEMES.join(", "),
-                        value
-                    ),
-                );
-            }
+        "theme" if !VALID_THEMES.contains(&value.to_lowercase().as_str()) => {
+            result.add_error(
+                path,
+                Some(line),
+                format!(
+                    "'{}' must be one of [{}], got '{}'",
+                    key,
+                    VALID_THEMES.join(", "),
+                    value
+                ),
+            );
         }
 
         "stats_view" => {
@@ -418,10 +406,8 @@ fn validate_config_value(
         }
 
         // Path values - just check they're not empty
-        "log_file" | "log_dir" | "sqlite" => {
-            if value.is_empty() {
-                result.add_error(path, Some(line), format!("'{}' cannot be empty", key));
-            }
+        "log_file" | "log_dir" | "sqlite" if value.is_empty() => {
+            result.add_error(path, Some(line), format!("'{}' cannot be empty", key));
         }
 
         // String/pattern values - no validation needed for syntax
