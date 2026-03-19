@@ -43,9 +43,6 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             artifact_name: rano
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact_name: rano.exe
 
     runs-on: ${{ matrix.os }}
     permissions:
@@ -62,8 +59,7 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Create tarball (Unix)
-        if: runner.os != 'Windows'
+      - name: Create tarball
         run: |
           mkdir -p dist
           TARBALL="rano-${{ matrix.target }}.tar.xz"
@@ -71,17 +67,6 @@ jobs:
           tar -cJf "../../../dist/$TARBALL" ${{ matrix.artifact_name }}
           cd ../../../dist
           shasum -a 256 "$TARBALL" > "$TARBALL.sha256"
-
-      - name: Create zip (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          New-Item -ItemType Directory -Force -Path dist | Out-Null
-          $zipName = "rano-${{ matrix.target }}.zip"
-          Compress-Archive -Path "target/${{ matrix.target }}/release/${{ matrix.artifact_name }}" -DestinationPath "dist/$zipName"
-          cd dist
-          $hash = (Get-FileHash -Algorithm SHA256 $zipName).Hash.ToLower()
-          "$hash  $zipName" | Out-File -Encoding ASCII "$zipName.sha256"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
