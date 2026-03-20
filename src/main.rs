@@ -4952,10 +4952,6 @@ fn self_update(update: UpdateCommand) -> Result<(), Box<dyn std::error::Error>> 
         .or_else(|| env::var("RANO_BRANCH").ok())
         .unwrap_or_else(|| "main".to_string());
 
-    if cfg!(windows) {
-        return self_update_windows(&update, &owner, &repo, &branch);
-    }
-
     self_update_unix(&update, &owner, &repo, &branch)
 }
 
@@ -5101,68 +5097,6 @@ fn self_update_unix(
     Ok(())
 }
 
-fn self_update_windows(
-    update: &UpdateCommand,
-    owner: &str,
-    repo: &str,
-    branch: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if update.system || update.from_source || update.quiet || update.no_gum {
-        return Err(
-            "Windows updater supports only --version, --dest, --easy-mode, and --verify.".into(),
-        );
-    }
-
-    let script_url = format!(
-        "https://raw.githubusercontent.com/{}/{}/{}/install.ps1",
-        owner, repo, branch
-    );
-    let mut args: Vec<String> = Vec::new();
-
-    args.push(format!("-Owner {}", shell_escape_powershell(owner)));
-    args.push(format!("-Repo {}", shell_escape_powershell(repo)));
-
-    if let Some(version) = &update.version {
-        args.push(format!("-Version {}", shell_escape_powershell(version)));
-    }
-    if let Some(dest) = &update.dest {
-        args.push(format!(
-            "-Dest {}",
-            shell_escape_powershell(&dest.to_string_lossy())
-        ));
-    }
-    if update.easy_mode {
-        args.push("-EasyMode".to_string());
-    }
-    if update.verify {
-        args.push("-Verify".to_string());
-    }
-
-    let args_str = args.join(" ");
-
-    let command = format!(
-        "$ErrorActionPreference='Stop'; \
-$url={url}; \
-$script=(Invoke-WebRequest -UseBasicParsing $url).Content; \
-$sb=[ScriptBlock]::Create($script); \
-& $sb {args}",
-        url = shell_escape_powershell(&script_url),
-        args = args_str,
-    );
-
-    let status = ProcessCommand::new("powershell")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-Command")
-        .arg(command)
-        .status()?;
-
-    if !status.success() {
-        return Err(format!("Installer failed with status {status}").into());
-    }
-    Ok(())
-}
 
 fn shell_escape_posix(input: &str) -> String {
     if input.is_empty() {
@@ -5177,9 +5111,6 @@ fn shell_escape_posix(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
-fn shell_escape_powershell(input: &str) -> String {
-    format!("'{}'", input.replace('\'', "''"))
-}
 
 fn resolve_domain(ip: IpAddr, cache: &mut HashMap<IpAddr, DnsCacheEntry>) -> Option<String> {
     let now = SystemTime::now();

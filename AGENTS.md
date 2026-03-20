@@ -241,7 +241,6 @@ rano/
 │   └── e2e/                    # E2E test harness (lib.sh, run.sh, feature scripts)
 ├── docs/                       # Design documents (alerts, exports, pcap, presets, providers, reports)
 ├── install.sh                  # Cross-platform installer (Linux/macOS)
-├── install.ps1                 # Windows PowerShell installer
 └── .github/workflows/          # CI configuration
 ```
 
