@@ -4625,7 +4625,12 @@ fn print_provider_stats(stats: &Stats, width: usize, style: OutputStyle) {
     );
     for provider in providers {
         let count = *stats.per_provider.get(&provider).unwrap_or(&0);
+        // `total` is `.max(1)`'d at its binding site so division is safe,
+        // but clamp bar_len to width to guarantee the repeat allocation
+        // stays bounded even if future callers drop that invariant or
+        // `count > total` via a stale snapshot between reads.
         let bar_len = ((count as f64 / total as f64) * width as f64).round() as usize;
+        let bar_len = bar_len.min(width);
         let bar_char = style.provider_bar_char(provider);
         let bar_plain = format!(
             "{:width$}",
@@ -4720,7 +4725,24 @@ fn render_stats_bar(count: u64, max: u64, width: usize, style: OutputStyle) -> S
     if width == 0 {
         return String::new();
     }
+    // Guard against max == 0: without this, `count / 0` is infinity (or
+    // NaN when count is also 0), `(inf).round() as usize` saturates to
+    // `usize::MAX` on current stable Rust, and `"█".repeat(usize::MAX)`
+    // then tries to allocate ~3 × usize::MAX bytes and aborts the
+    // process. The single in-tree caller already `.max(1)`s before
+    // passing, so this is defense in depth — but any future caller that
+    // forgets that invariant shouldn't be able to crash the binary.
+    if max == 0 {
+        return " ".repeat(width);
+    }
     let bar_len = ((count as f64 / max as f64) * width as f64).round() as usize;
+    // Clamp bar_len to width. `f64::round() as usize` can saturate to
+    // `usize::MAX` on non-finite inputs (count == 0 && max == 0 was
+    // handled above, but infinities from transitional arithmetic on
+    // oddly-shaped callers are still possible), and it would
+    // additionally be nonsensical to render a bar longer than the
+    // total width even for sane inputs where count > max.
+    let bar_len = bar_len.min(width);
     let bar_plain = format!("{:width$}", "█".repeat(bar_len), width = width);
     paint(&bar_plain, style.accent(), false, false, style.color)
 }
@@ -9431,6 +9453,44 @@ mod tests {
         };
         let bar = render_stats_bar(50, 100, 0, style);
         assert!(bar.is_empty());
+    }
+
+    #[test]
+    fn test_render_stats_bar_zero_max_is_bounded() {
+        // Regression: `render_stats_bar(count, 0, width, …)` used to hit a
+        // floating-point divide by zero, round the resulting `+inf` to
+        // `usize::MAX`, and then `"█".repeat(usize::MAX)` would abort the
+        // process trying to allocate ~3 × usize::MAX bytes. The function
+        // now emits a width-padded blank string for `max == 0`.
+        let style = OutputStyle {
+            color: false,
+            theme: Theme::Vivid,
+        };
+        let bar = render_stats_bar(5, 0, 10, style);
+        assert_eq!(bar.len(), 10, "zero-max output must be width-padded");
+        assert!(
+            bar.chars().all(|c| c == ' '),
+            "zero-max output must contain no bar characters, got {bar:?}"
+        );
+    }
+
+    #[test]
+    fn test_render_stats_bar_count_exceeds_max_is_clamped() {
+        // Regression: `count > max` is possible under non-atomic stats
+        // snapshots (e.g. a stats thread reading per-provider counts and
+        // the max independently). The rendered bar must not exceed the
+        // requested width, and the repeat allocation must stay bounded.
+        let style = OutputStyle {
+            color: false,
+            theme: Theme::Vivid,
+        };
+        let bar = render_stats_bar(1_000, 10, 10, style);
+        // Bar is clamped to width; the full-width bar is 10 block chars.
+        assert_eq!(
+            bar.chars().filter(|c| *c == '█').count(),
+            10,
+            "oversized count must saturate at width, got {bar:?}"
+        );
     }
 
     #[test]
