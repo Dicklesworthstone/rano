@@ -9,7 +9,7 @@ default = []
 pcap = ["dep:pcap"]
 
 [dependencies]
-libc = "0.2.185"
+libc = "0.2.186"
 pcap = { version = "2.4", optional = true }
 rusqlite = { version = "0.38", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
