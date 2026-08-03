@@ -10,3 +10,7 @@ logs/
 # Beads ephemeral files
 .beads/last-touched
 .beads/.bv.lock
+
+# === multi-repo ephemeral cleanup 2026-08-03 ===
+.DS_Store
+**/.DS_Store
