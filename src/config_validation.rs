@@ -892,7 +892,12 @@ unknown_provider = ["test"]
 
     #[test]
     fn test_validate_paths_missing_parent() {
-        let result = validate_paths(None, Some(Path::new("/nonexistent/path/logfile.log")), None);
+        // A tempdir-scoped path keeps this hermetic: a literal "/nonexistent"
+        // can exist on shared build hosts, turning the assertion into a
+        // false failure.
+        let tmp = tempfile::tempdir().unwrap();
+        let log_file = tmp.path().join("missing-parent/logfile.log");
+        let result = validate_paths(None, Some(&log_file), None);
         assert!(!result.is_valid());
         assert!(result.errors[0].message.contains("does not exist"));
     }
