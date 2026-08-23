@@ -14,7 +14,7 @@
 
 set -euo pipefail
 
-RANO="${RANO:-./target/debug/rano}"
+RANO="${RANO:-${E2E_RANO_DEBUG}}"
 TEST_SQLITE="/tmp/rano-e2e-ancestry-$$.sqlite"
 
 # Cleanup on exit

@@ -14,7 +14,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-RANO_BIN="${RANO_BIN:-./target/release/rano}"
+RANO_BIN="${RANO_BIN:-${E2E_RANO_RELEASE}}"
 if [ ! -x "${RANO_BIN}" ]; then
   e2e_section "Building rano"
   cargo build --release --quiet

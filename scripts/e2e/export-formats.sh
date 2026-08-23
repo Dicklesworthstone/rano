@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-RANO="${RANO:-./target/debug/rano}"
+RANO="${RANO:-${E2E_RANO_DEBUG}}"
 TEST_SQLITE="/tmp/rano-e2e-export-$$.sqlite"
 EXPORT_CSV="/tmp/rano-e2e-export-$$.csv"
 EXPORT_JSONL="/tmp/rano-e2e-export-$$.jsonl"

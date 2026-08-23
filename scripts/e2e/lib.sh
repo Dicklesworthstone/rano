@@ -23,6 +23,17 @@ e2e_init() {
   E2E_START_EPOCH="$(date +%s)"
   export E2E_OUTPUT_DIR="${E2E_LOG_DIR}/outputs"
   mkdir -p "${E2E_OUTPUT_DIR}"
+
+  # Resolve rano binary paths honoring CARGO_TARGET_DIR so hosts with redirected
+  # target directories (shared build caches, multi-agent machines) still work.
+  if [ -n "${CARGO_TARGET_DIR:-}" ]; then
+    E2E_RANO_DEBUG="${CARGO_TARGET_DIR%/}/debug/rano"
+    E2E_RANO_RELEASE="${CARGO_TARGET_DIR%/}/release/rano"
+  else
+    E2E_RANO_DEBUG="./target/debug/rano"
+    E2E_RANO_RELEASE="./target/release/rano"
+  fi
+  export E2E_RANO_DEBUG E2E_RANO_RELEASE
 }
 
 e2e_section() {

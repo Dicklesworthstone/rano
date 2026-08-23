@@ -572,6 +572,8 @@ struct RetryWarning {
 struct RetryTracker {
     /// Recent connection timestamps: (remote_ip, remote_port, pid) -> Vec<Instant>
     recent: HashMap<(IpAddr, u16, u32), Vec<Instant>>,
+    /// Per-source warning cooldown: (remote_ip, remote_port, pid) -> last emit time
+    last_warn: HashMap<(IpAddr, u16, u32), Instant>,
     /// Number of connections that trigger a warning
     threshold: usize,
     /// Time window in milliseconds
@@ -582,6 +584,7 @@ impl RetryTracker {
     fn new(threshold: usize, window_ms: u64) -> Self {
         Self {
             recent: HashMap::new(),
+            last_warn: HashMap::new(),
             threshold,
             window_ms,
         }
@@ -595,6 +598,9 @@ impl RetryTracker {
         remote_port: u16,
         pid: u32,
     ) -> Option<RetryWarning> {
+        // Bound memory: drop endpoints whose entries fully expired before tracking.
+        self.prune_stale();
+
         let key = (remote_ip, remote_port, pid);
         let now = Instant::now();
         let window = Duration::from_millis(self.window_ms);
@@ -608,8 +614,15 @@ impl RetryTracker {
         // Prune entries older than window_ms
         timestamps.retain(|ts| now.duration_since(*ts) < window);
 
-        // Check if count >= threshold
+        // Check if count >= threshold, honoring an endpoint-level cooldown equal to
+        // the detection window so sustained storms do not re-warn on every close.
         if timestamps.len() >= self.threshold {
+            if let Some(last) = self.last_warn.get(&key) {
+                if now.duration_since(*last) < window {
+                    return None;
+                }
+            }
+            self.last_warn.insert(key, now);
             Some(RetryWarning {
                 count: timestamps.len(),
                 window_seconds: self.window_ms as f64 / 1000.0,
@@ -620,8 +633,7 @@ impl RetryTracker {
         }
     }
 
-    /// Prune old entries from all tracked endpoints (call periodically for memory management)
-    #[allow(dead_code)]
+    /// Prune old entries from all tracked endpoints (bounds map growth over long sessions).
     fn prune_stale(&mut self) {
         let now = Instant::now();
         let window = Duration::from_millis(self.window_ms);
@@ -631,6 +643,21 @@ impl RetryTracker {
             !timestamps.is_empty()
         });
     }
+}
+
+/// Build the stderr lines shown when the startup banner is suppressed: plain
+/// "warning: ..." lines always, plus one structured JSON warning per note in --json mode.
+fn suppressed_banner_note_lines(notes: &[String], json_mode: bool) -> Vec<String> {
+    let mut lines: Vec<String> = notes.iter().map(|n| format!("warning: {}", n)).collect();
+    if json_mode {
+        for note in notes {
+            lines.push(format!(
+                "{{\"type\":\"warning\",\"scope\":\"domain_mode\",\"message\":\"{}\"}}",
+                escape_json(note)
+            ));
+        }
+    }
+    lines
 }
 
 impl Default for MonitorArgs {
@@ -1502,6 +1529,13 @@ fn main() {
 
     if !args.no_banner {
         banner(&args, domain_label, &domain_notes, style, &log_writer);
+    } else {
+        // Banner suppressed: domain-mode notes (pcap fallback, PTR disabled) would be
+        // invisible. Emit them on stderr so degradation is never silent; stdout stays a
+        // pure event stream.
+        for line in suppressed_banner_note_lines(&domain_notes, args.json) {
+            eprintln!("{}", line);
+        }
     }
 
     let mut last_stats = SystemTime::now();
@@ -1716,7 +1750,9 @@ fn main() {
                             warning.count, domain_str, key.remote_port, warning.window_seconds
                         );
                         if args.json {
-                            eprintln!(
+                            // JSON retry warnings join alert/event objects on stdout so
+                            // machine consumers read one stream; stderr stays human-only.
+                            println!(
                                 r#"{{"type":"retry_warning","count":{},"endpoint":"{}:{}","window_seconds":{}}}"#,
                                 warning.count,
                                 warning.endpoint.0,
@@ -3461,6 +3497,8 @@ fn resolve_domain_mode(args: &MonitorArgs) -> (DomainMode, Option<String>) {
         DomainMode::Auto => (DomainMode::Ptr, None),
         DomainMode::Ptr => (DomainMode::Ptr, None),
         DomainMode::Pcap => (
+            // Reaching this arm means the caller wanted pcap but capture init failed
+            // upstream; degrade to PTR with an explanation rather than silently.
             DomainMode::Ptr,
             Some("pcap capture requested; falling back to PTR.".to_string()),
         ),
@@ -3469,7 +3507,14 @@ fn resolve_domain_mode(args: &MonitorArgs) -> (DomainMode, Option<String>) {
 
 fn pcap_permission_hint(err: &str) -> Option<&'static str> {
     let lower = err.to_lowercase();
-    if lower.contains("permission") || lower.contains("denied") || lower.contains("not permitted") {
+    if lower.contains("permission")
+        || lower.contains("denied")
+        || lower.contains("not permitted")
+        // libpcap words unprivileged socket-creation failures this way instead of
+        // EPERM-style: "Attempt to create packet socket failed - CAP_NET_RAW may
+        // be required".
+        || lower.contains("cap_net_raw")
+    {
         Some("pcap capture requires elevated privileges (sudo or CAP_NET_RAW).")
     } else {
         None
@@ -3720,7 +3765,11 @@ fn format_json_alert(
     let (kind_str, extra) = match kind {
         AlertKind::DomainMatch { domain, pattern } => (
             "domain_match",
-            format!(",\"pattern\":\"{}\",\"domain\":\"{}\"", pattern, domain),
+            format!(
+                ",\"pattern\":\"{}\",\"domain\":\"{}\"",
+                escape_json(pattern),
+                escape_json(domain)
+            ),
         ),
         AlertKind::MaxConnections { current, threshold } => (
             "max_connections",
@@ -3776,7 +3825,7 @@ fn format_json_alert(
 
     if let Some(info) = conn_info {
         parts.push(format!("\"pid\":{}", info.pid));
-        parts.push(format!("\"comm\":\"{}\"", info.comm));
+        parts.push(format!("\"comm\":\"{}\"", escape_json(&info.comm)));
     }
 
     format!("{{{}{}}}", parts.join(","), extra)
@@ -5729,6 +5778,7 @@ fn run_export(args: ExportArgs) -> Result<(), String> {
     }
 
     let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
+    set_busy_timeout(&conn);
 
     let has_events = table_exists(&conn, "events")?;
     if !has_events {
@@ -6040,6 +6090,7 @@ fn run_diff(args: DiffArgs) -> Result<(), String> {
     }
 
     let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
+    set_busy_timeout(&conn);
 
     let has_events = table_exists(&conn, "events")?;
     if !has_events {
@@ -6504,6 +6555,7 @@ fn run_status(args: StatusArgs) -> Result<(), String> {
     }
 
     let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
+    set_busy_timeout(&conn);
 
     // Check if events table exists
     let has_events = table_exists(&conn, "events")?;
@@ -6632,6 +6684,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     }
 
     let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
+    set_busy_timeout(&conn);
 
     // Check schema
     let has_events = table_exists(&conn, "events")?;
@@ -7734,10 +7787,13 @@ fn build_ips_query(filter: &ReportFilter, top: usize) -> (String, Vec<String>) {
 }
 
 fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
+    // Phase 1: pragmas + base tables only. Must not reference columns that older
+    // databases may lack, or CREATE INDEX/VIEW would fail before migration runs.
     conn.execute_batch(
         "
         PRAGMA journal_mode=WAL;
         PRAGMA synchronous=NORMAL;
+        PRAGMA busy_timeout=5000;
         CREATE TABLE IF NOT EXISTS events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             ts TEXT NOT NULL,
@@ -7775,6 +7831,24 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
             closes INTEGER,
             session_name TEXT
         );
+        ",
+    )?;
+
+    // Phase 2: migrate columns added after the original schema so any historical DB
+    // opens cleanly (missing columns previously caused insert failures that disabled
+    // SQLite logging entirely).
+    ensure_column(conn, "events", "run_id", "TEXT")?;
+    ensure_column(conn, "events", "duration_ms", "INTEGER")?;
+    ensure_column(conn, "events", "ancestry_path", "TEXT")?;
+    ensure_column(conn, "events", "alert", "INTEGER")?;
+    ensure_column(conn, "events", "remote_is_private", "INTEGER")?;
+    ensure_column(conn, "events", "ip_version", "INTEGER")?;
+    ensure_column(conn, "events", "retry_count", "INTEGER")?;
+    ensure_column(conn, "sessions", "session_name", "TEXT")?;
+
+    // Phase 3: indexes and views (safe now that all columns exist).
+    conn.execute_batch(
+        "
         CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
         CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);
         CREATE INDEX IF NOT EXISTS idx_events_provider ON events(provider);
@@ -7824,13 +7898,14 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
             GROUP BY s.run_id;
         ",
     )?;
-    ensure_column(conn, "events", "run_id", "TEXT")?;
-    ensure_column(conn, "events", "duration_ms", "INTEGER")?;
-    ensure_column(conn, "events", "ancestry_path", "TEXT")?;
-    ensure_column(conn, "events", "alert", "INTEGER")?;
     Ok(())
 }
 
+/// Allow concurrent readers (report/export/diff/status) to wait briefly instead of
+/// failing with SQLITE_BUSY while the monitor's writer thread holds the database.
+fn set_busy_timeout(conn: &Connection) {
+    let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+}
 fn insert_session(conn: &mut Connection, ctx: &RunContext) -> rusqlite::Result<()> {
     conn.execute(
         "INSERT OR REPLACE INTO sessions (run_id, start_ts, host, user, patterns, domain_mode, args, interval_ms, stats_interval_ms, session_name)
@@ -8307,6 +8382,68 @@ mod tests {
         let mut conn = Connection::open_in_memory().expect("failed to open in-memory db");
         init_sqlite(&mut conn).expect("failed to init schema");
         conn
+    }
+
+    #[test]
+    fn init_sqlite_migrates_legacy_schema() {
+        // Schema as shipped by older rano builds: missing run_id/duration_ms/ancestry_path/
+        // alert/remote_is_private/ip_version/retry_count on events and session_name on
+        // sessions. Before the migration these DBs caused insert failures that disabled
+        // SQLite logging entirely ("sqlite session insert failed: table sessions has no
+        // column named session_name").
+        let mut conn = Connection::open_in_memory().expect("failed to open in-memory db");
+        conn.execute_batch(
+            "
+            CREATE TABLE events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts TEXT NOT NULL,
+                event TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                pid INTEGER,
+                comm TEXT,
+                cmdline TEXT,
+                proto TEXT,
+                local_ip TEXT,
+                local_port INTEGER,
+                remote_ip TEXT,
+                remote_port INTEGER,
+                domain TEXT
+            );
+            CREATE TABLE sessions (
+                run_id TEXT PRIMARY KEY,
+                start_ts TEXT NOT NULL,
+                end_ts TEXT,
+                host TEXT,
+                user TEXT,
+                patterns TEXT,
+                domain_mode TEXT,
+                args TEXT,
+                interval_ms INTEGER,
+                stats_interval_ms INTEGER,
+                connects INTEGER,
+                closes INTEGER
+            );
+            ",
+        )
+        .expect("legacy schema creation failed");
+
+        init_sqlite(&mut conn).expect("migration of legacy schema failed");
+
+        let ctx = RunContext::new(&MonitorArgs::default(), "ptr", None);
+        insert_session(&mut conn, &ctx).expect("session insert failed on migrated legacy db");
+
+        let event = create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Anthropic);
+        write_sqlite_batch(&mut conn, &[event]).expect("event insert failed on migrated legacy db");
+
+        let name: Option<String> = conn
+            .query_row("SELECT session_name FROM sessions LIMIT 1", [], |row| {
+                row.get(0)
+            })
+            .expect("session_name query failed");
+        assert!(
+            name.is_some(),
+            "session_name should be populated after migration"
+        );
     }
 
     #[test]
@@ -9335,6 +9472,100 @@ mod tests {
             "Same endpoint with different PID should trigger at threshold"
         );
         assert_eq!(w3.unwrap().count, 3);
+    }
+
+    #[test]
+    fn retry_cooldown_suppresses_repeated_warnings() {
+        let mut tracker = RetryTracker::new(2, 40);
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(9, 9, 9, 9));
+        let port = 443;
+        let pid = 7;
+
+        assert!(tracker.track_connection(ip, port, pid).is_none());
+        assert!(
+            tracker.track_connection(ip, port, pid).is_some(),
+            "first breach warns"
+        );
+        // Sustained storm: cooldown equal to window suppresses immediate re-warnings.
+        assert!(
+            tracker.track_connection(ip, port, pid).is_none(),
+            "cooldown suppresses"
+        );
+        assert!(
+            tracker.track_connection(ip, port, pid).is_none(),
+            "cooldown suppresses"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        // Cooldown AND detection window have both elapsed: fresh storm re-warns.
+        assert!(tracker.track_connection(ip, port, pid).is_none());
+        assert!(
+            tracker.track_connection(ip, port, pid).is_some(),
+            "warning re-emits after cooldown elapses"
+        );
+    }
+    #[test]
+    fn retry_tracker_bounds_endpoint_map_growth() {
+        // Zero-width window expires every entry immediately: map must stay empty no
+        // matter how many distinct endpoints are tracked (prune_stale wired in).
+        let mut tracker = RetryTracker::new(1, 0);
+        for i in 0..200u32 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 0, (i >> 8) as u8, i as u8));
+            let _ = tracker.track_connection(ip, 80, i);
+        }
+        assert!(
+            tracker.recent.values().all(Vec::is_empty),
+            "expired endpoints must not accumulate timestamps"
+        );
+
+        // Live entries are retained.
+        let mut live = RetryTracker::new(1, 60_000);
+        let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(10, 1, 1, 1));
+        let _ = live.track_connection(ip, 443, 1);
+        assert_eq!(live.recent.len(), 1);
+    }
+
+    #[test]
+    fn format_json_alert_escapes_quotes_in_strings() {
+        let kind = AlertKind::DomainMatch {
+            domain: "evil\".com".to_string(),
+            pattern: "*.ev\"il.com\\x".to_string(),
+        };
+        let json = format_json_alert(
+            "2026-08-23T00:00:00Z",
+            &kind,
+            AlertSeverity::Critical,
+            None,
+            None,
+        );
+        assert!(
+            !json.contains("evil\".com"),
+            "raw quote must not leak into JSON"
+        );
+        assert!(json.contains("evil\\\".com"), "quote must be escaped");
+        assert!(
+            json.contains("*.ev\\\"il.com\\\\x"),
+            "backslash must be escaped"
+        );
+    }
+
+    #[test]
+    fn suppressed_banner_note_lines_plain_and_json() {
+        let notes = vec!["pcap capture unavailable: perm".to_string()];
+        let plain = suppressed_banner_note_lines(&notes, false);
+        assert_eq!(
+            plain,
+            vec!["warning: pcap capture unavailable: perm".to_string()]
+        );
+
+        let quoted = vec!["note with \"quote\"".to_string()];
+        let json_lines = suppressed_banner_note_lines(&quoted, true);
+        assert_eq!(json_lines.len(), 2);
+        assert_eq!(json_lines[0], "warning: note with \"quote\"");
+        assert!(
+            json_lines[1].contains("note with \\\"quote\\\""),
+            "json message must escape quotes: {}",
+            json_lines[1]
+        );
     }
 
     // ============================================================

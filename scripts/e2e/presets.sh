@@ -15,7 +15,7 @@
 
 set -euo pipefail
 
-RANO="${RANO:-./target/debug/rano}"
+RANO="${RANO:-${E2E_RANO_DEBUG}}"
 TEMP_PRESET_DIR=""
 
 # Cleanup on exit

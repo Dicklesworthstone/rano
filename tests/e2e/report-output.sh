@@ -7,7 +7,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-RANO_BIN="${RANO_BIN:-./target/release/rano}"
+RANO_BIN="${RANO_BIN:-${E2E_RANO_RELEASE:-./target/release/rano}}"
 if [ ! -x "${RANO_BIN}" ]; then
   e2e_section "Building rano"
   cargo build --release --quiet
@@ -86,9 +86,19 @@ e2e_info "events_run2=${events_run2}"
 e2e_info "connects_run2=${connects_run2}"
 e2e_info "closes_run2=${closes_run2}"
 
-# Pretty output (golden)
-e2e_run "report latest pretty" "${RANO_BIN}" report --sqlite "${DB_PATH}" --latest --no-color
+# Pretty output (golden). Stdout is compared against the fixture; schema-compat
+# warnings are stderr-only by design and asserted positively right after.
+e2e_run "report latest pretty" sh -c "\"${RANO_BIN}\" report --sqlite \"${DB_PATH}\" --latest --no-color 2>\"${TMP_DIR}/pretty.stderr\""
 e2e_assert_last_status 0
+
+e2e_section "Schema-compat warnings present on stderr"
+for warning_needle in "missing sqlite views" "ancestry_path column missing"; do
+  if grep -Fq "${warning_needle}" "${TMP_DIR}/pretty.stderr"; then
+    e2e_info "ok: ${warning_needle}"
+  else
+    e2e_fail "expected stderr warning not found: ${warning_needle}"
+  fi
+done
 
 e2e_section "Output snippet (pretty)"
 head -n 12 "${E2E_LAST_OUTPUT_FILE}" | while IFS= read -r line; do
@@ -100,7 +110,7 @@ e2e_assert_last_eq "${expected_pretty}"$'\n\n'
 
 # JSON output + schema validation + golden
 
-e2e_run "report latest json" "${RANO_BIN}" report --sqlite "${DB_PATH}" --latest --json
+e2e_run "report latest json" sh -c "\"${RANO_BIN}\" report --sqlite \"${DB_PATH}\" --latest --json 2>\"${TMP_DIR}/json.stderr\""
 e2e_assert_last_status 0
 
 e2e_section "Output snippet (json)"
@@ -158,7 +168,7 @@ e2e_assert_last_eq "${expected_json}"$'\n'
 
 # Time range filter sanity check
 
-e2e_run "report range json" "${RANO_BIN}" report --sqlite "${DB_PATH}" --since 2026-01-18 --until 2026-01-19 --json
+e2e_run "report range json" sh -c "\"${RANO_BIN}\" report --sqlite \"${DB_PATH}\" --since 2026-01-18 --until 2026-01-19 --json 2>\"${TMP_DIR}/range.stderr\""
 e2e_assert_last_status 0
 
 python3 - "${E2E_LAST_OUTPUT_FILE}" <<'PY'

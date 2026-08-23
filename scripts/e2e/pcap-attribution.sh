@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-RANO="${RANO:-./target/debug/rano}"
+RANO="${RANO:-${E2E_RANO_DEBUG}}"
 FIXTURE_DIR="tests/fixtures/pcap"
 PCAP_FIXTURE="${FIXTURE_DIR}/dns-fixture.pcap"
 SERVER_PORT=18080

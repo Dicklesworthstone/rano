@@ -44,17 +44,58 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
-      - name: Run tests
-        run: cargo test
+      - name: Install sqlite3 (E2E dependency)
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
 
-      - name: Run help-command E2E
-        run: scripts/e2e/run.sh help-command tests/e2e/help-command.sh
+      - name: Build debug profile for E2E
+        run: cargo build --quiet
 
-      - name: Run diff-command E2E
-        run: scripts/e2e/run.sh diff-command tests/e2e/diff-command.sh
+      - name: Run E2E suites
+        run: |
+          set -u
+          pass=0
+          fail=0
+          failed=""
+          for spec in \
+            "batching-under-load tests/e2e/batching-under-load.sh" \
+            "diff-command tests/e2e/diff-command.sh" \
+            "help-command tests/e2e/help-command.sh" \
+            "provider-config-override tests/e2e/provider-config-override.sh" \
+            "report-output tests/e2e/report-output.sh" \
+            "report-seeded-sqlite tests/e2e/report-seeded-sqlite.sh" \
+            "stats-views tests/e2e/stats-views.sh" \
+            "status-command tests/e2e/status-command.sh" \
+            "alert-thresholds scripts/e2e/alert-thresholds.sh" \
+            "config-validation scripts/e2e/config-validation.sh" \
+            "export-formats scripts/e2e/export-formats.sh" \
+            "presets scripts/e2e/presets.sh" \
+            "process-ancestry scripts/e2e/process-ancestry.sh" \
+            "sqlite-concurrency scripts/e2e/sqlite-concurrency.sh"
+          do
+            name="${spec%% *}"
+            script="${spec#* }"
+            if scripts/e2e/run.sh "${name}" "${script}" > /dev/null 2>&1; then
+              echo "PASS ${name}"
+              pass=$((pass+1))
+            else
+              echo "FAIL ${name}"
+              fail=$((fail+1))
+              failed="${failed} ${name}"
+            fi
+          done
+          echo "E2E summary: pass=${pass} fail=${fail}"
+          if [ "${fail}" -ne 0 ]; then
+            echo "Failed suites:${failed}"
+            exit 1
+          fi
 
-      - name: Run status-command E2E
-        run: scripts/e2e/run.sh status-command tests/e2e/status-command.sh
+      - name: Upload E2E logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: logs/e2e/
+          retention-days: 7
 
   # ============================================================
   # PCAP FEATURE BUILD/TEST MATRIX
@@ -102,3 +143,9 @@ jobs:
           cargo test --features pcap
           echo "::endgroup::"
           echo "✅ pcap feature tests passed"
+
+      - name: "[pcap] Run pcap-attribution E2E"
+        run: |
+          sudo apt-get update && sudo apt-get install -y sqlite3
+          scripts/e2e/run.sh pcap-attribution scripts/e2e/pcap-attribution.sh
+          echo "✅ pcap attribution e2e passed"

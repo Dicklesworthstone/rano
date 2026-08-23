@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RANO_BIN="${RANO_BIN:-./target/debug/rano}"
+RANO_BIN="${RANO_BIN:-${E2E_RANO_DEBUG}}"
 if [ ! -x "${RANO_BIN}" ]; then
   e2e_section "Building rano"
   cargo build --quiet
