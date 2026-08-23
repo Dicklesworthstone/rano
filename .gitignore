@@ -14,3 +14,7 @@ logs/
 # === multi-repo ephemeral cleanup 2026-08-03 ===
 .DS_Store
 **/.DS_Store
+
+# br transient write/sync locks
+.beads/*.lock
+.beads/.*.lock
