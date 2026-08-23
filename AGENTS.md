@@ -229,7 +229,7 @@ Target Processes (claude / codex / gemini PIDs)
 ```
 rano/
 ├── Cargo.toml                  # Package manifest (single crate, no workspace)
-├── rust-toolchain.toml         # Stable Rust toolchain
+├── rust-toolchain.toml         # Nightly Rust toolchain
 ├── src/
 │   ├── main.rs                 # Core binary: monitoring, CLI, reporting, export, diff, status (~10K lines)
 │   ├── config_validation.rs    # Config file validation (KV + TOML)

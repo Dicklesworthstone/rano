@@ -200,6 +200,12 @@ rano --once
 --stats-interval-ms <ms>  # Live stats cadence (0 disables)
 --stats-width <n>         # ASCII bar width
 --stats-top <n>           # Top-N lists size
+--stats-view <name>       # Stats view provider|domain|port|process (repeatable)
+--stats-cycle-ms <ms>     # Rotate stats views at this interval (0 disables)
+--show-ancestry           # Capture/display process ancestry chains (off by default)
+--session-name <name>     # Override auto-generated session name
+--retry-threshold <n>     # Connections within window before retry warning (default 3)
+--retry-window-ms <ms>    # Retry detection window in ms (default 60000)
 --once                    # Single poll and exit
 --color <auto|always|never>
 --no-color                # Disable ANSI color
@@ -393,8 +399,8 @@ rano --alert-domain "*.suspicious.com" \
 | Flag | Description |
 |------|-------------|
 | `--alert-domain <pattern>` | Glob pattern for domains to watch (repeatable) |
-| `--alert-max-connections <N>` | Alert when total active connections exceed N |
-| `--alert-max-per-provider <N>` | Alert when any provider exceeds N connections |
+| `--alert-max-connections <N>` | Alert when total active connections reach N (fires at >= N) |
+| `--alert-max-per-provider <N>` | Alert when any provider reaches N connections (fires at >= N) |
 | `--alert-duration-ms <N>` | Alert on connections lasting longer than N ms |
 | `--alert-unknown-domain` | Alert on connections to unresolved IPs |
 | `--alert-bell` | Ring terminal bell on alert |
@@ -411,7 +417,7 @@ Alerts print to stderr with timestamps and details:
 [ALERT] 2026-01-20T10:00:02Z | WARNING | long_duration | 45000ms > 30000ms
 ```
 
-In JSON mode, alerts are JSON objects on stderr:
+In JSON mode, alerts are JSON objects on **stdout**, interleaved with connection events so machine consumers read a single stream (pretty-mode alerts go to stderr):
 
 ```json
 {"type":"alert","ts":"2026-01-20T10:00:00Z","kind":"domain_match","severity":"critical","pattern":"*.malicious.com","domain":"evil.malicious.com"}
@@ -471,6 +477,24 @@ rano --alert-domain "*.cn" \
 3. Raise thresholds: increase `--alert-max-connections` value
 
 ---
+
+## Retry Detection
+
+rano watches for connection-churn storms (rapid reconnects to the same endpoint from the same PID) and warns once per endpoint per window.
+
+```bash
+# Warn when 5+ closes to one endpoint occur within 30 seconds
+rano --pattern claude --retry-threshold 5 --retry-window-ms 30000
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--retry-threshold <n>` | 3 | Connections within the window that trigger a warning |
+| `--retry-window-ms <ms>` | 60000 | Detection window; also acts as the per-source re-warn cooldown |
+
+- Warnings print as yellow `⚠ Retry pattern:` lines on stderr in pretty mode.
+- In `--json` mode they are emitted as `{"type":"retry_warning","count":N,"endpoint":"ip:port","window_seconds":S}` on stdout, alongside events and alerts.
+- The triggering close event persists `retry_count` in SQLite (`events.retry_count`) for post-hoc queries.
 
 ## Presets
 
@@ -650,7 +674,7 @@ rano export --format jsonl | jq 'select(.ancestry_path | contains("tmux"))'
 
 ### Performance
 
-Ancestry is cached with a configurable TTL (default 30 seconds) and staleness detection. The cache is invalidated if the process's comm name changes, ensuring accuracy even for long-running sessions.
+Ancestry is cached with a fixed 30-second TTL plus staleness detection; the cache is invalidated if a process's comm name changes, keeping long-running sessions accurate. Ancestry capture is active when `--show-ancestry` is passed (it is off by default to save syscalls); without it the stored `ancestry_path` is empty. Display truncates chains deeper than five levels to `... → grandparent → leaf`.
 
 ---
 
@@ -1016,7 +1040,7 @@ rano --pid <pid>
 
 ### "SQLite file is locked"
 
-Another process is holding a lock on the database. Stop the other writer or use a new file.
+Transient SQLite contention between the monitor's writer and read-side commands (`status`, `report`, `export`) is retried automatically via `busy_timeout=5000` on every connection, so prompt-style status usage does not fail under load. If you still see "database is locked", another process holds an exclusive lock (e.g., a different tool) — stop it or use a separate database file:
 
 ```bash
 rano --sqlite /tmp/rano-$(date +%s).sqlite

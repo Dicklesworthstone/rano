@@ -1,3 +1,9 @@
+> **As-built note (2026-08-23):** Implemented as designed except: no port 80 in the BPF
+> filter; the "background sweep" is lazy cleanup inside cache lookups (idle caches persist);
+> TTLs and the 10k cap are compile-time constants — the tuning-flag table below was not
+> implemented (`--pcap-interface` / `--pcap-cache-max` are tracked separately). DomainSource
+> currently has Dns/Sni variants only; provenance surfacing is tracked separately.
+
 # Pcap Domain Attribution Design
 
 Status: design for bead rust_agent_network_observer-35w.1.1

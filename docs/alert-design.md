@@ -1,3 +1,9 @@
+> **As-built note (2026-08-23):** The `alerts` table, its views, and `--alert-domain-regex`
+> below were NOT implemented. Alerts denormalize onto `events.alert=1` (see README) and
+> domain matching uses the in-tree glob matcher only. Thresholds fire at `>=` the value.
+> JSON alerts go to stdout (interleaved with events); pretty alerts to stderr. The rest of
+> this document describes shipped behavior.
+
 # Alert System Design
 
 Status: design for bead bd-1jj (parent: bd-2iu)

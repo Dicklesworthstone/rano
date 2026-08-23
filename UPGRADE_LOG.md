@@ -1,3 +1,8 @@
+> **Status (2026-08-23):** Historical planning document. The summary table below no longer
+> reflects reality: all listed dependency and action upgrades have since landed on `main`
+> (see `Cargo.lock` — rusqlite 0.40.x, serde 1.0.229, toml 1.x — and the actions v6/v7 bumps).
+> Kept for provenance; do not treat "Pending" rows as open work.
+
 # Rano Dependency Upgrade Log
 
 ## Upgrade Summary

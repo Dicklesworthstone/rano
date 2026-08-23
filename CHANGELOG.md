@@ -26,6 +26,27 @@ Commits on `main` after the v0.1.0 release (2026-03-19).
 
 - Style cleanup: removed extra blank lines left behind by Windows code removal
   ([d6175dd](https://github.com/Dicklesworthstone/rano/commit/d6175dd43eac98ac0aca06a99588f92df681614e))
+- Pcap-to-PTR fallback no longer silent: domain-mode notes (capture unavailable,
+  privilege hint) are emitted on stderr under `--json`/`--no-banner`, and the
+  privilege hint now recognizes libpcap's "CAP_NET_RAW may be required" wording
+- Legacy SQLite databases (pre `session_name` / missing newer `events` columns)
+  are migrated in a dedicated phase before index/view creation, instead of
+  failing schema init or disabling SQLite logging entirely
+- Alert JSON lines escape `pattern`/`domain`/`comm`, so hostile process names can
+  no longer produce malformed JSON on the alert stream
+- Retry warnings honor a per-source cooldown (equal to the detection window) and
+  prune expired endpoint entries each close, bounding memory over long sessions
+### Changed
+
+- JSON retry warnings moved from stderr to stdout to join events/alerts as one
+  machine-readable stream; pretty-mode retry warnings remain on stderr
+- Every SQLite connection (writer and readers) sets `busy_timeout=5000`;
+  concurrent `status`/`report` during monitoring no longer risk SQLITE_BUSY errors
+- E2E harness resolves binaries via `CARGO_TARGET_DIR`-aware defaults; CI now runs
+  all 14 E2E suites (including pcap-attribution with a feature build) plus a new
+  sqlite-concurrency suite, uploading logs on failure
+- report-output golden comparison uses stdout only, with the schema-compat
+  warnings positively asserted on stderr
 
 ---
 
@@ -256,7 +277,8 @@ Full process-tree lineage for every connection.
   `cargo fmt --check`, E2E test suite
 - **dist.yml** -- cross-compile for four targets (x86\_64-linux,
   aarch64-linux, x86\_64-darwin, aarch64-darwin)
-- **release-automation.yml** -- tag-triggered binary publishing to GitHub Releases
+- **release-automation.yml** -- push-triggered (main) version-drift tagging that
+  publishes GitHub Releases when Cargo.toml version moves past the latest `v*` tag
 - pcap feature CI matrix
   ([bf77dbc](https://github.com/Dicklesworthstone/rano/commit/bf77dbcd38526e1355d7aa1e35914d1cb37e7bef))
 - Workflow lint job with actionlint
