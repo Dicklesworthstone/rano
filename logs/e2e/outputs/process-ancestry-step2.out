@@ -16,8 +16,10 @@ CREATE TABLE events (
             ancestry_path TEXT,
             remote_is_private INTEGER,
             ip_version INTEGER,
-            duration_ms INTEGER
-        , alert INTEGER);
+            duration_ms INTEGER,
+            alert INTEGER,
+            retry_count INTEGER
+        );
 CREATE INDEX idx_events_ts ON events(ts);
 CREATE INDEX idx_events_run_id ON events(run_id);
 CREATE INDEX idx_events_provider ON events(provider);

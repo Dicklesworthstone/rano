@@ -1,3 +1,4 @@
+warning: sqlite disabled (sqlite session insert failed: table sessions has no column named session_name)
 Summary
   connects 0
   closes 0

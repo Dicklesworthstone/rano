@@ -1,3 +1,4 @@
+warning: sqlite disabled (sqlite session insert failed: table sessions has no column named session_name)
 rano patterns=[nonexistent] interval=1000ms json=false domain=ptr udp=true listening=true once=true sqlite=observer.sqlite stats=1000ms log_file=- log_dir=-
 Summary
   connects 0
