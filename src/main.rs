@@ -1196,7 +1196,7 @@ struct SqliteEvent {
     run_id: String,
     event: String,
     key: ConnKey,
-    pid: u32,
+    pid: Option<u32>,
     comm: String,
     cmdline: String,
     provider: Provider,
@@ -1633,30 +1633,9 @@ fn main() {
                     last_seen: now,
                 };
 
-                // Check if this connection would trigger an alert (for SQLite flag)
-                let triggers_alert =
-                    would_trigger_connection_alert(&args.alert, domain.as_deref(), entry.remote_ip);
-
                 active.insert(key.clone(), info);
 
                 let ts = now_rfc3339();
-                if let Some(writer) = sqlite_writer.as_ref() {
-                    writer.enqueue(SqliteEvent {
-                        ts: ts.clone(),
-                        run_id: run_ctx.run_id.clone(),
-                        event: "connect".to_string(),
-                        key: key.clone(),
-                        pid,
-                        comm: meta.comm.clone(),
-                        cmdline: meta.cmdline.clone(),
-                        provider: meta.provider,
-                        domain: domain.clone(),
-                        ancestry_path: ancestry_path.clone(),
-                        duration_ms: None,
-                        alert: triggers_alert,
-                        retry_count: None,
-                    });
-                }
                 if !args.summary_only {
                     emit_event(
                         &ts,
@@ -1696,24 +1675,56 @@ fn main() {
                     .entry(meta.provider)
                     .or_default()
                     .insert(entry.remote_ip);
-                if let Some(name) = domain {
+                if let Some(name) = domain.clone() {
                     *stats.per_domain.entry(name).or_insert(0) += 1;
                 }
 
-                // Check connection-level alerts (domain pattern, unknown domain)
-                if let Some(conn_info) = active.get(&key) {
-                    check_connection_alerts(
+                // Single decision point for connection-level alerts: consults
+                // AlertState cooldowns so suppressed alerts never flag the row.
+                let conn_alert_emitted = match active.get(&key) {
+                    Some(conn_info) => check_connection_alerts(
                         &args.alert,
                         &mut alert_state,
                         &key,
                         conn_info,
                         args.json,
                         style,
-                    );
-                }
+                    ),
+                    None => false,
+                };
 
-                // Check threshold alerts (max connections, max per provider)
-                check_threshold_alerts(&args.alert, &mut alert_state, &stats, args.json, style);
+                // Threshold alerts have no natural per-connection row; synthesize
+                // a queryable alert=1 row for each emitted breach.
+                let threshold_rows = check_threshold_alerts(
+                    &args.alert,
+                    &mut alert_state,
+                    &stats,
+                    &run_ctx.run_id,
+                    &ts,
+                    args.json,
+                    style,
+                );
+
+                if let Some(writer) = sqlite_writer.as_ref() {
+                    writer.enqueue(SqliteEvent {
+                        ts: ts.clone(),
+                        run_id: run_ctx.run_id.clone(),
+                        event: "connect".to_string(),
+                        key: key.clone(),
+                        pid: Some(pid),
+                        comm: meta.comm.clone(),
+                        cmdline: meta.cmdline.clone(),
+                        provider: meta.provider,
+                        domain: domain.clone(),
+                        ancestry_path: ancestry_path.clone(),
+                        duration_ms: None,
+                        alert: conn_alert_emitted,
+                        retry_count: None,
+                    });
+                    for row in threshold_rows {
+                        writer.enqueue(row);
+                    }
+                }
             } else if let Some(info) = active.get_mut(&key) {
                 info.last_seen = now;
             }
@@ -1776,23 +1787,6 @@ fn main() {
                     }
                 }
 
-                if let Some(writer) = sqlite_writer.as_ref() {
-                    writer.enqueue(SqliteEvent {
-                        ts: ts.clone(),
-                        run_id: run_ctx.run_id.clone(),
-                        event: "close".to_string(),
-                        key: key.clone(),
-                        pid: info.pid,
-                        comm: info.comm.clone(),
-                        cmdline: info.cmdline.clone(),
-                        provider: info.provider,
-                        domain: info.domain.clone(),
-                        ancestry_path: info.ancestry_path.clone(),
-                        duration_ms,
-                        alert: triggers_alert,
-                        retry_count,
-                    });
-                }
                 if !args.summary_only {
                     emit_event(
                         &ts,
@@ -1812,6 +1806,45 @@ fn main() {
                         resolved_log_format,
                         log_writer.as_ref(),
                     );
+                }
+                stats.closes += 1;
+                stats.active = stats.active.saturating_sub(1);
+
+                // Single decision point for duration alerts: consults AlertState
+                // cooldowns so suppressed alerts never flag the row.
+                let mut close_alert_emitted = false;
+                if let Some(ms) = duration_ms {
+                    stats.duration_ms_samples += 1;
+                    stats.duration_ms_total = stats.duration_ms_total.saturating_add(ms);
+                    stats.duration_ms_max = stats.duration_ms_max.max(ms);
+
+                    close_alert_emitted = check_duration_alert(
+                        &args.alert,
+                        &mut alert_state,
+                        &key,
+                        &info,
+                        ms,
+                        args.json,
+                        style,
+                    );
+                }
+
+                if let Some(writer) = sqlite_writer.as_ref() {
+                    writer.enqueue(SqliteEvent {
+                        ts: ts.clone(),
+                        run_id: run_ctx.run_id.clone(),
+                        event: "close".to_string(),
+                        key: key.clone(),
+                        pid: Some(info.pid),
+                        comm: info.comm.clone(),
+                        cmdline: info.cmdline.clone(),
+                        provider: info.provider,
+                        domain: info.domain.clone(),
+                        ancestry_path: info.ancestry_path.clone(),
+                        duration_ms,
+                        alert: close_alert_emitted,
+                        retry_count,
+                    });
                 }
                 stats.closes += 1;
                 stats.active = stats.active.saturating_sub(1);
