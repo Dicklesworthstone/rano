@@ -11344,4 +11344,127 @@ mod tests {
         assert!(args.stats_width_set);
         assert_eq!(args.stats_cycle_ms, 3500);
     }
+
+    #[test]
+    fn test_parse_report_args_flags() {
+        let args = parse_report_args(&[
+            "--sqlite".to_string(),
+            "/tmp/custom-report.sqlite".to_string(),
+            "--latest".to_string(),
+            "--since".to_string(),
+            "2026-01-01".to_string(),
+            "--until".to_string(),
+            "2026-01-02".to_string(),
+            "--json".to_string(),
+            "--top".to_string(),
+            "15".to_string(),
+            "--no-color".to_string(),
+        ])
+        .expect("should parse report args");
+
+        assert_eq!(args.sqlite_path, "/tmp/custom-report.sqlite");
+        assert!(args.latest);
+        assert_eq!(args.since.as_deref(), Some("2026-01-01"));
+        assert_eq!(args.until.as_deref(), Some("2026-01-02"));
+        assert!(args.json);
+        assert_eq!(args.top, 15);
+        assert_eq!(args.color, ColorMode::Never);
+
+        // Mutually exclusive latest and run-id
+        let err = parse_report_args(&[
+            "--latest".to_string(),
+            "--run-id".to_string(),
+            "run-123".to_string(),
+        ])
+        .expect_err("should reject mutually exclusive latest and run-id");
+        assert!(err.contains("mutually exclusive"));
+    }
+
+    #[test]
+    fn test_parse_export_args_flags() {
+        let args = parse_export_args(&[
+            "--format".to_string(),
+            "csv".to_string(),
+            "--sqlite".to_string(),
+            "/tmp/custom-export.sqlite".to_string(),
+            "--since".to_string(),
+            "1h".to_string(),
+            "--until".to_string(),
+            "now".to_string(),
+            "--run-id".to_string(),
+            "run-abc".to_string(),
+            "--provider".to_string(),
+            "anthropic".to_string(),
+            "--provider".to_string(),
+            "openai".to_string(),
+            "--domain".to_string(),
+            "*.anthropic.com".to_string(),
+            "--fields".to_string(),
+            "ts,provider,domain".to_string(),
+            "--no-header".to_string(),
+            "-o".to_string(),
+            "/tmp/out.csv".to_string(),
+        ])
+        .expect("should parse export args");
+
+        assert_eq!(args.format, ExportFormat::Csv);
+        assert_eq!(args.sqlite_path, "/tmp/custom-export.sqlite");
+        assert_eq!(args.since.as_deref(), Some("1h"));
+        assert_eq!(args.until.as_deref(), Some("now"));
+        assert_eq!(args.run_id.as_deref(), Some("run-abc"));
+        assert_eq!(args.providers, vec!["anthropic", "openai"]);
+        assert_eq!(args.domain_patterns, vec!["*.anthropic.com"]);
+        assert_eq!(
+            args.fields.as_deref(),
+            Some(
+                &[
+                    "ts".to_string(),
+                    "provider".to_string(),
+                    "domain".to_string()
+                ][..]
+            )
+        );
+        assert!(args.no_header);
+        assert_eq!(args.output, Some(PathBuf::from("/tmp/out.csv")));
+
+        // Missing format error
+        let err = parse_export_args(&["--sqlite".to_string(), "test.sqlite".to_string()])
+            .expect_err("should require --format");
+        assert!(err.contains("--format is required"));
+    }
+
+    #[test]
+    fn test_parse_update_args_flags() {
+        let cmd = parse_update_args(&[
+            "--version".to_string(),
+            "v0.3.0".to_string(),
+            "--system".to_string(),
+            "--easy-mode".to_string(),
+            "--dest".to_string(),
+            "/custom/bin".to_string(),
+            "--from-source".to_string(),
+            "--verify".to_string(),
+            "--quiet".to_string(),
+            "--no-gum".to_string(),
+            "--owner".to_string(),
+            "custom-owner".to_string(),
+            "--repo".to_string(),
+            "custom-repo".to_string(),
+            "--branch".to_string(),
+            "main".to_string(),
+        ])
+        .expect("should parse update args");
+
+        assert_eq!(cmd.version.as_deref(), Some("v0.3.0"));
+        assert!(cmd.system);
+        assert!(cmd.easy_mode);
+        assert_eq!(cmd.dest, Some(PathBuf::from("/custom/bin")));
+        assert!(cmd.from_source);
+        assert!(cmd.verify);
+        assert!(cmd.quiet);
+        assert!(cmd.no_gum);
+        assert_eq!(cmd.owner.as_deref(), Some("custom-owner"));
+        assert_eq!(cmd.repo.as_deref(), Some("custom-repo"));
+        assert_eq!(cmd.branch.as_deref(), Some("main"));
+    }
 }
