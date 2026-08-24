@@ -1,3 +1,3 @@
-ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
-2026-01-20T10:00:05Z,run-test-1,connect,google,1236,gemini,/usr/bin/gemini,tcp,192.168.1.100,54323,142.250.189.206,443,gemini.google.com,,
-2026-01-20T10:00:15Z,run-test-1,close,google,1236,gemini,/usr/bin/gemini,tcp,192.168.1.100,54323,142.250.189.206,443,gemini.google.com,,10000
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,domain_source,ancestry_path,duration_ms,alert,retry_count
+2026-01-20T10:00:05Z,run-test-1,connect,google,1236,gemini,/usr/bin/gemini,tcp,192.168.1.100,54323,142.250.189.206,443,gemini.google.com,,,,0,
+2026-01-20T10:00:15Z,run-test-1,close,google,1236,gemini,/usr/bin/gemini,tcp,192.168.1.100,54323,142.250.189.206,443,gemini.google.com,,,10000,0,

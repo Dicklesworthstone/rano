@@ -1,1 +1,1 @@
-ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,domain_source,ancestry_path,duration_ms,alert,retry_count

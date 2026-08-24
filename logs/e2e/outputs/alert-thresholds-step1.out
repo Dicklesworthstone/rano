@@ -27,6 +27,8 @@ OPTIONS:
 --summary-only            Suppress live events, show summary only
 --domain-mode <mode>      auto|ptr|pcap (default: auto)
 --pcap                    Force pcap mode (falls back with warning)
+--pcap-interface <name>   Capture interface for pcap mode (default: auto)
+--pcap-cache-max <n>      DNS/SNI cache cap, >= 100 (default: 10000)
 --no-dns                  Disable PTR lookups
 --include-udp             Include UDP sockets (default: true)
 --no-udp                  Disable UDP sockets
@@ -66,7 +68,12 @@ RETRY DETECTION:
 --retry-threshold <n>          Connections in window to trigger warning (default: 3)
 --retry-window-ms <ms>         Retry detection window in ms (default: 60000)
 
-CONFIG:
+SECRETS & PRIVACY:
+--redact-cmdline [mode]        Mask cmdlines in durable stores (SQLite, log
+files, exports): off|secrets|all (bare flag
+= secrets; default: off). Attribution and
+live display always see the original.
+
 --preset <name>           Load named preset (repeatable, merged in order)
 --list-presets            List available presets and exit
 --config <path>           Load config file (key=value format)

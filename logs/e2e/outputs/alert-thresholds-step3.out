@@ -19,7 +19,7 @@ CREATE TABLE events (
             duration_ms INTEGER,
             alert INTEGER,
             retry_count INTEGER
-        );
+        , domain_source TEXT);
 CREATE INDEX idx_events_ts ON events(ts);
 CREATE INDEX idx_events_run_id ON events(run_id);
 CREATE INDEX idx_events_provider ON events(provider);

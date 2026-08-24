@@ -1,2 +1,2 @@
-ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
-2026-01-20T12:04:00Z,test-run-special-chars,connect,anthropic,5000,my-app_v2,/usr/bin/my-app_v2,tcp,192.168.1.100,54325,104.18.32.7,443,api.anthropic.com,"init:1,bash:100,my-app_v2:5000",
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,domain_source,ancestry_path,duration_ms,alert,retry_count
+2026-01-20T12:04:00Z,test-run-special-chars,connect,anthropic,5000,my-app_v2,/usr/bin/my-app_v2,tcp,192.168.1.100,54325,104.18.32.7,443,api.anthropic.com,,"init:1,bash:100,my-app_v2:5000",,0,

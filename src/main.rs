@@ -2241,6 +2241,18 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 args.include_udp = true;
                 i += 1;
             }
+            "--no-udp" => {
+                args.include_udp = false;
+                i += 1;
+            }
+            "--include-listening" => {
+                args.include_listening = true;
+                i += 1;
+            }
+            "--show-ancestry" => {
+                args.show_ancestry = true;
+                i += 1;
+            }
             "--redact-cmdline" => {
                 // Optional value: --redact-cmdline [off|secrets|all]; bare flag = secrets
                 let next = argv.get(i + 1).map(|s| s.as_str());
@@ -2350,6 +2362,7 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 i += 1;
             }
             "--stats-top" => {
+                i += 1;
                 let value = require_value(argv, i, "--stats-top")?;
                 args.stats_top = parse_usize(value, "--stats-top")?;
                 if args.stats_top == 0 {
@@ -2362,6 +2375,19 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 let value = require_value(argv, i, "--stats-view")?;
                 let view = parse_stats_view(value)?;
                 args.stats_views.push(view);
+                i += 1;
+            }
+            "--stats-width" => {
+                i += 1;
+                let value = require_value(argv, i, "--stats-width")?;
+                args.stats_width = parse_usize(value, "--stats-width")?;
+                args.stats_width_set = true;
+                i += 1;
+            }
+            "--stats-cycle-ms" => {
+                i += 1;
+                let value = require_value(argv, i, "--stats-cycle-ms")?;
+                args.stats_cycle_ms = parse_u64(value, "--stats-cycle-ms")?;
                 i += 1;
             }
             "--no-banner" => {
@@ -6179,10 +6205,13 @@ fn run_export(args: ExportArgs) -> Result<(), String> {
 
     let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
     set_busy_timeout(&conn);
-    // Late-added column: migrate idempotently so exports from pre-provenance
+    // Late-added columns: migrate idempotently so exports from older
     // databases still prepare their default-field SELECT.
     let mut conn = conn;
     let _ = ensure_column(&mut conn, "events", "domain_source", "TEXT");
+    let _ = ensure_column(&mut conn, "events", "retry_count", "INTEGER");
+    let _ = ensure_column(&mut conn, "events", "alert", "INTEGER");
+    let _ = ensure_column(&mut conn, "events", "ancestry_path", "TEXT");
 
     let has_events = table_exists(&conn, "events")?;
     if !has_events {
@@ -11242,5 +11271,32 @@ mod tests {
         let masked = redact_cmdline_str(raw, RedactMode::Secrets);
         assert!(masked.contains("<redacted>"));
         assert!(masked.contains("claude"));
+    }
+
+    #[test]
+    fn test_load_monitor_args_extended_flags() {
+        let args = load_monitor_args(&[
+            "--no-udp".to_string(),
+            "--include-listening".to_string(),
+            "--show-ancestry".to_string(),
+            "--stats-top".to_string(),
+            "7".to_string(),
+            "--stats-view".to_string(),
+            "domain".to_string(),
+            "--stats-width".to_string(),
+            "65".to_string(),
+            "--stats-cycle-ms".to_string(),
+            "3500".to_string(),
+        ])
+        .expect("should parse flags");
+
+        assert!(!args.include_udp);
+        assert!(args.include_listening);
+        assert!(args.show_ancestry);
+        assert_eq!(args.stats_top, 7);
+        assert_eq!(args.stats_views, vec![StatsView::Domain]);
+        assert_eq!(args.stats_width, 65);
+        assert!(args.stats_width_set);
+        assert_eq!(args.stats_cycle_ms, 3500);
     }
 }

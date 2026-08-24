@@ -1,4 +1,4 @@
-ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
-2026-01-20T10:00:00Z,run-test-1,connect,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,
-2026-01-20T10:00:01Z,run-test-1,connect,openai,1235,codex,/usr/bin/codex,tcp,192.168.1.100,54322,13.107.246.10,443,api.openai.com,,
-2026-01-20T10:00:02Z,run-test-1,close,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,1500
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,domain_source,ancestry_path,duration_ms,alert,retry_count
+2026-01-20T10:00:00Z,run-test-1,connect,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,,,0,
+2026-01-20T10:00:01Z,run-test-1,connect,openai,1235,codex,/usr/bin/codex,tcp,192.168.1.100,54322,13.107.246.10,443,api.openai.com,,,,0,
+2026-01-20T10:00:02Z,run-test-1,close,anthropic,1234,claude,/usr/bin/claude,tcp,192.168.1.100,54321,104.18.32.7,443,api.anthropic.com,,,1500,0,

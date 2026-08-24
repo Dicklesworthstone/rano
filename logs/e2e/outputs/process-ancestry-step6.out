@@ -1,2 +1,2 @@
-ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,ancestry_path,duration_ms
-2026-01-20T12:01:00Z,test-run-ancestry-short,connect,openai,2000,codex,/usr/bin/codex,tcp,192.168.1.100,54322,13.107.246.10,443,api.openai.com,"init:1,codex:2000",
+ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,domain_source,ancestry_path,duration_ms,alert,retry_count
+2026-01-20T12:01:00Z,test-run-ancestry-short,connect,openai,2000,codex,/usr/bin/codex,tcp,192.168.1.100,54322,13.107.246.10,443,api.openai.com,,"init:1,codex:2000",,0,

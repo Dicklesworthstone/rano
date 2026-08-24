@@ -38,12 +38,14 @@
     {
       "domain": "api.openai.com",
       "events": 3,
-      "provider": "openai"
+      "provider": "openai",
+      "source": null
     },
     {
       "domain": "api.anthropic.com",
       "events": 2,
-      "provider": "anthropic"
+      "provider": "anthropic",
+      "source": null
     }
   ],
   "top_ips": [

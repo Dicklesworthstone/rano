@@ -55,11 +55,13 @@ CREATE TABLE events (
     remote_ip TEXT,
     remote_port INTEGER,
     domain TEXT,
+    domain_source TEXT,
     ancestry_path TEXT,
     remote_is_private INTEGER,
     ip_version INTEGER,
     duration_ms INTEGER,
-    alert INTEGER
+    alert INTEGER,
+    retry_count INTEGER
 );
 CREATE INDEX idx_events_ts ON events(ts);
 CREATE INDEX idx_events_run_id ON events(run_id);

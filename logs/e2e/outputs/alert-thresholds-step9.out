@@ -18,3 +18,4 @@
 17|duration_ms|INTEGER|0||0
 18|alert|INTEGER|0||0
 19|retry_count|INTEGER|0||0
+20|domain_source|TEXT|0||0
