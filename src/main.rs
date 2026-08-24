@@ -92,8 +92,13 @@ struct ConfigArgs {
 
 #[derive(Clone, Debug)]
 enum ConfigSubcommand {
-    Check,
-    Show { json: bool },
+    Check {
+        config: Option<PathBuf>,
+        config_toml: Option<PathBuf>,
+    },
+    Show {
+        json: bool,
+    },
     Paths,
 }
 
@@ -2505,6 +2510,37 @@ fn parse_report_args(argv: &[String]) -> Result<ReportArgs, String> {
     Ok(args)
 }
 
+/// Parse `rano config check [--config <path>] [--config-toml <path>]`.
+fn parse_config_check_args(argv: &[String]) -> Result<ConfigArgs, String> {
+    let mut config = None;
+    let mut config_toml = None;
+    let mut i = 0;
+    while i < argv.len() {
+        match argv[i].as_str() {
+            "--config" => {
+                i += 1;
+                let value = argv.get(i).ok_or("Missing value for --config")?;
+                config = Some(PathBuf::from(value));
+            }
+            "--config-toml" => {
+                i += 1;
+                let value = argv.get(i).ok_or("Missing value for --config-toml")?;
+                config_toml = Some(PathBuf::from(value));
+            }
+            other => {
+                return Err(format!("Unknown config check flag: '{}'", other));
+            }
+        }
+        i += 1;
+    }
+    Ok(ConfigArgs {
+        subcommand: ConfigSubcommand::Check {
+            config,
+            config_toml,
+        },
+    })
+}
+
 fn parse_config_args(argv: &[String]) -> Result<ConfigArgs, String> {
     for arg in argv {
         if arg == "-h" || arg == "--help" {
@@ -2523,12 +2559,11 @@ fn parse_config_args(argv: &[String]) -> Result<ConfigArgs, String> {
     }
 
     let subcommand = match argv[0].as_str() {
-        "check" => ConfigSubcommand::Check,
+        "check" => parse_config_check_args(&argv[1..])?.subcommand,
         "show" => {
             let json = argv.iter().any(|a| a == "--json");
             ConfigSubcommand::Show { json }
         }
-        "paths" => ConfigSubcommand::Paths,
         other => {
             return Err(format!(
                 "Unknown config subcommand: '{}'. Use 'rano config --help' for usage.",
@@ -3416,14 +3451,18 @@ fn print_config_help() {
         "rano config - validate and inspect configuration\n\n\
 USAGE:\n  rano config <subcommand> [options]\n\n\
 SUBCOMMANDS:\n\
-  check             Validate all configuration files\n\
-  show [--json]     Display resolved configuration\n\
-  paths             Show config file search locations\n\n\
+  check [options]    Validate all configuration sources\n\
+    --config <path>        Also validate this key-value config file\n\
+    --config-toml <path>   Also validate this TOML provider config\n\
+                           (RANO_CONFIG_TOML is always checked when set)\n\
+  show [--json]      Display resolved configuration\n\
+  paths              Show config file search locations\n\n\
 OPTIONS:\n\
   -h, --help        Show this help\n\
   -V, --version     Show version\n\n\
 EXAMPLES:\n\
   rano config check                # Validate all config files\n\
+  rano config check --config-toml custom.toml  # Include an override file\n\
   rano config show                 # Show resolved config\n\
   rano config show --json          # Show config as JSON\n\
   rano config paths                # List config search paths\n"
@@ -5757,42 +5796,22 @@ enum FieldValue {
 
 fn run_config(args: ConfigArgs) -> i32 {
     match args.subcommand {
-        ConfigSubcommand::Check => run_config_check(),
+        ConfigSubcommand::Check {
+            config,
+            config_toml,
+        } => run_config_check_with_sources(config.as_deref(), config_toml.as_deref()),
         ConfigSubcommand::Show { json } => run_config_show(json),
         ConfigSubcommand::Paths => run_config_paths(),
     }
 }
 
-fn run_config_check() -> i32 {
-    use config_validation::ConfigValidator;
-
-    let mut validator = ConfigValidator::new();
-    let mut checked_any = false;
-    // Check key-value config file
-    if let Some(kv_path) = default_config_path() {
-        if kv_path.exists() {
-            checked_any = true;
-            validator.validate_config_file(&kv_path);
-        }
-    }
-
-    // Check TOML config files
-    for toml_path in default_provider_config_paths() {
-        if toml_path.exists() {
-            checked_any = true;
-            validator.validate_toml_config(&toml_path);
-        }
-    }
-
-    if !checked_any {
-        println!("No configuration files found.");
-        println!("Use 'rano config paths' to see search locations.");
-        return 0;
-    }
-
-    println!("{}", validator.summary());
-
-    if validator.is_valid() { 0 } else { 1 }
+#[derive(Clone)]
+struct ExportFilter {
+    run_id: Option<String>,
+    since: Option<String>,
+    until: Option<String>,
+    providers: Vec<String>,
+    domain_patterns: Vec<String>,
 }
 
 fn run_config_show(json: bool) -> i32 {
@@ -5861,8 +5880,6 @@ fn run_config_show(json: bool) -> i32 {
 fn run_config_paths() -> i32 {
     println!("Configuration file search locations:\n");
 
-    // Key-value config paths
-    println!("Key-value config (config.conf):");
     if let Some(kv_path) = default_config_path() {
         let exists = kv_path.exists();
         let marker = if exists { "[found]" } else { "[not found]" };
@@ -5885,17 +5902,107 @@ fn run_config_paths() -> i32 {
     println!("Environment variables:");
     println!("  RANO_CONFIG       Override key-value config path");
     println!("  RANO_CONFIG_TOML  Override TOML config path");
-    println!("  XDG_CONFIG_HOME   XDG base directory (default: ~/.config)");
-
     0
 }
 
-struct ExportFilter {
-    run_id: Option<String>,
-    since: Option<String>,
-    until: Option<String>,
-    providers: Vec<String>,
-    domain_patterns: Vec<String>,
+fn run_config_check() -> i32 {
+    run_config_check_with_sources(None, None)
+}
+
+/// Validate every configured source: the default discovery paths plus any
+/// explicit `--config` / `--config-toml` overrides and `RANO_CONFIG_TOML`,
+/// mirroring what a monitor run actually loads.
+fn run_config_check_with_sources(kv_override: Option<&Path>, toml_override: Option<&Path>) -> i32 {
+    use config_validation::ConfigValidator;
+
+    fn check_path(
+        validator: &mut ConfigValidator,
+        checked_any: &mut bool,
+        path: &Path,
+        is_toml: bool,
+    ) -> bool {
+        if !path.exists() {
+            return false;
+        }
+        let errors_before = validator.errors.len();
+        let warnings_before = validator.warnings.len();
+        if is_toml {
+            validator.validate_toml_config(path);
+        } else {
+            validator.validate_config_file(path);
+        }
+        *checked_any = true;
+        let status = if validator.errors.len() > errors_before {
+            "[errors]"
+        } else if validator.warnings.len() > warnings_before {
+            "[warnings]"
+        } else {
+            "[ok]"
+        };
+        println!("  {} {}", path.display(), status);
+        true
+    }
+
+    let mut validator = ConfigValidator::new();
+    let mut checked_any = false;
+
+    println!("Checking configuration sources:\n");
+
+    // Key-value config
+    println!("Key-value config (config.conf):");
+    match kv_override {
+        Some(path) => {
+            if !check_path(&mut validator, &mut checked_any, path, false) {
+                eprintln!("error: --config path not found: {}", path.display());
+                return 1;
+            }
+        }
+        None => {
+            if let Some(path) = default_config_path() {
+                check_path(&mut validator, &mut checked_any, &path, false);
+            }
+        }
+    }
+    println!();
+
+    // TOML provider configs (CLI override and env both load, like the monitor)
+    println!("TOML provider config (rano.toml):");
+    match toml_override {
+        Some(path) => {
+            if !check_path(&mut validator, &mut checked_any, path, true) {
+                eprintln!("error: --config-toml path not found: {}", path.display());
+                return 1;
+            }
+        }
+        None => {
+            for path in default_provider_config_paths() {
+                check_path(&mut validator, &mut checked_any, &path, true);
+            }
+        }
+    }
+    if let Ok(env_path) = env::var("RANO_CONFIG_TOML") {
+        let trimmed = env_path.trim();
+        if !trimmed.is_empty() {
+            let path = PathBuf::from(trimmed);
+            if !check_path(&mut validator, &mut checked_any, &path, true) {
+                eprintln!(
+                    "warning: RANO_CONFIG_TOML path not found: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+
+    println!();
+    if !checked_any {
+        println!("No configuration files found.");
+        println!("Use 'rano config paths' to see search locations.");
+        return 0;
+    }
+
+    println!("{}", validator.summary());
+
+    if validator.is_valid() { 0 } else { 1 }
 }
 
 fn run_export(args: ExportArgs) -> Result<(), String> {
@@ -8284,6 +8391,7 @@ fn push_json_map_provider(out: &mut String, key: &str, map: &BTreeMap<Provider, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::NamedTempFile;
 
     #[test]
     fn normalize_patterns_lowercases_and_dedupes() {
@@ -10856,5 +10964,53 @@ mod tests {
                 .is_some(),
             "newest entry survives pruning"
         );
+    }
+
+    #[test]
+    fn config_check_reports_invalid_override_path() {
+        let file = NamedTempFile::new().expect("tempfile failed");
+        std::fs::write(file.path(), "interval_ms=notanumber\n").expect("write failed");
+        let code = run_config_check_with_sources(Some(file.path()), None);
+        assert_eq!(code, 1, "invalid override must exit nonzero");
+    }
+
+    #[test]
+    fn config_check_accepts_valid_override_path() {
+        let file = NamedTempFile::new().expect("tempfile failed");
+        std::fs::write(file.path(), "interval_ms=1000\njson=true\n").expect("write failed");
+        let code = run_config_check_with_sources(Some(file.path()), None);
+        assert_eq!(code, 0, "valid override must pass");
+    }
+
+    #[test]
+    fn config_check_missing_override_path_is_error() {
+        let missing = std::path::Path::new("/nonexistent/rano-test-does-not-exist.conf");
+        assert_ne!(run_config_check_with_sources(Some(missing), None), 0);
+    }
+
+    #[test]
+    fn parse_config_check_args_flags() {
+        let args = parse_config_check_args(&[
+            "--config".to_string(),
+            "/tmp/a.conf".to_string(),
+            "--config-toml".to_string(),
+            "/tmp/b.toml".to_string(),
+        ])
+        .expect("flags should parse");
+        match args.subcommand {
+            ConfigSubcommand::Check {
+                config,
+                config_toml,
+            } => {
+                assert_eq!(config.as_deref(), Some(std::path::Path::new("/tmp/a.conf")));
+                assert_eq!(
+                    config_toml.as_deref(),
+                    Some(std::path::Path::new("/tmp/b.toml"))
+                );
+            }
+            other => panic!("unexpected subcommand: {other:?}"),
+        }
+
+        assert!(parse_config_check_args(&["--bogus".to_string()]).is_err());
     }
 }

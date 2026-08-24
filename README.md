@@ -823,6 +823,11 @@ rano provides built-in configuration validation to catch errors and typos before
 # Validate all config files
 rano config check
 
+# Validate every source a run would load, including overrides
+rano config check --config-toml /path/to/custom.toml
+RANO_CONFIG_TOML=/path/to/custom.toml rano config check
+rano config check --config /path/to/rano.conf
+
 # Show resolved configuration
 rano config show
 
@@ -837,7 +842,7 @@ rano config paths
 
 | Subcommand | Description |
 |------------|-------------|
-| `config check` | Validate all config files and report errors/warnings |
+| `config check` | Validate all config files and report errors/warnings; `--config <path>` / `--config-toml <path>` include overrides, and a set `RANO_CONFIG_TOML` is always checked |
 | `config show` | Display the resolved configuration (all sources merged) |
 | `config show --json` | Output resolved configuration as JSON |
 | `config paths` | Show where rano looks for config files |
