@@ -57,6 +57,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "alert_cooldown_ms",
     "no_alerts",
     "redact_cmdline",
+    "retry_threshold",
+    "retry_window_ms",
 ];
 
 /// Valid values for enum-like configuration options.
@@ -297,24 +299,25 @@ fn validate_config_value(
         }
 
         // Positive u64 values that must be >= 1
-        "alert_max_connections" | "alert_max_per_provider" | "alert_duration_ms" => {
-            match value.parse::<u64>() {
-                Ok(0) => {
-                    result.add_error(path, Some(line), format!("'{}' must be >= 1, got 0", key));
-                }
-                Err(_) => {
-                    result.add_error(
-                        path,
-                        Some(line),
-                        format!("'{}' must be a positive integer, got '{}'", key, value),
-                    );
-                }
-                Ok(_) => {}
+        "alert_max_connections"
+        | "alert_max_per_provider"
+        | "alert_duration_ms"
+        | "retry_window_ms" => match value.parse::<u64>() {
+            Ok(0) => {
+                result.add_error(path, Some(line), format!("'{}' must be >= 1, got 0", key));
             }
-        }
+            Err(_) => {
+                result.add_error(
+                    path,
+                    Some(line),
+                    format!("'{}' must be a positive integer, got '{}'", key, value),
+                );
+            }
+            Ok(_) => {}
+        },
 
         // Positive usize values that must be >= 1
-        "db_batch_size" | "db_queue_max" => match value.parse::<usize>() {
+        "db_batch_size" | "db_queue_max" | "retry_threshold" => match value.parse::<usize>() {
             Ok(0) => {
                 result.add_error(path, Some(line), format!("'{}' must be >= 1, got 0", key));
             }
@@ -1003,5 +1006,26 @@ unknown_provider = ["test"]
                 .iter()
                 .any(|e| e.message.contains("'pcap_interface'"))
         );
+    }
+
+    #[test]
+    fn test_validate_config_file_retry_knobs() {
+        let valid = write_temp_file("retry_threshold=5\nretry_window_ms=30000\n");
+        let result = validate_config_file(valid.path());
+        assert!(
+            result.is_valid(),
+            "expected valid, got: {:?}",
+            result.errors
+        );
+
+        let zero_threshold = write_temp_file("retry_threshold=0\n");
+        let result = validate_config_file(zero_threshold.path());
+        assert!(!result.is_valid());
+        assert!(result.errors[0].message.contains("must be >= 1"));
+
+        let zero_window = write_temp_file("retry_window_ms=0\n");
+        let result = validate_config_file(zero_window.path());
+        assert!(!result.is_valid());
+        assert!(result.errors[0].message.contains("must be >= 1"));
     }
 }
