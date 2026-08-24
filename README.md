@@ -518,6 +518,31 @@ rano --pattern claude --retry-threshold 5 --retry-window-ms 30000
 - In `--json` mode they are emitted as `{"type":"retry_warning","count":N,"endpoint":"ip:port","window_seconds":S}` on stdout, alongside events and alerts.
 - The triggering close event persists `retry_count` in SQLite (`events.retry_count`) for post-hoc queries.
 
+---
+
+## Secrets & Privacy
+
+AI CLI invocations routinely embed credentials in argv — `ANTHROPIC_API_KEY=sk-... claude`, wrapper scripts passing tokens, CI jobs echoing keys. By default rano records full cmdlines into SQLite, log files, and exports, which turns a security-audit tool into a credential sink.
+
+`--redact-cmdline` masks cmdlines **in durable stores only** (SQLite rows, log files, exports). Live terminal display and provider attribution always see the original argv, so classification and on-screen output are unchanged.
+
+| Mode | Behavior |
+|------|----------|
+| `off` *(default)* | Store cmdlines verbatim |
+| `secrets` | Mask `KEY=value` assignments whose key mentions key/token/secret/password/credential, `--api-key <value>` / `--token=value` style flags, known token prefixes (`sk-`, `ghp_`, `xox`, `AKIA`), JWT-shaped blobs, and high-entropy arguments |
+| `all` | Replace the whole cmdline with `<redacted:N args>` |
+
+```bash
+# Audit preset enables this by default; equivalently:
+rano --preset audit
+rano --pattern claude --redact-cmdline            # = secrets
+rano --pattern claude --redact-cmdline all        # maximum paranoia
+```
+
+**Threat model**: redaction protects readers of rano's own artifacts (a shared observer.sqlite, an exported CSV attached to a ticket, log archives) from inheriting every secret that transited a monitored shell. It cannot protect against the monitored processes leaking their own secrets elsewhere.
+
+The built-in `audit` preset enables `redact_cmdline=secrets`.
+
 ## Presets
 
 rano includes built-in configuration presets for common use cases. Presets bundle multiple settings into a single flag, making it easy to switch between monitoring styles without remembering individual options.

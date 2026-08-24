@@ -114,7 +114,8 @@ summary_only=true\n\
 stats_interval_ms=0\n\
 include_udp=false\n\
 no_dns=false\n\
-log_format=json\n";
+log_format=json\n\
+redact_cmdline=secrets\n";
 
 const PRESET_QUIET: &str = "# Description: Reduce terminal output\n\
 summary_only=true\n\
@@ -357,6 +358,7 @@ fn apply_preset_values(
             }
             "no_banner" => args.no_banner = parse_bool(value)?,
             "theme" => args.theme = parse_theme(value)?,
+            "redact_cmdline" => args.redact_cmdline = parse_redact_mode(value)?,
             "alert_domain" => push_list_value(&mut args.alert.domain_patterns, value),
             "alert_max_connections" => {
                 let n = parse_u64(value, "alert_max_connections")?;
@@ -464,6 +466,8 @@ struct MonitorArgs {
     alert: AlertConfig,
     /// Retry detection threshold (number of connections in window to trigger warning)
     retry_threshold: usize,
+    /// Cmdline masking for durable stores (SQLite, log files)
+    redact_cmdline: RedactMode,
     /// Retry detection window in milliseconds
     retry_window_ms: u64,
 }
@@ -715,6 +719,7 @@ impl Default for MonitorArgs {
             alert: AlertConfig::default(),
             retry_threshold: 3,
             retry_window_ms: 60000,
+            redact_cmdline: RedactMode::Off,
             pcap_interface: None,
             pcap_cache_max: None,
         }
@@ -1210,6 +1215,133 @@ impl LogWriter {
     }
 }
 
+/// How aggressively to mask cmdlines in durable stores (SQLite, log files,
+/// exports). Attribution and live display always see the original cmdline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+enum RedactMode {
+    #[default]
+    Off,
+    /// Mask key=value assignments, --flag value secret pairs, token-shaped
+    /// and high-entropy arguments.
+    Secrets,
+    /// Replace the whole cmdline with `<redacted:N args>`.
+    All,
+}
+
+impl RedactMode {
+    fn parse(value: &str) -> Result<Self, String> {
+        match value.to_lowercase().as_str() {
+            "off" => Ok(Self::Off),
+            "secrets" => Ok(Self::Secrets),
+            "all" => Ok(Self::All),
+            _ => Err("Invalid --redact-cmdline (use off|secrets|all)".to_string()),
+        }
+    }
+}
+
+const REDACTED_PLACEHOLDER: &str = "<redacted>";
+
+/// Flags whose separate value argument is a credential.
+fn is_secret_flag(token: &str) -> bool {
+    if !token.starts_with('-') || token.contains('=') {
+        return false;
+    }
+    let name = token.trim_start_matches('-').to_ascii_lowercase();
+    matches!(
+        name.as_str(),
+        "api-key"
+            | "apikey"
+            | "token"
+            | "with-token"
+            | "access-token"
+            | "password"
+            | "passwd"
+            | "secret"
+    )
+}
+
+fn looks_like_secret_key(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    upper.contains("KEY")
+        || upper.contains("TOKEN")
+        || upper.contains("SECRET")
+        || upper.contains("PASSWORD")
+        || upper.contains("PASSWD")
+        || upper.contains("CREDENTIAL")
+}
+
+fn high_entropy_token(token: &str) -> bool {
+    if token.len() < 20 {
+        return false;
+    }
+    let has_digit = token.chars().any(|c| c.is_ascii_digit());
+    let has_alpha = token.chars().any(|c| c.is_ascii_alphabetic());
+    let mixed_case =
+        token.chars().any(|c| c.is_uppercase()) && token.chars().any(|c| c.is_lowercase());
+    has_digit && has_alpha && mixed_case
+}
+
+fn mask_token(token: &str) -> String {
+    // KEY=value assignment style
+    if let Some(eq) = token.find('=') {
+        let name = &token[..eq];
+        if looks_like_secret_key(name.trim_start_matches('-')) {
+            return format!("{name}={REDACTED_PLACEHOLDER}");
+        }
+    }
+    // Known credential prefixes
+    const PREFIXES: [&str; 4] = ["sk-", "ghp_", "xox", "AKIA"];
+    if PREFIXES.iter().any(|p| token.starts_with(p)) && token.len() >= 16 {
+        return REDACTED_PLACEHOLDER.to_string();
+    }
+    // JWT-like three dot-separated base64url segments
+    let dots = token.matches('.').count();
+    if dots == 2
+        && token.len() >= 20
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return REDACTED_PLACEHOLDER.to_string();
+    }
+    if high_entropy_token(token) {
+        return REDACTED_PLACEHOLDER.to_string();
+    }
+    token.to_string()
+}
+
+/// Redact a command line for durable storage according to `mode`.
+fn redact_cmdline_str(cmdline: &str, mode: RedactMode) -> String {
+    match mode {
+        RedactMode::Off => return cmdline.to_string(),
+        RedactMode::All => {
+            let argc = cmdline.split_whitespace().count();
+            return format!("<redacted:{argc} args>");
+        }
+        RedactMode::Secrets => {}
+    }
+
+    let tokens: Vec<&str> = cmdline.split_whitespace().collect();
+    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        let token = tokens[i];
+        if is_secret_flag(token) && i + 1 < tokens.len() {
+            out.push(token.to_string());
+            out.push(REDACTED_PLACEHOLDER.to_string());
+            i += 2;
+            continue;
+        }
+        out.push(mask_token(token));
+        i += 1;
+    }
+    out.join(" ")
+}
+
+fn parse_redact_mode(value: &str) -> Result<RedactMode, String> {
+    RedactMode::parse(value)
+}
+
 #[derive(Clone, Debug)]
 struct SqliteEvent {
     ts: String,
@@ -1645,6 +1777,12 @@ fn main() {
                     (None, None)
                 };
 
+                // Durable sinks get the masked cmdline; display keeps the original.
+                let log_cmdline = match args.redact_cmdline {
+                    RedactMode::Off => None,
+                    mode => Some(redact_cmdline_str(&meta.cmdline, mode)),
+                };
+
                 let info = ConnInfo {
                     pid,
                     comm: meta.comm.clone(),
@@ -1670,6 +1808,7 @@ fn main() {
                         pid,
                         &meta.comm,
                         &meta.cmdline,
+                        log_cmdline.as_deref(),
                         meta.provider,
                         domain.as_deref(),
                         domain_source,
@@ -1737,9 +1876,9 @@ fn main() {
                         run_id: run_ctx.run_id.clone(),
                         event: "connect".to_string(),
                         key: key.clone(),
+                        cmdline: log_cmdline.clone().unwrap_or_else(|| meta.cmdline.clone()),
                         pid: Some(pid),
                         comm: meta.comm.clone(),
-                        cmdline: meta.cmdline.clone(),
                         provider: meta.provider,
                         domain: domain.clone(),
                         domain_source: domain_source.map(str::to_string),
@@ -1811,6 +1950,12 @@ fn main() {
                     }
                 }
 
+                // Durable sinks get the masked cmdline; display keeps the original.
+                let close_log_cmdline = match args.redact_cmdline {
+                    RedactMode::Off => None,
+                    mode => Some(redact_cmdline_str(&info.cmdline, mode)),
+                };
+
                 if !args.summary_only {
                     emit_event(
                         &ts,
@@ -1820,6 +1965,7 @@ fn main() {
                         info.pid,
                         &info.comm,
                         &info.cmdline,
+                        close_log_cmdline.as_deref(),
                         info.provider,
                         info.domain.as_deref(),
                         info.domain_source.as_deref(),
@@ -1862,7 +2008,9 @@ fn main() {
                         key: key.clone(),
                         pid: Some(info.pid),
                         comm: info.comm.clone(),
-                        cmdline: info.cmdline.clone(),
+                        cmdline: close_log_cmdline
+                            .clone()
+                            .unwrap_or_else(|| info.cmdline.clone()),
                         provider: info.provider,
                         domain: info.domain.clone(),
                         domain_source: info.domain_source.clone(),
@@ -2093,22 +2241,27 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 args.include_udp = true;
                 i += 1;
             }
-            "--no-udp" => {
-                args.include_udp = false;
-                i += 1;
-            }
-            "--include-listening" => {
-                args.include_listening = true;
-                i += 1;
-            }
-            "--show-ancestry" => {
-                args.show_ancestry = true;
-                i += 1;
+            "--redact-cmdline" => {
+                // Optional value: --redact-cmdline [off|secrets|all]; bare flag = secrets
+                let next = argv.get(i + 1).map(|s| s.as_str());
+                let (value, consumed) = match next {
+                    Some(v @ ("off" | "secrets" | "all")) => (v, 1),
+                    _ => ("secrets", 0),
+                };
+                args.redact_cmdline =
+                    parse_redact_mode(value).map_err(|e| format!("--redact-cmdline: {e}"))?;
+                i += 1 + consumed;
             }
             "--log-file" => {
                 i += 1;
                 let value = require_value(argv, i, "--log-file")?;
                 args.log_file = Some(PathBuf::from(value));
+                i += 1;
+            }
+            "--theme" => {
+                i += 1;
+                let value = require_value(argv, i, "--theme")?;
+                args.theme = parse_theme(value)?;
                 i += 1;
             }
             "--log-dir" => {
@@ -2211,12 +2364,6 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 args.stats_views.push(view);
                 i += 1;
             }
-            "--stats-cycle-ms" => {
-                i += 1;
-                let value = require_value(argv, i, "--stats-cycle-ms")?;
-                args.stats_cycle_ms = parse_u64(value, "--stats-cycle-ms")?;
-                i += 1;
-            }
             "--no-banner" => {
                 args.no_banner = true;
                 i += 1;
@@ -2225,12 +2372,6 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 i += 1;
                 let value = require_value(argv, i, "--session-name")?;
                 args.session_name = Some(value.to_string());
-                i += 1;
-            }
-            "--theme" => {
-                i += 1;
-                let value = require_value(argv, i, "--theme")?;
-                args.theme = parse_theme(value)?;
                 i += 1;
             }
             "--alert-domain" => {
@@ -3049,6 +3190,7 @@ fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> 
             }
             "no_banner" => args.no_banner = parse_bool(value)?,
             "theme" => args.theme = parse_theme(value)?,
+            "redact_cmdline" => args.redact_cmdline = parse_redact_mode(value)?,
             "alert_domain" => push_list_value(&mut args.alert.domain_patterns, value),
             "alert_max_connections" => {
                 let n = parse_u64(value, "alert_max_connections")?;
@@ -3374,7 +3516,11 @@ ALERT OPTIONS:\n\
 RETRY DETECTION:\n\
   --retry-threshold <n>          Connections in window to trigger warning (default: 3)\n\
   --retry-window-ms <ms>         Retry detection window in ms (default: 60000)\n\n\
-CONFIG:\n\
+SECRETS & PRIVACY:\n\
+  --redact-cmdline [mode]        Mask cmdlines in durable stores (SQLite, log\n\
+                                 files, exports): off|secrets|all (bare flag\n\
+                                 = secrets; default: off). Attribution and\n\
+                                 live display always see the original.\n\n\
   --preset <name>           Load named preset (repeatable, merged in order)\n\
   --list-presets            List available presets and exit\n\
   --config <path>           Load config file (key=value format)\n\
@@ -4275,6 +4421,7 @@ fn emit_event(
     pid: u32,
     comm: &str,
     cmdline: &str,
+    log_cmdline: Option<&str>,
     provider: Provider,
     domain: Option<&str>,
     domain_source: Option<&str>,
@@ -4286,6 +4433,9 @@ fn emit_event(
     log_format: LogFormat,
     log_writer: Option<&Arc<LogWriter>>,
 ) {
+    // Cmdline shown on stdout; the durable file line may use a masked variant.
+    let cmdline_for_log = log_cmdline.unwrap_or(cmdline);
+
     let proto = match key.proto {
         Proto::Tcp => "tcp",
         Proto::Udp => "udp",
@@ -4314,7 +4464,27 @@ fn emit_event(
         );
         println!("{}", line);
         if let Some(writer) = log_writer {
-            writer.write_line(&line);
+            if cmdline_for_log == cmdline {
+                writer.write_line(&line);
+            } else {
+                writer.write_line(&format_json_event(
+                    ts,
+                    run_id,
+                    event,
+                    pid,
+                    comm,
+                    cmdline_for_log,
+                    provider.label(),
+                    proto,
+                    &local,
+                    &remote,
+                    dom,
+                    domain_source,
+                    domain_mode,
+                    ancestry,
+                    duration_ms,
+                ));
+            }
         }
         return;
     }
@@ -4359,7 +4529,7 @@ fn emit_event(
                 event,
                 pid,
                 comm,
-                cmdline,
+                cmdline_for_log,
                 provider.label(),
                 proto,
                 &local,
@@ -4375,7 +4545,6 @@ fn emit_event(
         writer.write_line(&output);
     }
 }
-
 fn format_pretty_event(
     ts: &str,
     event: &str,
@@ -11009,5 +11178,69 @@ mod tests {
         }
 
         assert!(parse_config_check_args(&["--bogus".to_string()]).is_err());
+    }
+
+    #[test]
+    fn redact_secrets_masks_credentials_but_not_normal_args() {
+        let cases: &[(&str, &str)] = &[
+            // env-prefix style assignments
+            (
+                "ANTHROPIC_API_KEY=sk-ant-api03-abcdef claude --model opus",
+                "ANTHROPIC_API_KEY=<redacted> claude --model opus",
+            ),
+            // secret flag with separate value
+            (
+                "codex --api-key sk-proj-0123456789abcdefghij serve",
+                "codex --api-key <redacted> serve",
+            ),
+            // --flag=value form
+            (
+                "tool --token=ghp_0123456789abcdefghijklmnopqrstuvwxyz run",
+                "tool --token=<redacted> run",
+            ),
+            // JWT-shaped bearer token
+            (
+                "curl -H eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c api",
+                "curl -H <redacted> api",
+            ),
+            // ordinary argv must survive untouched
+            (
+                "claude --model opus --verbose",
+                "claude --model opus --verbose",
+            ),
+            ("codex serve --port 8080", "codex serve --port 8080"),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(&redact_cmdline_str(input, RedactMode::Secrets), expected);
+        }
+    }
+
+    #[test]
+    fn redact_all_replaces_whole_cmdline() {
+        assert_eq!(
+            redact_cmdline_str("claude --model opus", RedactMode::All),
+            "<redacted:3 args>"
+        );
+    }
+
+    #[test]
+    fn redact_off_is_identity() {
+        let raw = "ANTHROPIC_API_KEY=sk-123 claude";
+        assert_eq!(redact_cmdline_str(raw, RedactMode::Off), raw);
+    }
+
+    #[test]
+    fn provider_classification_uses_original_cmdline_before_redaction() {
+        let raw = "ANTHROPIC_API_KEY=sk-ant-api03-secret claude --model opus";
+        let matcher = ProviderMatcher::default();
+        assert_eq!(
+            provider_from_text("claude", raw, &matcher),
+            Provider::Anthropic,
+            "attribution must classify on the original argv"
+        );
+
+        let masked = redact_cmdline_str(raw, RedactMode::Secrets);
+        assert!(masked.contains("<redacted>"));
+        assert!(masked.contains("claude"));
     }
 }

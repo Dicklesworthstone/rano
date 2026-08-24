@@ -56,6 +56,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "alert_bell",
     "alert_cooldown_ms",
     "no_alerts",
+    "redact_cmdline",
 ];
 
 /// Valid values for enum-like configuration options.
@@ -363,6 +364,17 @@ fn validate_config_value(
                     key,
                     VALID_DOMAIN_MODES.join(", "),
                     value
+                ),
+            );
+        }
+
+        "redact_cmdline" if !["off", "secrets", "all"].contains(&value.to_lowercase().as_str()) => {
+            result.add_error(
+                path,
+                Some(line),
+                format!(
+                    "'{}' must be one of [off, secrets, all], got '{}'",
+                    key, value
                 ),
             );
         }
