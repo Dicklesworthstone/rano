@@ -658,6 +658,15 @@ Chains longer than 5 levels show ellipsis: `... → bash(1700) → claude(2000)`
 
 The full ancestry path is stored in the `ancestry_path` column:
 
+Ancestry capture is gated behind `--show-ancestry` (off by default for
+performance). When it is disabled — or cannot be resolved — `ancestry_path`
+is stored as SQL `NULL`, so filter with plain null checks:
+
+```sql
+-- Ancestry present (works regardless of --show-ancestry)
+SELECT * FROM events WHERE ancestry_path IS NOT NULL;
+```
+
 ```sql
 -- Find all connections from processes spawned by tmux
 SELECT * FROM events WHERE ancestry_path LIKE '%tmux%';
@@ -760,8 +769,10 @@ Both CSV and JSONL include these fields (in order for CSV):
 | `remote_ip` | string | Remote IP address |
 | `remote_port` | integer | Remote port |
 | `domain` | string | Resolved domain name (if available) |
-| `ancestry_path` | string | Process ancestry chain (`comm:pid,comm:pid,...`) |
+| `ancestry_path` | string | Process ancestry chain (`comm:pid,comm:pid,...`); NULL unless `--show-ancestry` is enabled |
 | `duration_ms` | integer | Connection duration in ms (close events only) |
+| `alert` | integer | `1` when an alert emitted for this event (cooldown-suppressed alerts stay `0`) |
+| `retry_count` | integer | Connections-in-window at retry-warning trigger time (close events only) |
 
 ### Format Notes
 

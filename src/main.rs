@@ -5732,6 +5732,8 @@ const EXPORT_FIELDS: &[&str] = &[
     "domain_source",
     "ancestry_path",
     "duration_ms",
+    "alert",
+    "retry_count",
 ];
 
 const PROVIDER_LABELS: &[&str] = &["anthropic", "openai", "google", "unknown"];
@@ -5742,7 +5744,7 @@ enum FieldType {
     Integer,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 enum FieldValue {
     String(String),
     Integer(i64),
@@ -6053,7 +6055,9 @@ fn normalize_domain_patterns(values: &[String]) -> Result<Vec<String>, String> {
 
 fn field_type(field: &str) -> FieldType {
     match field {
-        "pid" | "local_port" | "remote_port" | "duration_ms" => FieldType::Integer,
+        "pid" | "local_port" | "remote_port" | "duration_ms" | "retry_count" | "alert" => {
+            FieldType::Integer
+        }
         _ => FieldType::String,
     }
 }
@@ -7786,7 +7790,7 @@ fn build_ancestry_roots_query(filter: &ReportFilter, top: usize) -> (String, Vec
     let mut sql = format!(
         "SELECT {root_seg} as root_seg,
                 SUM(CASE WHEN event='connect' THEN 1 ELSE 0 END) as connects
-         FROM events WHERE ancestry_path IS NOT NULL AND ancestry_path != ''",
+         FROM events WHERE NULLIF(ancestry_path, '') IS NOT NULL",
         root_seg = root_seg
     );
     let mut params: Vec<String> = Vec::new();
@@ -8136,7 +8140,7 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
             event.key.remote_port as i64,
             event.domain.as_deref().unwrap_or("unknown"),
             event.domain_source.as_deref(),
-            event.ancestry_path.as_deref().unwrap_or(""),
+            event.ancestry_path.as_deref(),
             if is_private { 1 } else { 0 },
             ip_version,
             event.duration_ms.map(|v| v as i64),
@@ -8747,6 +8751,76 @@ mod tests {
             )
             .expect("null query failed");
         assert_eq!(none, 1);
+    }
+
+    #[test]
+    fn export_roundtrips_alert_retry_and_null_ancestry() {
+        let mut conn = setup_test_db();
+
+        let mut flagged = create_test_event("2026-01-20T12:00:00Z", "close", Provider::Anthropic);
+        flagged.alert = true;
+        flagged.retry_count = Some(3);
+        flagged.ancestry_path = Some("init:1,claude:42".to_string());
+
+        let mut plain = create_test_event("2026-01-20T12:00:01Z", "connect", Provider::Google);
+        plain.ancestry_path = None; // --show-ancestry disabled => NULL, not ''
+
+        write_sqlite_batch(&mut conn, &[flagged, plain]).expect("batch write failed");
+
+        let fields = default_export_fields();
+        let filter = ExportFilter {
+            run_id: Some("test-run".to_string()),
+            since: None,
+            until: None,
+            providers: Vec::new(),
+            domain_patterns: Vec::new(),
+        };
+        let (sql, params) = build_export_query(&filter, &fields);
+        let mut stmt = conn.prepare(&sql).expect("prepare failed");
+        let params_refs: Vec<&dyn rusqlite::ToSql> =
+            params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let rows: Vec<Vec<(String, FieldValue)>> = stmt
+            .query_map(params_refs.as_slice(), |row| row_to_values(row, &fields))
+            .expect("query failed")
+            .map(|r| r.expect("row failed"))
+            .collect();
+        assert_eq!(rows.len(), 2);
+
+        for values in &rows {
+            // CSV round-trips alert/retry_count and renders NULL ancestry empty.
+            let csv = format_csv_row(values);
+            assert!(csv.contains("test-run"));
+
+            let get = |name: &str| {
+                values
+                    .iter()
+                    .find(|(f, _)| f == name)
+                    .map(|(_, v)| v.clone())
+                    .expect("field missing")
+            };
+            match get("event") {
+                FieldValue::String(ref e) if e == "close" => {
+                    assert_eq!(get("alert"), FieldValue::Integer(1));
+                    assert_eq!(get("retry_count"), FieldValue::Integer(3));
+                    assert!(csv.contains("init:1,claude:42"));
+                }
+                _ => {
+                    assert_eq!(get("alert"), FieldValue::Integer(0));
+                    assert_eq!(get("retry_count"), FieldValue::Null);
+                    assert_eq!(get("ancestry_path"), FieldValue::Null);
+                }
+            }
+
+            // JSONL omits NULL keys entirely.
+            if values
+                .iter()
+                .any(|(f, v)| f == "ancestry_path" && matches!(v, FieldValue::Null))
+            {
+                let jsonl = format_jsonl_row(values);
+                assert!(!jsonl.contains("ancestry_path"));
+                assert!(!jsonl.contains("retry_count"));
+            }
+        }
     }
 
     #[test]
