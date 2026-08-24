@@ -389,12 +389,22 @@ fn parse_transport_packet(data: &[u8]) -> Option<TransportPacket<'_>> {
     let mut offset = 14;
     let mut ethertype = u16::from_be_bytes([data[12], data[13]]);
 
-    if ethertype == 0x8100 {
-        if data.len() < 18 {
-            return None;
+    // Skip up to two stacked VLAN tags: 802.1Q (0x8100), 802.1ad QinQ outer
+    // (0x88A8), and the common 0x9100 variant. Deeper stacking is rejected.
+    for _ in 0..2 {
+        match ethertype {
+            0x8100 | 0x88A8 | 0x9100 => {
+                if data.len() < offset + 4 {
+                    return None;
+                }
+                ethertype = u16::from_be_bytes([data[offset + 2], data[offset + 3]]);
+                offset += 4;
+            }
+            _ => break,
         }
-        ethertype = u16::from_be_bytes([data[16], data[17]]);
-        offset = 18;
+    }
+    if matches!(ethertype, 0x8100 | 0x88A8 | 0x9100) {
+        return None;
     }
 
     match ethertype {
@@ -1268,6 +1278,35 @@ mod tests {
 
     #[cfg(feature = "pcap")]
     #[test]
+    fn transport_parse_qinq_double_tagged_dns() {
+        // QinQ frame: 802.1ad outer (0x88A8) + 802.1Q inner (0x8100), UDP dst 53
+        // carrying a valid DNS response. The DNS payload must parse end to end.
+        let packet = build_test_stacked_vlan_packet(&[0x88A8, 0x8100]);
+        let result = parse_transport_packet(&packet);
+        assert!(result.is_some(), "QinQ double-tagged frame should parse");
+        let tp = result.unwrap();
+        assert!(matches!(tp.proto, TransportProto::Udp));
+        assert_eq!(tp.dst_port, 53);
+
+        let (hostname, ips) = parse_dns_response(tp.payload).expect("DNS payload should parse");
+        assert_eq!(hostname, "example.com");
+        assert_eq!(ips, vec![IpAddr::V4(Ipv4Addr::new(93, 184, 216, 34))]);
+    }
+
+    #[cfg(feature = "pcap")]
+    #[test]
+    fn transport_rejects_triple_vlan_stack() {
+        // Three stacked tags exceed the supported depth: reject instead of looping.
+        let packet = build_test_stacked_vlan_packet(&[0x88A8, 0x8100, 0x9100]);
+        let result = parse_transport_packet(&packet);
+        assert!(
+            result.is_none(),
+            "triple-stacked VLAN frames must be rejected"
+        );
+    }
+
+    #[cfg(feature = "pcap")]
+    #[test]
     fn transport_parse_vlan_tagged() {
         // VLAN-tagged packet (802.1Q)
         let packet = build_test_vlan_packet();
@@ -1528,6 +1567,62 @@ mod tests {
         assert_eq!(tp.dst_port, 53);
     }
 
+    #[cfg(feature = "pcap")]
+    /// Build an Ethernet frame with the given stack of VLAN tag ethertypes
+    /// (outermost first), carrying IPv4/UDP dst 53 with a minimal DNS response.
+    fn build_test_stacked_vlan_packet(tag_ethertypes: &[u16]) -> Vec<u8> {
+        let dns_payload: &[u8] = &[
+            0x12, 0x34, // ID
+            0x81, 0x80, // Flags: response, recursion available
+            0x00, 0x01, // QDCOUNT = 1
+            0x00, 0x01, // ANCOUNT = 1
+            0x00, 0x00, // NSCOUNT = 0
+            0x00, 0x00, // ARCOUNT = 0
+            // Question: example.com
+            0x07, b'e', b'x', b'a', b'm', b'p', b'l', b'e', 0x03, b'c', b'o', b'm', 0x00, 0x00,
+            0x01, // QTYPE = A
+            0x00, 0x01, // QCLASS = IN
+            // Answer: example.com -> 93.184.216.34
+            0xc0, 0x0c, // Name pointer to offset 12
+            0x00, 0x01, // TYPE = A
+            0x00, 0x01, // CLASS = IN
+            0x00, 0x00, 0x0e, 0x10, // TTL = 3600
+            0x00, 0x04, // RDLENGTH = 4
+            93, 184, 216, 34, // RDATA
+        ];
+
+        let mut packet = Vec::new();
+        packet.extend_from_slice(&[0; 12]); // MAC addresses
+        for (i, ethertype) in tag_ethertypes.iter().enumerate() {
+            packet.extend_from_slice(&ethertype.to_be_bytes());
+            // TCI: VLAN ID 100 + i so stacked tags stay distinguishable
+            packet.extend_from_slice(&(100u16 + i as u16).to_be_bytes());
+        }
+        packet.extend_from_slice(&[0x08, 0x00]); // IPv4 ethertype
+
+        // IPv4 header (20 bytes) with correct total length
+        let udp_len = 8 + dns_payload.len();
+        let ip_total_len = 20 + udp_len;
+        packet.push(0x45);
+        packet.push(0x00);
+        packet.extend_from_slice(&(ip_total_len as u16).to_be_bytes());
+        packet.extend_from_slice(&[0x00, 0x00]); // ID
+        packet.extend_from_slice(&[0x00, 0x00]); // flags/frag
+        packet.push(64);
+        packet.push(17); // UDP
+        packet.extend_from_slice(&[0x00, 0x00]); // checksum
+        packet.extend_from_slice(&[10, 0, 0, 1]);
+        packet.extend_from_slice(&[10, 0, 0, 2]);
+
+        // UDP header with dst port 53 (DNS)
+        packet.extend_from_slice(&(1234u16).to_be_bytes());
+        packet.extend_from_slice(&(53u16).to_be_bytes());
+        packet.extend_from_slice(&(udp_len as u16).to_be_bytes());
+        packet.extend_from_slice(&[0x00, 0x00]); // checksum
+
+        packet.extend_from_slice(dns_payload);
+        packet
+    }
     #[cfg(feature = "pcap")]
     fn build_test_vlan_packet() -> Vec<u8> {
         let mut packet = Vec::new();
