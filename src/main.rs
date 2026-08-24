@@ -2898,6 +2898,10 @@ fn parse_diff_args(argv: &[String]) -> Result<DiffArgs, String> {
                 args.color = parse_color_mode(value)?;
                 i += 1;
             }
+            "--no-color" => {
+                args.color = ColorMode::Never;
+                i += 1;
+            }
             other => {
                 if other.starts_with('-') {
                     return Err(format!("Unknown diff flag: {}", other));
@@ -3653,6 +3657,7 @@ OPTIONS:\n\
   --threshold <N>   Percentage change threshold for 'significant' (default: 50)\n\
   --json            Output in JSON format\n\
   --color <mode>    Color output: auto|always|never (default: auto)\n\
+  --no-color        Disable color output\n\
   -h, --help        Show this help\n\
   -V, --version     Show version\n\n\
 OUTPUT SECTIONS:\n\
@@ -10896,6 +10901,27 @@ mod tests {
         assert_eq!(args.color, ColorMode::Auto);
     }
 
+    #[test]
+    fn test_parse_diff_args_flags() {
+        let args = parse_diff_args(&[
+            "--old".to_string(),
+            "run-1".to_string(),
+            "--new".to_string(),
+            "run-2".to_string(),
+            "--no-color".to_string(),
+            "--threshold".to_string(),
+            "25".to_string(),
+            "--json".to_string(),
+        ])
+        .expect("should parse diff args");
+
+        assert_eq!(args.old_id, "run-1");
+        assert_eq!(args.new_id, "run-2");
+        assert_eq!(args.color, ColorMode::Never);
+        assert!((args.threshold_pct - 25.0).abs() < f64::EPSILON);
+        assert!(args.json);
+    }
+
     // Session name generation tests
 
     #[test]
@@ -11090,6 +11116,25 @@ mod tests {
         assert!(!args.one_line);
         assert!(args.format.is_none());
         assert_eq!(args.sqlite_path, "observer.sqlite");
+    }
+
+    #[test]
+    fn test_parse_status_args_flags() {
+        let args = parse_status_args(&[
+            "--one-line".to_string(),
+            "--format".to_string(),
+            "{active} conns | {anthropic} anthropic".to_string(),
+            "--sqlite".to_string(),
+            "/tmp/test.sqlite".to_string(),
+        ])
+        .expect("should parse status args");
+
+        assert!(args.one_line);
+        assert_eq!(
+            args.format.as_deref(),
+            Some("{active} conns | {anthropic} anthropic")
+        );
+        assert_eq!(args.sqlite_path, "/tmp/test.sqlite");
     }
 
     #[test]
