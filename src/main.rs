@@ -2564,6 +2564,7 @@ fn parse_config_args(argv: &[String]) -> Result<ConfigArgs, String> {
             let json = argv.iter().any(|a| a == "--json");
             ConfigSubcommand::Show { json }
         }
+        "paths" => ConfigSubcommand::Paths,
         other => {
             return Err(format!(
                 "Unknown config subcommand: '{}'. Use 'rano config --help' for usage.",
@@ -5903,10 +5904,6 @@ fn run_config_paths() -> i32 {
     println!("  RANO_CONFIG       Override key-value config path");
     println!("  RANO_CONFIG_TOML  Override TOML config path");
     0
-}
-
-fn run_config_check() -> i32 {
-    run_config_check_with_sources(None, None)
 }
 
 /// Validate every configured source: the default discovery paths plus any
