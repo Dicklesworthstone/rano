@@ -85,12 +85,12 @@ enum Command {
     Status(StatusArgs),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 struct ConfigArgs {
     subcommand: ConfigSubcommand,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ConfigSubcommand {
     Check {
         config: Option<PathBuf>,
@@ -2467,18 +2467,23 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 i += 1;
             }
             "--preset" => {
-                // Already handled in find_preset_flags
-                i += 2;
+                i += 1;
+                let _ = require_value(argv, i, "--preset")?;
+                i += 1;
             }
             "--list-presets" => {
                 // Already handled in early check
                 i += 1;
             }
             "--config" => {
-                i += 2;
+                i += 1;
+                let _ = require_value(argv, i, "--config")?;
+                i += 1;
             }
             "--config-toml" => {
-                i += 2;
+                i += 1;
+                let _ = require_value(argv, i, "--config-toml")?;
+                i += 1;
             }
             "--no-config" => {
                 i += 1;
@@ -2686,19 +2691,20 @@ fn parse_config_check_args(argv: &[String]) -> Result<ConfigArgs, String> {
         match argv[i].as_str() {
             "--config" => {
                 i += 1;
-                let value = argv.get(i).ok_or("Missing value for --config")?;
+                let value = require_value(argv, i, "--config")?;
                 config = Some(PathBuf::from(value));
+                i += 1;
             }
             "--config-toml" => {
                 i += 1;
-                let value = argv.get(i).ok_or("Missing value for --config-toml")?;
+                let value = require_value(argv, i, "--config-toml")?;
                 config_toml = Some(PathBuf::from(value));
+                i += 1;
             }
             other => {
                 return Err(format!("Unknown config check flag: '{}'", other));
             }
         }
-        i += 1;
     }
     Ok(ConfigArgs {
         subcommand: ConfigSubcommand::Check {
@@ -2728,10 +2734,29 @@ fn parse_config_args(argv: &[String]) -> Result<ConfigArgs, String> {
     let subcommand = match argv[0].as_str() {
         "check" => parse_config_check_args(&argv[1..])?.subcommand,
         "show" => {
-            let json = argv.iter().any(|a| a == "--json");
+            let mut json = false;
+            for arg in &argv[1..] {
+                match arg.as_str() {
+                    "--json" => json = true,
+                    other => {
+                        return Err(format!(
+                            "Unknown config show flag: '{}'. Use 'rano config --help' for usage.",
+                            other
+                        ));
+                    }
+                }
+            }
             ConfigSubcommand::Show { json }
         }
-        "paths" => ConfigSubcommand::Paths,
+        "paths" => {
+            if argv.len() > 1 {
+                return Err(format!(
+                    "Unexpected argument for 'rano config paths': '{}'. Use 'rano config --help' for usage.",
+                    argv[1]
+                ));
+            }
+            ConfigSubcommand::Paths
+        }
         other => {
             return Err(format!(
                 "Unknown config subcommand: '{}'. Use 'rano config --help' for usage.",
@@ -11255,6 +11280,25 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_config_args_subcommands() {
+        let args_show = parse_config_args(&["show".to_string(), "--json".to_string()])
+            .expect("should parse show --json");
+        assert_eq!(args_show.subcommand, ConfigSubcommand::Show { json: true });
+
+        let args_paths = parse_config_args(&["paths".to_string()]).expect("should parse paths");
+        assert_eq!(args_paths.subcommand, ConfigSubcommand::Paths);
+
+        let err_show = parse_config_args(&["show".to_string(), "--unknown".to_string()]);
+        assert!(err_show.is_err());
+
+        let err_paths = parse_config_args(&["paths".to_string(), "extra".to_string()]);
+        assert!(err_paths.is_err());
+
+        let err_sub = parse_config_args(&["unknown-cmd".to_string()]);
+        assert!(err_sub.is_err());
+    }
+
+    #[test]
     fn redact_secrets_masks_credentials_but_not_normal_args() {
         let cases: &[(&str, &str)] = &[
             // env-prefix style assignments
@@ -11321,6 +11365,7 @@ mod tests {
     #[test]
     fn test_load_monitor_args_extended_flags() {
         let args = load_monitor_args(&[
+            "--no-config".to_string(),
             "--no-udp".to_string(),
             "--include-listening".to_string(),
             "--show-ancestry".to_string(),
@@ -11343,6 +11388,11 @@ mod tests {
         assert_eq!(args.stats_width, 65);
         assert!(args.stats_width_set);
         assert_eq!(args.stats_cycle_ms, 3500);
+
+        // Missing value errors
+        assert!(load_monitor_args(&["--config".to_string()]).is_err());
+        assert!(load_monitor_args(&["--config-toml".to_string()]).is_err());
+        assert!(load_monitor_args(&["--preset".to_string()]).is_err());
     }
 
     #[test]
