@@ -1846,24 +1846,6 @@ fn main() {
                         retry_count,
                     });
                 }
-                stats.closes += 1;
-                stats.active = stats.active.saturating_sub(1);
-                if let Some(ms) = duration_ms {
-                    stats.duration_ms_samples += 1;
-                    stats.duration_ms_total = stats.duration_ms_total.saturating_add(ms);
-                    stats.duration_ms_max = stats.duration_ms_max.max(ms);
-
-                    // Check duration alert
-                    check_duration_alert(
-                        &args.alert,
-                        &mut alert_state,
-                        &key,
-                        &info,
-                        ms,
-                        args.json,
-                        style,
-                    );
-                }
             }
         }
 
@@ -3942,31 +3924,43 @@ fn format_pretty_alert(
     )
 }
 
-/// Check if a connection would trigger a connection-level alert (without emitting).
-/// Returns true if domain pattern or unknown domain alert would fire.
-fn would_trigger_connection_alert(
+/// A connection-level alert condition resolved without consulting cooldown state.
+enum ConnectionAlertTrigger {
+    DomainPattern { domain: String, pattern: String },
+    UnknownDomain { remote_ip: std::net::IpAddr },
+}
+
+/// Pure predicate: which connection-level alert (if any) applies to this
+/// connection. The single decision point in `check_connection_alerts` consumes
+/// this before consulting `AlertState`.
+fn connection_alert_trigger(
     alert_config: &AlertConfig,
     domain: Option<&str>,
-    _remote_ip: std::net::IpAddr,
-) -> bool {
+    remote_ip: std::net::IpAddr,
+) -> Option<ConnectionAlertTrigger> {
     if !alert_config.is_enabled() {
-        return false;
+        return None;
     }
 
     // Check domain patterns
-    if check_domain_patterns(domain, &alert_config.domain_patterns).is_some() {
-        return true;
+    if let Some(pattern) = check_domain_patterns(domain, &alert_config.domain_patterns) {
+        return Some(ConnectionAlertTrigger::DomainPattern {
+            domain: domain.unwrap_or_default().to_string(),
+            pattern,
+        });
     }
 
     // Check unknown domain
     if alert_config.alert_unknown_domain && domain.is_none() {
-        return true;
+        return Some(ConnectionAlertTrigger::UnknownDomain { remote_ip });
     }
 
-    false
+    None
 }
 
-/// Check connection-level alerts (domain pattern, unknown domain).
+/// Check connection-level alerts (domain pattern, unknown domain). Returns true
+/// only when an alert actually emitted; cooldown-suppressed alerts return false
+/// so the durable event row is flagged solely for alerts the operator saw.
 fn check_connection_alerts(
     alert_config: &AlertConfig,
     alert_state: &mut AlertState,
@@ -3974,81 +3968,82 @@ fn check_connection_alerts(
     info: &ConnInfo,
     json_mode: bool,
     style: OutputStyle,
-) {
-    if !alert_config.is_enabled() {
-        return;
-    }
-
-    // Check domain patterns
-    if let Some(pattern) =
-        check_domain_patterns(info.domain.as_deref(), &alert_config.domain_patterns)
+) -> bool {
+    let trigger = match connection_alert_trigger(alert_config, info.domain.as_deref(), key.remote_ip)
     {
-        let sig = AlertSignature::DomainMatch {
-            domain: info.domain.clone().unwrap_or_default(),
-            pattern: pattern.clone(),
-        };
-        if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
-            let kind = AlertKind::DomainMatch {
-                domain: info.domain.clone().unwrap_or_default(),
-                pattern,
-            };
-            emit_alert(
-                &kind,
-                AlertSeverity::Critical,
-                Some(key),
-                Some(info),
-                alert_config.bell,
-                json_mode,
-                style,
-            );
-        }
-    }
+        Some(trigger) => trigger,
+        None => return false,
+    };
 
-    // Check unknown domain
-    if alert_config.alert_unknown_domain && info.domain.is_none() {
-        let sig = AlertSignature::UnknownDomain {
-            remote_ip: key.remote_ip,
-        };
-        if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
-            let kind = AlertKind::UnknownDomain {
-                remote_ip: key.remote_ip,
+    match trigger {
+        ConnectionAlertTrigger::DomainPattern { domain, pattern } => {
+            let sig = AlertSignature::DomainMatch {
+                domain: domain.clone(),
+                pattern: pattern.clone(),
             };
-            emit_alert(
-                &kind,
-                AlertSeverity::Warning,
-                Some(key),
-                Some(info),
-                alert_config.bell,
-                json_mode,
-                style,
-            );
+            if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
+                emit_alert(
+                    &AlertKind::DomainMatch { domain, pattern },
+                    AlertSeverity::Critical,
+                    Some(key),
+                    Some(info),
+                    alert_config.bell,
+                    json_mode,
+                    style,
+                );
+                true
+            } else {
+                false
+            }
+        }
+        ConnectionAlertTrigger::UnknownDomain { remote_ip } => {
+            let sig = AlertSignature::UnknownDomain { remote_ip };
+            if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
+                emit_alert(
+                    &AlertKind::UnknownDomain { remote_ip },
+                    AlertSeverity::Warning,
+                    Some(key),
+                    Some(info),
+                    alert_config.bell,
+                    json_mode,
+                    style,
+                );
+                true
+            } else {
+                false
+            }
         }
     }
 }
 
-/// Check threshold-level alerts (max connections, max per provider).
+/// Check threshold-level alerts (max connections, max per provider). Returns one
+/// synthesized `event='alert'` row per emitted breach so threshold kinds are
+/// queryable via `WHERE alert=1` alongside connect/close flags.
 fn check_threshold_alerts(
     alert_config: &AlertConfig,
     alert_state: &mut AlertState,
     stats: &Stats,
+    run_id: &str,
+    ts: &str,
     json_mode: bool,
     style: OutputStyle,
-) {
+) -> Vec<SqliteEvent> {
     if !alert_config.is_enabled() {
-        return;
+        return Vec::new();
     }
+
+    let mut rows = Vec::new();
 
     // Check max connections threshold
     if let Some(threshold) = alert_config.max_connections {
         if stats.active >= threshold {
             let sig = AlertSignature::MaxConnections;
             if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
-                let kind = AlertKind::MaxConnections {
-                    current: stats.active,
-                    threshold,
-                };
                 emit_alert(
-                    &kind,
+                    &AlertKind::MaxConnections {
+                        current: stats.active,
+                        threshold,
+                    },
                     AlertSeverity::Warning,
                     None,
                     None,
@@ -4056,6 +4051,7 @@ fn check_threshold_alerts(
                     json_mode,
                     style,
                 );
+                rows.push(synthesized_alert_event(ts, run_id, Provider::Unknown));
             }
         }
     }
@@ -4064,17 +4060,14 @@ fn check_threshold_alerts(
     if let Some(threshold) = alert_config.max_per_provider {
         for (provider, count) in &stats.per_provider {
             if *count >= threshold {
-                let sig = AlertSignature::MaxPerProvider {
-                    provider: *provider,
-                };
+                let sig = AlertSignature::MaxPerProvider { provider: *provider };
                 if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
-                    let kind = AlertKind::MaxPerProvider {
-                        provider: *provider,
-                        current: *count,
-                        threshold,
-                    };
                     emit_alert(
-                        &kind,
+                        &AlertKind::MaxPerProvider {
+                            provider: *provider,
+                            current: *count,
+                            threshold,
+                        },
                         AlertSeverity::Warning,
                         None,
                         None,
@@ -4082,9 +4075,38 @@ fn check_threshold_alerts(
                         json_mode,
                         style,
                     );
+                    rows.push(synthesized_alert_event(ts, run_id, *provider));
                 }
             }
         }
+    }
+
+    rows
+}
+
+/// Threshold breaches have no natural per-connection row; synthesize one carrying
+/// `alert=1` with NULL pid and zeroed endpoint columns.
+fn synthesized_alert_event(ts: &str, run_id: &str, provider: Provider) -> SqliteEvent {
+    SqliteEvent {
+        ts: ts.to_string(),
+        run_id: run_id.to_string(),
+        event: "alert".to_string(),
+        key: ConnKey {
+            proto: Proto::Tcp,
+            local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            local_port: 0,
+            remote_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            remote_port: 0,
+        },
+        pid: None,
+        comm: String::new(),
+        cmdline: String::new(),
+        provider,
+        domain: None,
+        ancestry_path: None,
+        duration_ms: None,
+        alert: true,
+        retry_count: None,
     }
 }
 
@@ -4101,7 +4123,9 @@ fn would_trigger_duration_alert(alert_config: &AlertConfig, duration_ms: Option<
     false
 }
 
-/// Check duration alerts on connection close.
+/// Check duration alerts on connection close. Returns true only when the alert
+/// actually emitted; cooldown-suppressed alerts return false so the durable
+/// close row is flagged solely for alerts the operator saw.
 fn check_duration_alert(
     alert_config: &AlertConfig,
     alert_state: &mut AlertState,
@@ -4110,32 +4134,35 @@ fn check_duration_alert(
     duration_ms: u64,
     json_mode: bool,
     style: OutputStyle,
-) {
-    if !alert_config.is_enabled() {
-        return;
+) -> bool {
+    if !would_trigger_duration_alert(alert_config, Some(duration_ms)) {
+        return false;
     }
 
-    if let Some(threshold_ms) = alert_config.duration_threshold_ms {
-        if duration_ms > threshold_ms {
-            let sig = AlertSignature::LongDuration {
-                conn_key: key.clone(),
-            };
-            if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
-                let kind = AlertKind::LongDuration {
-                    duration_ms,
-                    threshold_ms,
-                };
-                emit_alert(
-                    &kind,
-                    AlertSeverity::Warning,
-                    Some(key),
-                    Some(info),
-                    alert_config.bell,
-                    json_mode,
-                    style,
-                );
-            }
-        }
+    let threshold_ms = match alert_config.duration_threshold_ms {
+        Some(threshold) => threshold,
+        None => return false,
+    };
+
+    let sig = AlertSignature::LongDuration {
+        conn_key: key.clone(),
+    };
+    if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
+        emit_alert(
+            &AlertKind::LongDuration {
+                duration_ms,
+                threshold_ms,
+            },
+            AlertSeverity::Warning,
+            Some(key),
+            Some(info),
+            alert_config.bell,
+            json_mode,
+            style,
+        );
+        true
+    } else {
+        false
     }
 }
 
