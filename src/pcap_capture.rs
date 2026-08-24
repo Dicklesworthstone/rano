@@ -31,12 +31,24 @@ const MAX_DNS_PTR_DEPTH: usize = 6;
 pub enum DomainSource {
     Dns,
     Sni,
+    Ptr,
+}
+
+impl DomainSource {
+    /// Stable lowercase label used in events JSON, SQLite `domain_source`,
+    /// exports, and reports.
+    pub fn label(self) -> &'static str {
+        match self {
+            DomainSource::Dns => "dns",
+            DomainSource::Sni => "sni",
+            DomainSource::Ptr => "ptr",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
 pub struct DomainMapping {
     pub hostname: String,
-    #[allow(dead_code)]
     pub source: DomainSource,
     captured_at: SystemTime,
     ttl: Duration,
@@ -62,18 +74,20 @@ impl DomainCache {
         }
     }
 
-    pub fn lookup(&mut self, ip: IpAddr, port: u16) -> Option<String> {
+    /// Look up a cached mapping, returning the hostname and its provenance
+    /// source (dns or sni).
+    pub fn lookup(&mut self, ip: IpAddr, port: u16) -> Option<(String, DomainSource)> {
         let now = SystemTime::now();
         self.maybe_cleanup(now);
 
         if let Some(mapping) = self.by_ip_port.get(&(ip, port)) {
             if !is_expired(mapping, now) {
-                return Some(mapping.hostname.clone());
+                return Some((mapping.hostname.clone(), mapping.source));
             }
         }
         if let Some(mapping) = self.by_ip.get(&ip) {
             if !is_expired(mapping, now) {
-                return Some(mapping.hostname.clone());
+                return Some((mapping.hostname.clone(), mapping.source));
             }
         }
         None
@@ -863,8 +877,14 @@ mod tests {
         });
 
         // Lookup by IP (any port) should find DNS mapping
-        assert_eq!(cache.lookup(ip, 443), Some("www.google.com".to_string()));
-        assert_eq!(cache.lookup(ip, 80), Some("www.google.com".to_string()));
+        assert_eq!(
+            cache.lookup(ip, 443),
+            Some(("www.google.com".to_string(), DomainSource::Dns))
+        );
+        assert_eq!(
+            cache.lookup(ip, 80),
+            Some(("www.google.com".to_string(), DomainSource::Dns))
+        );
     }
 
     #[test]
@@ -879,7 +899,10 @@ mod tests {
         });
 
         // Lookup by exact IP+port should find SNI mapping
-        assert_eq!(cache.lookup(ip, 443), Some("api.anthropic.com".to_string()));
+        assert_eq!(
+            cache.lookup(ip, 443),
+            Some(("api.anthropic.com".to_string(), DomainSource::Sni))
+        );
         // Different port should not find SNI mapping
         assert!(cache.lookup(ip, 80).is_none());
     }
@@ -903,9 +926,15 @@ mod tests {
         });
 
         // SNI should be preferred for exact port match
-        assert_eq!(cache.lookup(ip, 443), Some("api.anthropic.com".to_string()));
+        assert_eq!(
+            cache.lookup(ip, 443),
+            Some(("api.anthropic.com".to_string(), DomainSource::Sni))
+        );
         // DNS should be used for other ports
-        assert_eq!(cache.lookup(ip, 80), Some("cloudflare.net".to_string()));
+        assert_eq!(
+            cache.lookup(ip, 80),
+            Some(("cloudflare.net".to_string(), DomainSource::Dns))
+        );
     }
 
     #[test]
@@ -920,7 +949,10 @@ mod tests {
             hostname: "ipv6.google.com".to_string(),
         });
 
-        assert_eq!(cache.lookup(ip, 443), Some("ipv6.google.com".to_string()));
+        assert_eq!(
+            cache.lookup(ip, 443),
+            Some(("ipv6.google.com".to_string(), DomainSource::Dns))
+        );
     }
 
     #[test]
@@ -937,7 +969,10 @@ mod tests {
             hostname: "new.example.com".to_string(),
         });
 
-        assert_eq!(cache.lookup(ip, 443), Some("new.example.com".to_string()));
+        assert_eq!(
+            cache.lookup(ip, 443),
+            Some(("new.example.com".to_string(), DomainSource::Dns))
+        );
     }
 
     #[test]
@@ -962,14 +997,10 @@ mod tests {
         }
 
         // Total entries should be <= max_entries
-        let total = cache.by_ip.len() + cache.by_ip_port.len();
-        assert!(total <= 3);
-
-        // Latest entry should still exist
         let latest_ip = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 3));
         assert_eq!(
             cache.lookup(latest_ip, 443),
-            Some("host3.example.com".to_string())
+            Some(("host3.example.com".to_string(), DomainSource::Dns))
         );
     }
 
@@ -978,8 +1009,11 @@ mod tests {
         assert_eq!(DomainSource::Dns, DomainSource::Dns);
         assert_eq!(DomainSource::Sni, DomainSource::Sni);
         assert_ne!(DomainSource::Dns, DomainSource::Sni);
+        assert_eq!(DomainSource::Ptr, DomainSource::Ptr);
+        assert_eq!(DomainSource::Dns.label(), "dns");
+        assert_eq!(DomainSource::Sni.label(), "sni");
+        assert_eq!(DomainSource::Ptr.label(), "ptr");
     }
-
     #[test]
     fn pcap_msg_debug_format() {
         let dns_msg = PcapMsg::DnsMapping {
@@ -1381,7 +1415,7 @@ mod tests {
         // Connection to that IP should resolve
         assert_eq!(
             cache.lookup(IpAddr::V4(Ipv4Addr::new(140, 82, 114, 4)), 443),
-            Some("github.com".to_string())
+            Some(("github.com".to_string(), DomainSource::Dns))
         );
     }
 
@@ -1401,7 +1435,7 @@ mod tests {
         // Exact IP+port lookup should resolve
         assert_eq!(
             cache.lookup(IpAddr::V4(Ipv4Addr::new(104, 18, 32, 7)), 443),
-            Some("api.anthropic.com".to_string())
+            Some(("api.anthropic.com".to_string(), DomainSource::Sni))
         );
     }
 

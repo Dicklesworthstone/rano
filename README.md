@@ -225,6 +225,19 @@ rano can resolve domains in two modes:
 - **pcap**: uses libpcap to capture DNS responses + TLS SNI. Requires root/CAP_NET_RAW.
   If capture fails, rano logs a warning and falls back to PTR automatically.
 
+Every resolved domain carries a **provenance source** so you can weigh
+attribution confidence:
+
+| `domain_source` | Meaning | Confidence |
+|-----------------|---------|------------|
+| `sni` | Observed in the TLS ClientHello handshake | Highest — what the process actually dialed |
+| `dns` | Answer from a captured DNS response | High — name the process looked up |
+| `ptr` | Reverse DNS on the remote IP | Indicative — CDN/shared hosts may be misleading |
+| *(absent)* | Unresolved or attribution unavailable | — |
+
+The source appears as `"domain_source"` in `--json` events, in SQLite
+(`events.domain_source`), in exports, and as a `[sni]`-style suffix on report
+Top Domains rows.
 Examples:
 
 ```bash

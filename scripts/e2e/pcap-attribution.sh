@@ -69,6 +69,7 @@ e2e_run "pcap attribution" env RANO_PCAP_FILE="${PCAP_FIXTURE}" \
 
 e2e_assert_last_status 0
 e2e_assert_last_contains "\"domain\":\"${EXPECTED_DOMAIN}\""
+e2e_assert_last_contains "\"domain_source\":\"dns\""
 e2e_assert_last_contains "\"domain_mode\":\"pcap\""
 
 ATTR_OUTPUT="${E2E_LAST_OUTPUT_FILE}"

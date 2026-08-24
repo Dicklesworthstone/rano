@@ -892,6 +892,7 @@ struct ConnInfo {
     cmdline: String,
     provider: Provider,
     domain: Option<String>,
+    domain_source: Option<String>,
     ancestry: Option<Vec<String>>,
     ancestry_path: Option<String>,
     opened_at: SystemTime,
@@ -1215,6 +1216,7 @@ struct SqliteEvent {
     cmdline: String,
     provider: Provider,
     domain: Option<String>,
+    domain_source: Option<String>,
     ancestry_path: Option<String>,
     duration_ms: Option<u64>,
     alert: bool,
@@ -1608,20 +1610,20 @@ fn main() {
             seen_keys.insert(key.clone());
 
             if !active.contains_key(&key) {
-                let domain = if let Some(cache) = domain_cache.as_mut() {
-                    cache
-                        .lookup(entry.remote_ip, entry.remote_port)
-                        .or_else(|| {
-                            if ptr_enabled {
-                                resolve_domain(entry.remote_ip, &mut dns_cache)
-                            } else {
-                                None
-                            }
-                        })
+                let (domain, domain_source) = if let Some(cache) = domain_cache.as_mut() {
+                    match cache.lookup(entry.remote_ip, entry.remote_port) {
+                        Some((host, source)) => (Some(host), Some(source.label())),
+                        None if ptr_enabled => resolve_domain(entry.remote_ip, &mut dns_cache)
+                            .map(|d| (Some(d), Some(pcap_capture::DomainSource::Ptr.label())))
+                            .unwrap_or((None, None)),
+                        _ => (None, None),
+                    }
                 } else if ptr_enabled {
                     resolve_domain(entry.remote_ip, &mut dns_cache)
+                        .map(|d| (Some(d), Some(pcap_capture::DomainSource::Ptr.label())))
+                        .unwrap_or((None, None))
                 } else {
-                    None
+                    (None, None)
                 };
                 let meta = pid_meta.get(&pid).cloned().unwrap_or_else(|| PidMeta {
                     comm: "unknown".to_string(),
@@ -1644,6 +1646,7 @@ fn main() {
                     cmdline: meta.cmdline.clone(),
                     provider: meta.provider,
                     domain: domain.clone(),
+                    domain_source: domain_source.map(str::to_string),
                     ancestry: ancestry.clone(),
                     ancestry_path: ancestry_path.clone(),
                     opened_at: now,
@@ -1664,6 +1667,7 @@ fn main() {
                         &meta.cmdline,
                         meta.provider,
                         domain.as_deref(),
+                        domain_source,
                         ancestry.as_deref(),
                         None,
                         domain_label,
@@ -1733,6 +1737,7 @@ fn main() {
                         cmdline: meta.cmdline.clone(),
                         provider: meta.provider,
                         domain: domain.clone(),
+                        domain_source: domain_source.map(str::to_string),
                         ancestry_path: ancestry_path.clone(),
                         duration_ms: None,
                         alert: conn_alert_emitted,
@@ -1812,6 +1817,7 @@ fn main() {
                         &info.cmdline,
                         info.provider,
                         info.domain.as_deref(),
+                        info.domain_source.as_deref(),
                         info.ancestry.as_deref(),
                         duration_ms,
                         domain_label,
@@ -1854,6 +1860,7 @@ fn main() {
                         cmdline: info.cmdline.clone(),
                         provider: info.provider,
                         domain: info.domain.clone(),
+                        domain_source: info.domain_source.clone(),
                         ancestry_path: info.ancestry_path.clone(),
                         duration_ms,
                         alert: close_alert_emitted,
@@ -4156,6 +4163,7 @@ fn synthesized_alert_event(ts: &str, run_id: &str, provider: Provider) -> Sqlite
         cmdline: String::new(),
         provider,
         domain: None,
+        domain_source: None,
         ancestry_path: None,
         duration_ms: None,
         alert: true,
@@ -4219,8 +4227,6 @@ fn check_duration_alert(
     }
 }
 
-// --- End Alert System Functions ---
-
 fn emit_event(
     ts: &str,
     event: &str,
@@ -4231,6 +4237,7 @@ fn emit_event(
     cmdline: &str,
     provider: Provider,
     domain: Option<&str>,
+    domain_source: Option<&str>,
     ancestry: Option<&[String]>,
     duration_ms: Option<u64>,
     domain_mode: &str,
@@ -4260,6 +4267,7 @@ fn emit_event(
             &local,
             &remote,
             dom,
+            domain_source,
             domain_mode,
             ancestry,
             duration_ms,
@@ -4317,6 +4325,7 @@ fn emit_event(
                 &local,
                 &remote,
                 dom,
+                domain_source,
                 domain_mode,
                 ancestry,
                 duration_ms,
@@ -4438,7 +4447,6 @@ fn format_pretty_event(
         duration_text,
     )
 }
-
 fn format_json_event(
     ts: &str,
     run_id: &str,
@@ -4451,6 +4459,7 @@ fn format_json_event(
     local: &str,
     remote: &str,
     domain: &str,
+    domain_source: Option<&str>,
     domain_mode: &str,
     ancestry: Option<&[String]>,
     duration_ms: Option<u64>,
@@ -4468,6 +4477,9 @@ fn format_json_event(
     push_json_str(&mut out, "local", local, false);
     push_json_str(&mut out, "remote", remote, false);
     push_json_str(&mut out, "domain", domain, false);
+    if let Some(source) = domain_source {
+        push_json_str(&mut out, "domain_source", source, false);
+    }
     push_json_str(&mut out, "domain_mode", domain_mode, false);
     if let Some(list) = ancestry {
         push_json_array(&mut out, "ancestry", list, false);
@@ -5717,6 +5729,7 @@ const EXPORT_FIELDS: &[&str] = &[
     "remote_ip",
     "remote_port",
     "domain",
+    "domain_source",
     "ancestry_path",
     "duration_ms",
 ];
@@ -5753,7 +5766,6 @@ fn run_config_check() -> i32 {
 
     let mut validator = ConfigValidator::new();
     let mut checked_any = false;
-
     // Check key-value config file
     if let Some(kv_path) = default_config_path() {
         if kv_path.exists() {
@@ -5892,6 +5904,10 @@ fn run_export(args: ExportArgs) -> Result<(), String> {
 
     let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
     set_busy_timeout(&conn);
+    // Late-added column: migrate idempotently so exports from pre-provenance
+    // databases still prepare their default-field SELECT.
+    let mut conn = conn;
+    let _ = ensure_column(&mut conn, "events", "domain_source", "TEXT");
 
     let has_events = table_exists(&conn, "events")?;
     if !has_events {
@@ -6796,8 +6812,12 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         return Err(format!("SQLite file not found: {}", args.sqlite_path));
     }
 
-    let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
+    let mut conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
     set_busy_timeout(&conn);
+
+    // Late-added column: migrate idempotently so reports on pre-provenance
+    // databases still prepare their queries.
+    let _ = ensure_column(&mut conn, "events", "domain_source", "TEXT");
 
     // Check schema
     let has_events = table_exists(&conn, "events")?;
@@ -7125,8 +7145,14 @@ fn output_report_json(
     out.push_str("  \"top_domains\": [\n");
     for (i, d) in domains.iter().enumerate() {
         out.push_str(&format!(
-            "    {{\"domain\": \"{}\", \"events\": {}, \"provider\": \"{}\"}}",
-            d.domain, d.events, d.provider
+            "    {{\"domain\": \"{}\", \"events\": {}, \"provider\": \"{}\", \"source\": {}}}",
+            d.domain,
+            d.events,
+            d.provider,
+            match d.source.as_deref() {
+                Some(s) => format!("\"{s}\""),
+                None => "null".to_string(),
+            }
         ));
         if i < domains.len() - 1 {
             out.push(',');
@@ -7392,7 +7418,10 @@ fn output_report_pretty(
             "-".repeat(provider_width)
         );
         for (i, d) in domains.iter().enumerate() {
-            let domain = truncate_ascii(&d.domain, domain_width);
+            let domain = match d.source.as_deref() {
+                Some(source) => format!("{} [{}]", truncate_ascii(&d.domain, domain_width), source),
+                None => truncate_ascii(&d.domain, domain_width),
+            };
             let provider = provider_label(&d.provider, color);
             let provider = pad_right(&provider, provider_width, d.provider.len());
             println!(
@@ -7590,6 +7619,7 @@ struct DomainStats {
     domain: String,
     events: i64,
     provider: String,
+    source: Option<String>,
 }
 
 struct IpStats {
@@ -7800,6 +7830,7 @@ fn query_top_domains(
                 domain: row.get(0)?,
                 events: row.get(1)?,
                 provider: row.get(2)?,
+                source: row.get(3)?,
             })
         })
         .map_err(|e| format!("Failed to query domains: {}", e))?;
@@ -7812,10 +7843,14 @@ fn query_top_domains(
 }
 
 fn build_domains_query(filter: &ReportFilter, top: usize) -> (String, Vec<String>) {
+    // Prefer the highest-confidence provenance per domain: sni > dns > ptr.
     let mut sql = String::from(
         "SELECT COALESCE(domain, 'unknown') as domain,
                 COUNT(*) as events,
-                provider
+                provider,
+                CASE MIN(CASE COALESCE(domain_source, 'none')
+                         WHEN 'sni' THEN 1 WHEN 'dns' THEN 2 WHEN 'ptr' THEN 3 ELSE 9 END)
+                     WHEN 1 THEN 'sni' WHEN 2 THEN 'dns' WHEN 3 THEN 'ptr' END as source
          FROM events WHERE domain IS NOT NULL AND domain != ''",
     );
     let mut params: Vec<String> = Vec::new();
@@ -7949,7 +7984,7 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
 
     // Phase 2: migrate columns added after the original schema so any historical DB
     // opens cleanly (missing columns previously caused insert failures that disabled
-    // SQLite logging entirely).
+    ensure_column(conn, "events", "domain_source", "TEXT")?;
     ensure_column(conn, "events", "run_id", "TEXT")?;
     ensure_column(conn, "events", "duration_ms", "INTEGER")?;
     ensure_column(conn, "events", "ancestry_path", "TEXT")?;
@@ -7987,6 +8022,10 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
         CREATE VIEW IF NOT EXISTS provider_processes AS
             SELECT provider, comm, COUNT(*) AS events
             FROM events GROUP BY provider, comm;
+        CREATE VIEW IF NOT EXISTS provider_domain_sources AS
+            SELECT provider, domain, domain_source, COUNT(*) AS events
+            FROM events WHERE domain IS NOT NULL AND domain != 'unknown'
+            GROUP BY provider, domain, domain_source;
         CREATE VIEW IF NOT EXISTS provider_last_hour AS
             SELECT provider, COUNT(*) AS events
             FROM events
@@ -8080,8 +8119,8 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
     };
     let (is_private, ip_version) = ip_flags(event.key.remote_ip);
     conn.execute(
-        "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, ancestry_path, remote_is_private, ip_version, duration_ms, alert, retry_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+        "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, domain_source, ancestry_path, remote_is_private, ip_version, duration_ms, alert, retry_count)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
         params![
             &event.ts,
             &event.run_id,
@@ -8096,6 +8135,7 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
             event.key.remote_ip.to_string(),
             event.key.remote_port as i64,
             event.domain.as_deref().unwrap_or("unknown"),
+            event.domain_source.as_deref(),
             event.ancestry_path.as_deref().unwrap_or(""),
             if is_private { 1 } else { 0 },
             ip_version,
@@ -8484,6 +8524,7 @@ mod tests {
             cmdline: "/usr/bin/testproc".to_string(),
             provider,
             domain: Some("test.example.com".to_string()),
+            domain_source: None,
             ancestry_path: Some("init:1,testproc:1234".to_string()),
             duration_ms: if event == "close" { Some(1000) } else { None },
             alert: false,
@@ -8662,6 +8703,53 @@ mod tests {
     }
 
     #[test]
+    fn sqlite_roundtrips_domain_source_provenance() {
+        let mut conn = setup_test_db();
+
+        let mut sni_event = create_test_event("2026-01-20T12:00:00Z", "connect", Provider::OpenAI);
+        sni_event.domain = Some("api.openai.com".to_string());
+        sni_event.domain_source = Some("sni".to_string());
+
+        let mut ptr_event = create_test_event("2026-01-20T12:00:01Z", "connect", Provider::Unknown);
+        ptr_event.domain = Some("ip-93-184-216-34.example.net".to_string());
+        ptr_event.domain_source = Some("ptr".to_string());
+
+        let mut no_source = create_test_event("2026-01-20T12:00:02Z", "connect", Provider::Google);
+        no_source.domain = None;
+
+        write_sqlite_batch(&mut conn, &[sni_event, ptr_event, no_source])
+            .expect("batch write failed");
+
+        let sni: Option<String> = conn
+            .query_row(
+                "SELECT domain_source FROM events WHERE domain = 'api.openai.com'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sni query failed");
+        assert_eq!(sni.as_deref(), Some("sni"));
+
+        let ptr: Option<String> = conn
+            .query_row(
+                "SELECT domain_source FROM events WHERE domain_source = 'ptr'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("ptr query failed");
+        assert_eq!(ptr.as_deref(), Some("ptr"));
+
+        // PTR-less/unattributed rows store NULL.
+        let none: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE domain_source IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("null query failed");
+        assert_eq!(none, 1);
+    }
+
+    #[test]
     fn write_sqlite_batch_multiple_calls_accumulate() {
         let mut conn = setup_test_db();
 
@@ -8834,6 +8922,7 @@ mod tests {
             cmdline: "claude".to_string(),
             provider: Provider::Anthropic,
             domain: Some("evil.malicious.com".to_string()),
+            domain_source: Some("dns".to_string()),
             ancestry: None,
             ancestry_path: None,
             opened_at: std::time::SystemTime::now(),
