@@ -500,6 +500,12 @@ rano --alert-domain "*.cn" \
 
 ---
 
+## Performance
+
+rano's second design pillar is low overhead. Measured evidence — scan-pass latency at 500/2000 tracked connections, durable SQLite throughput across batch sizes, and a bounded-RSS/zero-drop soak — lives in [docs/perf.md](docs/perf.md), reproducible via `scripts/bench.sh` and `scripts/e2e/soak-memory.sh` (nightly, non-blocking in CI).
+
+---
+
 ## Retry Detection
 
 rano watches for connection-churn storms (rapid reconnects to the same endpoint from the same PID) and warns once per endpoint per window.

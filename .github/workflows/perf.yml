@@ -1,0 +1,41 @@
+name: perf
+
+on:
+  schedule:
+    # Nightly at 03:20 UTC — off PR critical path by design.
+    - cron: "20 3 * * *"
+  workflow_dispatch:
+
+jobs:
+  bench-and-soak:
+    runs-on: ubuntu-latest
+    continue-on-error: true # benchmark variance is unsuitable for gating
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Install sqlite3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3
+
+      - name: Run benchmarks
+        run: scripts/bench.sh target/release/rano
+
+      - name: Memory soak (10 min accelerated)
+        run: |
+          SOAK_SECS=600 \
+          RANO=target/release/rano \
+          bash scripts/e2e/run.sh soak-memory scripts/e2e/soak-memory.sh
+
+      - name: Upload soak logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: soak-logs
+          path: logs/e2e/
+          retention-days: 14
