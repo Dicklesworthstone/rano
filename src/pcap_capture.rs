@@ -22,7 +22,7 @@ const DNS_TTL_SECS: u64 = 300;
 const SNI_TTL_SECS: u64 = 600;
 const CLEANUP_INTERVAL_SECS: u64 = 60;
 const CHANNEL_CAPACITY: usize = 1000;
-const CACHE_MAX_ENTRIES: usize = 10_000;
+pub const DEFAULT_CACHE_MAX_ENTRIES: usize = 10_000;
 const DNS_PORT: u16 = 53;
 const TLS_SNI_PORT: u16 = 443;
 const MAX_DNS_PTR_DEPTH: usize = 6;
@@ -50,12 +50,15 @@ pub struct DomainCache {
 }
 
 impl DomainCache {
-    pub fn new() -> Self {
+    /// Create a cache with a caller-provided entry cap (the `--pcap-cache-max`
+    /// knob). Values below the 100-entry floor are rejected by CLI/config
+    /// validation before reaching this constructor.
+    pub fn with_max_entries(max_entries: usize) -> Self {
         Self {
             by_ip_port: HashMap::new(),
             by_ip: HashMap::new(),
             last_cleanup: SystemTime::now(),
-            max_entries: CACHE_MAX_ENTRIES,
+            max_entries,
         }
     }
 
@@ -225,8 +228,17 @@ pub fn pcap_supported() -> bool {
     cfg!(feature = "pcap")
 }
 
+/// Tuning knobs for the pcap capture subsystem (feature `pcap`). The DNS/SNI
+/// cache cap (`--pcap-cache-max`) is applied by the caller at
+/// [`DomainCache::with_max_entries`], so only the interface lives here.
+#[derive(Clone, Debug, Default)]
+pub struct PcapOptions {
+    /// Capture interface name; `None` uses libpcap's default device.
+    pub interface: Option<String>,
+}
+
 #[cfg(feature = "pcap")]
-pub fn start_pcap_capture() -> Result<PcapHandle, String> {
+pub fn start_pcap_capture(options: PcapOptions) -> Result<PcapHandle, String> {
     use pcap::{Capture, Device};
 
     let offline_path = env::var("RANO_PCAP_FILE")
@@ -268,10 +280,29 @@ pub fn start_pcap_capture() -> Result<PcapHandle, String> {
         });
     }
 
-    // Live capture mode
-    let device = Device::lookup()
-        .map_err(|e| format!("pcap device lookup failed: {e}"))?
-        .ok_or_else(|| "no default pcap device found".to_string())?;
+    // Live capture mode: honor an explicit --pcap-interface, else libpcap default.
+    let device = match options.interface.as_deref() {
+        Some(name) => {
+            let devices =
+                Device::list().map_err(|e| format!("pcap device enumeration failed: {e}"))?;
+            match devices.into_iter().find(|d| d.name == name) {
+                Some(device) => device,
+                None => {
+                    let devices: Vec<Device> = Device::list()
+                        .map_err(|e| format!("pcap device enumeration failed: {e}"))?;
+                    let available: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
+                    return Err(format!(
+                        "pcap interface '{}' not found; available interfaces: {}",
+                        name,
+                        available.join(", ")
+                    ));
+                }
+            }
+        }
+        None => Device::lookup()
+            .map_err(|e| format!("pcap device lookup failed: {e}"))?
+            .ok_or_else(|| "no default pcap device found".to_string())?,
+    };
     let mut cap = Capture::from_device(device)
         .map_err(|e| format!("pcap device open failed: {e}"))?
         .promisc(true)
@@ -299,9 +330,6 @@ pub fn start_pcap_capture() -> Result<PcapHandle, String> {
                     }
                 }
                 Err(pcap::Error::TimeoutExpired) => {
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                Err(pcap::Error::NoMorePackets) => {
                     break;
                 }
                 Err(_) => {
@@ -319,7 +347,7 @@ pub fn start_pcap_capture() -> Result<PcapHandle, String> {
 }
 
 #[cfg(not(feature = "pcap"))]
-pub fn start_pcap_capture() -> Result<PcapHandle, String> {
+pub fn start_pcap_capture(_options: PcapOptions) -> Result<PcapHandle, String> {
     Err("pcap feature not enabled".to_string())
 }
 
@@ -819,14 +847,14 @@ mod tests {
 
     #[test]
     fn domain_cache_new_is_empty() {
-        let mut cache = DomainCache::new();
+        let mut cache = DomainCache::with_max_entries(DEFAULT_CACHE_MAX_ENTRIES);
         let ip = IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8));
         assert!(cache.lookup(ip, 443).is_none());
     }
 
     #[test]
     fn domain_cache_dns_insert_and_lookup() {
-        let mut cache = DomainCache::new();
+        let mut cache = DomainCache::with_max_entries(DEFAULT_CACHE_MAX_ENTRIES);
         let ip = IpAddr::V4(Ipv4Addr::new(142, 250, 189, 206));
 
         cache.apply_msg(PcapMsg::DnsMapping {
@@ -841,7 +869,7 @@ mod tests {
 
     #[test]
     fn domain_cache_sni_insert_and_lookup() {
-        let mut cache = DomainCache::new();
+        let mut cache = DomainCache::with_max_entries(DEFAULT_CACHE_MAX_ENTRIES);
         let ip = IpAddr::V4(Ipv4Addr::new(104, 18, 32, 7));
 
         cache.apply_msg(PcapMsg::SniMapping {
@@ -858,7 +886,7 @@ mod tests {
 
     #[test]
     fn domain_cache_sni_preferred_over_dns() {
-        let mut cache = DomainCache::new();
+        let mut cache = DomainCache::with_max_entries(DEFAULT_CACHE_MAX_ENTRIES);
         let ip = IpAddr::V4(Ipv4Addr::new(104, 18, 32, 7));
 
         // Insert DNS mapping first (broader match)
@@ -882,7 +910,7 @@ mod tests {
 
     #[test]
     fn domain_cache_ipv6_support() {
-        let mut cache = DomainCache::new();
+        let mut cache = DomainCache::with_max_entries(DEFAULT_CACHE_MAX_ENTRIES);
         let ip = IpAddr::V6(Ipv6Addr::new(
             0x2607, 0xf8b0, 0x4004, 0x800, 0, 0, 0, 0x200e,
         ));
@@ -897,7 +925,7 @@ mod tests {
 
     #[test]
     fn domain_cache_overwrites_existing() {
-        let mut cache = DomainCache::new();
+        let mut cache = DomainCache::with_max_entries(DEFAULT_CACHE_MAX_ENTRIES);
         let ip = IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4));
 
         cache.apply_msg(PcapMsg::DnsMapping {
@@ -1341,7 +1369,7 @@ mod tests {
     #[cfg(feature = "pcap")]
     #[test]
     fn integration_dns_to_cache() {
-        let mut cache = DomainCache::new();
+        let mut cache = DomainCache::with_max_entries(DEFAULT_CACHE_MAX_ENTRIES);
 
         // Simulate DNS response message
         let msg = PcapMsg::DnsMapping {
@@ -1360,7 +1388,7 @@ mod tests {
     #[cfg(feature = "pcap")]
     #[test]
     fn integration_sni_to_cache() {
-        let mut cache = DomainCache::new();
+        let mut cache = DomainCache::with_max_entries(DEFAULT_CACHE_MAX_ENTRIES);
 
         // Simulate SNI message
         let msg = PcapMsg::SniMapping {

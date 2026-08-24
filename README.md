@@ -185,6 +185,8 @@ rano --once
 --summary-only            # Suppress live events
 --domain-mode <auto|ptr|pcap>
 --pcap                    # Force pcap mode (falls back)
+--pcap-interface <name>   # Capture interface for pcap mode (default: auto)
+--pcap-cache-max <n>      # DNS/SNI cache cap, >= 100 (default: 10000)
 --no-dns                  # Disable PTR lookups
 --include-udp             # Include UDP sockets
 --no-udp                  # Exclude UDP sockets

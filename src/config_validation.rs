@@ -39,6 +39,8 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "db_batch_size",
     "db_flush_ms",
     "db_queue_max",
+    "pcap_interface",
+    "pcap_cache_max",
     "stats_interval_ms",
     "stats_width",
     "stats_top",
@@ -325,7 +327,24 @@ fn validate_config_value(
             Ok(_) => {}
         },
 
-        // Non-negative usize values
+        // pcap tuning knobs
+        "pcap_cache_max" => match value.parse::<usize>() {
+            Ok(n) if n < 100 => {
+                result.add_error(
+                    path,
+                    Some(line),
+                    format!("'pcap_cache_max' must be >= 100, got {}", n),
+                );
+            }
+            Err(_) => {
+                result.add_error(
+                    path,
+                    Some(line),
+                    format!("'{}' must be a non-negative integer, got '{}'", key, value),
+                );
+            }
+            Ok(_) => {}
+        },
         "stats_width" | "stats_top" if value.parse::<usize>().is_err() => {
             result.add_error(
                 path,
@@ -938,5 +957,39 @@ unknown_provider = ["test"]
         let result = validate_config_file(file.path());
         assert!(!result.is_valid());
         assert!(result.errors[0].message.contains("invalid value"));
+    }
+    #[test]
+    fn test_validate_config_file_pcap_knobs() {
+        let good = write_temp_file("pcap_interface=lo\npcap_cache_max=250\n");
+        let result = validate_config_file(good.path());
+        assert!(
+            result.is_valid(),
+            "expected valid, got errors: {:?}",
+            result.errors
+        );
+
+        let small = write_temp_file("pcap_cache_max=50\n");
+        let result = validate_config_file(small.path());
+        assert!(
+            !result.is_valid(),
+            "pcap_cache_max below 100 must be rejected"
+        );
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("pcap_cache_max"))
+        );
+
+        // Empty values fail earlier as missing-value errors naming the key.
+        let empty = write_temp_file("pcap_interface=\n");
+        let result = validate_config_file(empty.path());
+        assert!(!result.is_valid());
+        assert!(
+            result
+                .errors
+                .iter()
+                .any(|e| e.message.contains("'pcap_interface'"))
+        );
     }
 }

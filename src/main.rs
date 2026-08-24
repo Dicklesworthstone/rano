@@ -330,6 +330,14 @@ fn apply_preset_values(
                     return Err("db_queue_max must be >= 1".to_string());
                 }
             }
+            "pcap_cache_max" => {
+                let n = parse_usize(value, "pcap_cache_max")?;
+                if n < PCAP_CACHE_MIN_ENTRIES {
+                    return Err("pcap_cache_max must be >= 100".to_string());
+                }
+                args.pcap_cache_max = Some(n);
+            }
+            "pcap_interface" => set_pcap_interface(args, value, "pcap_interface")?,
             "stats_interval_ms" => args.stats_interval_ms = parse_u64(value, "stats_interval_ms")?,
             "stats_width" => {
                 args.stats_width = parse_usize(value, "stats_width")?;
@@ -435,6 +443,10 @@ struct MonitorArgs {
     db_batch_size: usize,
     db_flush_ms: u64,
     db_queue_max: usize,
+    /// pcap capture interface (--pcap-interface); None uses libpcap default
+    pcap_interface: Option<String>,
+    /// pcap DNS/SNI cache cap (--pcap-cache-max); None uses built-in default
+    pcap_cache_max: Option<usize>,
     stats_interval_ms: u64,
     stats_width: usize,
     stats_width_set: bool,
@@ -698,6 +710,8 @@ impl Default for MonitorArgs {
             alert: AlertConfig::default(),
             retry_threshold: 3,
             retry_window_ms: 60000,
+            pcap_interface: None,
+            pcap_cache_max: None,
         }
     }
 }
@@ -1474,7 +1488,7 @@ fn main() {
 
     let mut pcap_handle: Option<pcap_capture::PcapHandle> = None;
     if domain_mode == DomainMode::Pcap {
-        match pcap_capture::start_pcap_capture() {
+        match pcap_capture::start_pcap_capture(pcap_options_from_args(&args)) {
             Ok(handle) => {
                 pcap_handle = Some(handle);
             }
@@ -1502,9 +1516,12 @@ fn main() {
     };
 
     let mut dns_cache: HashMap<IpAddr, DnsCacheEntry> = HashMap::new();
-    let mut domain_cache = pcap_handle
-        .as_ref()
-        .map(|_| pcap_capture::DomainCache::new());
+    let mut domain_cache = pcap_handle.as_ref().map(|_| {
+        pcap_capture::DomainCache::with_max_entries(
+            args.pcap_cache_max
+                .unwrap_or(pcap_capture::DEFAULT_CACHE_MAX_ENTRIES),
+        )
+    });
     let mut ancestry_cache = AncestryCache::new(Duration::from_secs(ANCESTRY_CACHE_TTL_SECS));
 
     let mut active: HashMap<ConnKey, ConnInfo> = HashMap::new();
@@ -2151,15 +2168,23 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                 args.stats_interval_ms = parse_u64(value, "--stats-interval-ms")?;
                 i += 1;
             }
-            "--stats-width" => {
+            "--pcap-cache-max" => {
                 i += 1;
-                let value = require_value(argv, i, "--stats-width")?;
-                args.stats_width = parse_usize(value, "--stats-width")?;
-                args.stats_width_set = true;
+                let value = require_value(argv, i, "--pcap-cache-max")?;
+                let n = parse_usize(value, "--pcap-cache-max")?;
+                if n < PCAP_CACHE_MIN_ENTRIES {
+                    return Err("--pcap-cache-max must be >= 100".to_string());
+                }
+                args.pcap_cache_max = Some(n);
+                i += 1;
+            }
+            "--pcap-interface" => {
+                i += 1;
+                let value = require_value(argv, i, "--pcap-interface")?;
+                set_pcap_interface(&mut args, value, "--pcap-interface")?;
                 i += 1;
             }
             "--stats-top" => {
-                i += 1;
                 let value = require_value(argv, i, "--stats-top")?;
                 args.stats_top = parse_usize(value, "--stats-top")?;
                 if args.stats_top == 0 {
@@ -2730,6 +2755,25 @@ fn parse_status_args(argv: &[String]) -> Result<StatusArgs, String> {
     Ok(args)
 }
 
+/// Minimum accepted value for --pcap-cache-max / `pcap_cache_max` config key.
+const PCAP_CACHE_MIN_ENTRIES: usize = 100;
+
+/// Validate and store a pcap interface name from CLI or config sources.
+fn set_pcap_interface(args: &mut MonitorArgs, value: &str, source: &str) -> Result<(), String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{source} must be a non-empty interface name"));
+    }
+    args.pcap_interface = Some(trimmed.to_string());
+    Ok(())
+}
+/// Build pcap capture options from parsed monitor arguments.
+fn pcap_options_from_args(args: &MonitorArgs) -> pcap_capture::PcapOptions {
+    pcap_capture::PcapOptions {
+        interface: args.pcap_interface.clone(),
+    }
+}
+
 fn require_value<'a>(argv: &'a [String], index: usize, flag: &str) -> Result<&'a str, String> {
     argv.get(index)
         .map(|v| v.as_str())
@@ -2940,6 +2984,14 @@ fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> 
                     return Err("db_queue_max must be >= 1".to_string());
                 }
             }
+            "pcap_cache_max" => {
+                let n = parse_usize(value, "pcap_cache_max")?;
+                if n < PCAP_CACHE_MIN_ENTRIES {
+                    return Err("pcap_cache_max must be >= 100".to_string());
+                }
+                args.pcap_cache_max = Some(n);
+            }
+            "pcap_interface" => set_pcap_interface(args, value, "pcap_interface")?,
             "stats_interval_ms" => args.stats_interval_ms = parse_u64(value, "stats_interval_ms")?,
             "stats_width" => {
                 args.stats_width = parse_usize(value, "stats_width")?;
@@ -3241,6 +3293,8 @@ OPTIONS:\n\
   --summary-only            Suppress live events, show summary only\n\
   --domain-mode <mode>      auto|ptr|pcap (default: auto)\n\
   --pcap                    Force pcap mode (falls back with warning)\n\
+  --pcap-interface <name>   Capture interface for pcap mode (default: auto)\n\
+  --pcap-cache-max <n>      DNS/SNI cache cap, >= 100 (default: 10000)\n\
   --no-dns                  Disable PTR lookups\n\
   --include-udp             Include UDP sockets (default: true)\n\
   --no-udp                  Disable UDP sockets\n\
@@ -10570,5 +10624,74 @@ mod tests {
         assert!(!args.one_line);
         assert!(args.format.is_none());
         assert_eq!(args.sqlite_path, "observer.sqlite");
+    }
+
+    #[test]
+    fn pcap_cli_rejects_small_cache_max() {
+        let err = load_monitor_args(&["--pcap-cache-max".to_string(), "50".to_string()])
+            .expect_err("cache max below 100 must be rejected");
+        assert!(err.contains("--pcap-cache-max"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn pcap_cli_accepts_valid_knobs() {
+        let args = load_monitor_args(&[
+            "--pcap-cache-max".to_string(),
+            "250".to_string(),
+            "--pcap-interface".to_string(),
+            "lo".to_string(),
+        ])
+        .expect("valid pcap knobs must parse");
+        assert_eq!(args.pcap_cache_max, Some(250));
+        assert_eq!(args.pcap_interface.as_deref(), Some("lo"));
+    }
+
+    #[test]
+    fn pcap_cli_rejects_empty_interface() {
+        let err = load_monitor_args(&["--pcap-interface".to_string(), String::new()])
+            .expect_err("empty interface name must be rejected");
+        assert!(
+            err.contains("--pcap-interface must be a non-empty"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[cfg(feature = "pcap")]
+    #[test]
+    fn pcap_options_plumb_from_monitor_args() {
+        let args = load_monitor_args(&[
+            "--pcap-interface".to_string(),
+            "eth9".to_string(),
+            "--pcap-cache-max".to_string(),
+            "1000".to_string(),
+        ])
+        .expect("valid knobs must parse");
+        let opts = pcap_options_from_args(&args);
+        assert_eq!(opts.interface.as_deref(), Some("eth9"));
+
+        // Default stays None so the libpcap default device applies.
+        assert!(
+            pcap_options_from_args(&MonitorArgs::default())
+                .interface
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn pcap_cache_with_max_entries_respects_cap() {
+        let mut cache = pcap_capture::DomainCache::with_max_entries(120);
+        for i in 0..150u32 {
+            let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::from_bits(i));
+            cache.apply_msg(pcap_capture::PcapMsg::DnsMapping {
+                ip,
+                hostname: format!("host{i}.example.com"),
+            });
+        }
+        assert!(
+            cache
+                .lookup(std::net::IpAddr::V4(std::net::Ipv4Addr::from_bits(149)), 0)
+                .is_some(),
+            "newest entry survives pruning"
+        );
     }
 }
