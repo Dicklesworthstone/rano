@@ -1742,9 +1742,6 @@ fn main() {
                     .map(|d| d.as_millis() as u64)
                     .ok();
 
-                // Check if this close event would trigger a duration alert (for SQLite flag)
-                let triggers_alert = would_trigger_duration_alert(&args.alert, duration_ms);
-
                 let ts = now_rfc3339();
                 // Track retry pattern on close events
                 let retry_warning =
@@ -3969,11 +3966,11 @@ fn check_connection_alerts(
     json_mode: bool,
     style: OutputStyle,
 ) -> bool {
-    let trigger = match connection_alert_trigger(alert_config, info.domain.as_deref(), key.remote_ip)
-    {
-        Some(trigger) => trigger,
-        None => return false,
-    };
+    let trigger =
+        match connection_alert_trigger(alert_config, info.domain.as_deref(), key.remote_ip) {
+            Some(trigger) => trigger,
+            None => return false,
+        };
 
     match trigger {
         ConnectionAlertTrigger::DomainPattern { domain, pattern } => {
@@ -4060,7 +4057,9 @@ fn check_threshold_alerts(
     if let Some(threshold) = alert_config.max_per_provider {
         for (provider, count) in &stats.per_provider {
             if *count >= threshold {
-                let sig = AlertSignature::MaxPerProvider { provider: *provider };
+                let sig = AlertSignature::MaxPerProvider {
+                    provider: *provider,
+                };
                 if should_emit_alert(alert_state, &sig, alert_config.cooldown_ms) {
                     emit_alert(
                         &AlertKind::MaxPerProvider {
@@ -8426,7 +8425,7 @@ mod tests {
                 remote_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
                 remote_port: 443,
             },
-            pid: 1234,
+            pid: Some(1234),
             comm: "testproc".to_string(),
             cmdline: "/usr/bin/testproc".to_string(),
             provider,
@@ -8727,36 +8726,190 @@ mod tests {
     }
 
     #[test]
-    fn alert_would_trigger_connection_alert() {
+    fn alert_connection_alert_trigger_predicate() {
         let config = AlertConfig {
             domain_patterns: vec!["*.malicious.com".to_string()],
-            max_connections: None,
-            max_per_provider: None,
-            duration_threshold_ms: None,
             alert_unknown_domain: true,
-            bell: false,
-            cooldown_ms: 10000,
-            no_alerts: false,
+            ..AlertConfig::default()
         };
 
         let ip = std::net::IpAddr::V4(std::net::Ipv4Addr::new(1, 2, 3, 4));
 
-        // Domain pattern match should trigger
-        assert!(would_trigger_connection_alert(
-            &config,
-            Some("evil.malicious.com"),
-            ip
-        ));
+        // Domain pattern match should trigger with the matched pattern
+        match connection_alert_trigger(&config, Some("evil.malicious.com"), ip) {
+            Some(ConnectionAlertTrigger::DomainPattern { pattern, .. }) => {
+                assert_eq!(pattern, "*.malicious.com");
+            }
+            _ => panic!("expected DomainPattern trigger"),
+        }
 
         // Non-matching domain should not trigger
-        assert!(!would_trigger_connection_alert(
-            &config,
-            Some("safe.example.com"),
-            ip
-        ));
+        assert!(connection_alert_trigger(&config, Some("safe.example.com"), ip).is_none());
 
         // Unknown domain should trigger (when alert_unknown_domain is true)
-        assert!(would_trigger_connection_alert(&config, None, ip));
+        match connection_alert_trigger(&config, None, ip) {
+            Some(ConnectionAlertTrigger::UnknownDomain { remote_ip }) => {
+                assert_eq!(remote_ip, ip);
+            }
+            _ => panic!("expected UnknownDomain trigger"),
+        }
+    }
+
+    #[test]
+    fn alert_cooldown_suppresses_sqlite_flag_and_counts_suppression() {
+        let config = AlertConfig {
+            domain_patterns: vec!["*.malicious.com".to_string()],
+            cooldown_ms: 60_000,
+            ..AlertConfig::default()
+        };
+        let mut state = AlertState {
+            last_alert: HashMap::new(),
+            alert_count: 0,
+            suppressed_count: 0,
+        };
+        let key = ConnKey {
+            proto: Proto::Tcp,
+            local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
+            local_port: 40000,
+            remote_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
+            remote_port: 443,
+        };
+        let mk_info = || ConnInfo {
+            pid: 4242,
+            comm: "claude".to_string(),
+            cmdline: "claude".to_string(),
+            provider: Provider::Anthropic,
+            domain: Some("evil.malicious.com".to_string()),
+            ancestry: None,
+            ancestry_path: None,
+            opened_at: std::time::SystemTime::now(),
+            last_seen: std::time::SystemTime::now(),
+        };
+        let style = OutputStyle {
+            color: false,
+            theme: Theme::Mono,
+        };
+
+        // First occurrence emits and is flagged.
+        assert!(check_connection_alerts(
+            &config,
+            &mut state,
+            &key,
+            &mk_info(),
+            false,
+            style
+        ));
+        assert_eq!(state.alert_count, 1);
+        assert_eq!(state.suppressed_count, 0);
+
+        // Immediate repeat is cooldown-suppressed: no emission, no durable flag.
+        assert!(!check_connection_alerts(
+            &config,
+            &mut state,
+            &key,
+            &mk_info(),
+            false,
+            style
+        ));
+        assert_eq!(state.alert_count, 1);
+        assert_eq!(state.suppressed_count, 1);
+
+        // Durable rows mirror what the operator saw: exactly one flagged row.
+        let mk_row = |alert: bool| {
+            let mut ev = create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Anthropic);
+            ev.alert = alert;
+            ev.domain = Some("evil.malicious.com".to_string());
+            ev
+        };
+        let mut conn = setup_test_db();
+        write_sqlite_batch(&mut conn, &[mk_row(true), mk_row(false)]).expect("batch write failed");
+        let flagged: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events WHERE alert = 1", [], |row| {
+                row.get(0)
+            })
+            .expect("flagged count query failed");
+        assert_eq!(flagged, 1);
+        let unflagged: i64 = conn
+            .query_row("SELECT COUNT(*) FROM events WHERE alert = 0", [], |row| {
+                row.get(0)
+            })
+            .expect("unflagged count query failed");
+        assert_eq!(unflagged, 1);
+    }
+
+    #[test]
+    fn alert_threshold_breach_writes_queryable_synthesized_row() {
+        let config = AlertConfig {
+            max_connections: Some(1),
+            ..AlertConfig::default()
+        };
+        let mut state = AlertState {
+            last_alert: HashMap::new(),
+            alert_count: 0,
+            suppressed_count: 0,
+        };
+        let stats = Stats {
+            connects: 0,
+            closes: 0,
+            active: 5,
+            peak_active: 5,
+            sqlite_dropped: 0,
+            per_ip: BTreeMap::new(),
+            per_port: BTreeMap::new(),
+            per_domain: BTreeMap::new(),
+            per_pid: BTreeMap::new(),
+            per_comm: BTreeMap::new(),
+            per_provider: BTreeMap::new(),
+            per_provider_domains: BTreeMap::new(),
+            per_provider_ips: BTreeMap::new(),
+            duration_ms_total: 0,
+            duration_ms_max: 0,
+            duration_ms_samples: 0,
+        };
+        let style = OutputStyle {
+            color: false,
+            theme: Theme::Mono,
+        };
+
+        // Breach emits once and synthesizes a queryable alert row with NULL pid.
+        let rows = check_threshold_alerts(
+            &config,
+            &mut state,
+            &stats,
+            "run-x",
+            "2026-01-20T12:00:00Z",
+            false,
+            style,
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].event, "alert");
+        assert!(rows[0].alert);
+        assert_eq!(rows[0].pid, None);
+        assert_eq!(rows[0].provider.label(), "unknown");
+
+        // Immediate re-check is cooldown-suppressed: no extra rows.
+        let rows2 = check_threshold_alerts(
+            &config,
+            &mut state,
+            &stats,
+            "run-x",
+            "2026-01-20T12:00:01Z",
+            false,
+            style,
+        );
+        assert!(rows2.is_empty());
+        assert_eq!(state.suppressed_count, 1);
+
+        let mut conn = setup_test_db();
+        write_sqlite_batch(&mut conn, &rows).expect("synthetic alert insert failed");
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM events WHERE alert=1 AND event='alert' AND pid IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("synthetic alert query failed");
+        assert_eq!(n, 1);
     }
 
     #[test]

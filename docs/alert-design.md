@@ -452,3 +452,20 @@ glob = "0.3"         # For --alert-domain glob matching (OR use simple custom im
 ---
 
 *This design document addresses the deliverables specified in bd-1jj and provides the foundation for bd-291 (CLI flags) and bd-20u (implementation).*
+
+## As-Built: Cooldown-Aware Alert Flag (bead qpc, 2026-08)
+
+The separate `alerts` table sketched above was **not** implemented. Decision:
+alert determination moved to a single cooldown-aware decision point, and the
+durable record stays in `events` to preserve single-table queryability.
+
+- `check_connection_alerts` / `check_duration_alert` /
+  `check_threshold_alerts` consult `AlertState` cooldowns before emitting;
+  `events.alert=1` is written **only on EMIT**. Suppressed alerts increment
+  `suppressed_count` and leave the flag unset.
+- Threshold breaches (`max_connections`, `max_per_provider`) have no natural
+  connection row; each emitted breach synthesizes an `events` row with
+  `event='alert'`, `provider=<breaching provider|unknown>`, NULL `pid`,
+  zeroed endpoint columns, and `alert=1`.
+- The README workflow `SELECT * FROM events WHERE alert = 1` returns exactly
+  the emitted alerts across all kinds, 1:1 with what the operator saw.

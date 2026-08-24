@@ -425,14 +425,21 @@ In JSON mode, alerts are JSON objects on **stdout**, interleaved with connection
 
 ### SQLite Alert Tracking
 
-Events that trigger alerts are stored with `alert=1` in SQLite for later analysis:
+Rows are flagged with `alert=1` only when an alert actually **emitted** — repeats
+suppressed by `--alert-cooldown-ms` leave the flag unset, so SQL counts match what
+you saw on screen. Threshold alerts (`--alert-max-connections`,
+`--alert-max-per-provider`) have no natural connection row; each emitted breach
+writes a dedicated row with `event='alert'` and NULL `pid`:
 
 ```sql
--- Find all alert-triggering events
+-- Find all emitted alerts (connect/close flags plus threshold breaches)
 SELECT * FROM events WHERE alert = 1;
 
 -- Count alerts by domain
 SELECT domain, COUNT(*) as alerts FROM events WHERE alert = 1 GROUP BY domain;
+
+-- Threshold breaches land as their own event kind
+SELECT ts, provider FROM events WHERE event = 'alert';
 ```
 
 ### Use Cases
