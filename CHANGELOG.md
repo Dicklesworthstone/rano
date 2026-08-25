@@ -13,7 +13,33 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Commits on `main` after the v0.1.0 release (2026-03-19).
+## [v0.2.0] -- 2026-08-25 (GitHub Release)
+
+115 commits since v0.1.0 (2026-03-19). The headline is the completion of the rano v2 epic —
+connection alerting, pcap capture, and a substantially reworked CLI — alongside the removal
+of the vestigial Windows build.
+
+**Platform support is now stated plainly: Linux and macOS only.** Windows was already
+unsupported in practice (rano reads Linux-only `/proc` and Unix libc APIs) and the dead
+`self_update_windows` code and stale install-path references are gone. This release ships
+exactly the four targets `install.sh` can request — `x86_64-unknown-linux-gnu`,
+`aarch64-unknown-linux-gnu`, `x86_64-apple-darwin`, `aarch64-apple-darwin` — and, unlike
+v0.1.0, does **not** ship `install.ps1`, which advertised a Windows artifact that never
+existed (see #42).
+
+Both Linux binaries are built with a pinned glibc floor (2.28) rather than inheriting the
+build host's, so they run on Debian 12, Ubuntu 22.04, RHEL 9 and Amazon Linux 2023 as well
+as current distributions.
+
+### Fixed (release gate)
+
+- Three call sites in `alert_would_trigger_connection_alert` still referenced the
+  pre-rename boolean helper; they now call `connection_alert_trigger(..).is_some()` /
+  `.is_none()`, which preserves the assertions exactly.
+- A `SqliteEvent` test fixture passed a bare integer after `pid` became `Option<u32>`.
+- Removed a dead `triggers_alert` binding superseded by `close_alert_emitted`, which is
+  the cooldown-aware single decision point for duration alerts.
+
 
 ### Removed
 

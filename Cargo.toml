@@ -1,6 +1,6 @@
 [package]
 name = "rano"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "rano (short for rust_agent_network_observer): AI CLI network observer"
 
