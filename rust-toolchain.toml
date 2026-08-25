@@ -1,3 +1,20 @@
+# Pinned by date, deliberately — do not revert this to a bare `channel = "nightly"`.
+#
+# A floating nightly means an upstream rustc regression lands here with no warning and no
+# reproducible build. That is not hypothetical across this workspace: during the 2026-08-24
+# release sweep, rustc 1.100.0-nightly (c54751567, 2026-08-22) produced an ICE
+# ("unexpected rigid alias in layout_of after normalization") in two sibling repos, and
+# `cargo clippy --fix` ICE'd with the same signature in two more. The failures present as
+# code defects, which is what makes them expensive — the first instinct is to rewrite
+# correct source to satisfy a compiler that will be different tomorrow.
+#
+# The ICE only surfaces on async-heavy code, so a repo compiling cleanly today is not
+# evidence that it is safe on a floating channel; it is evidence that it got lucky.
+#
+# nightly-2026-08-20 is the known-good date used across the workspace (beads_rust,
+# franken_markdown, fastmcp_rust, charmed_rust, sqlmodel_rust, rich_rust and others).
+# If you need to move it, move it deliberately and re-run the full gate.
+
 [toolchain]
-channel = "nightly"
+channel = "nightly-2026-08-20"
 components = ["rustfmt", "clippy"]
