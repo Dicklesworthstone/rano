@@ -74,6 +74,7 @@ else:
     while time.time() < deadline:
         c = socket.socket()
         c.connect(("127.0.0.1", port))
+        socks.append(c)
         if len(socks) > 64:
             old = socks.pop(0)
             try:
@@ -88,8 +89,8 @@ PY
 
 start_holder() {
   local mode=$1 count=$2 port=$3 duration=$4
-  python3 "${TMPDIR_BENCH}/holder.py" "${mode}" "${count}" "${port}" "${duration}" &
-  echo $!
+  python3 "${TMPDIR_BENCH}/holder.py" "${mode}" "${count}" "${port}" "${duration}" >/dev/null 2>&1 &
+  HOLDER=$!
 }
 
 echo "| Metric | Value |"
@@ -97,7 +98,7 @@ echo "|--------|-------|"
 
 for CONNS in 500 2000; do
   PORT=$((PORT_BASE + CONNS % 97))
-  HOLDER=$(start_holder hold "${CONNS}" "${PORT}" 120)
+  start_holder hold "${CONNS}" "${PORT}" 120
   sleep 1.5   # let all connections establish
 
   # Warm-up
@@ -119,13 +120,16 @@ done
 for BATCH in 200 1000; do
   PORT=$((PORT_BASE + BATCH % 89 + 7))
   DB="${TMPDIR_BENCH}/bench-${BATCH}.sqlite"
-  HOLDER=$(start_holder churn 32 "${PORT}" "${CHURN_SECS}")
+  start_holder churn 32 "${PORT}" "${CHURN_SECS}"
   sleep 0.3
   START_NS=$(date +%s%N)
   "${RANO}" --pid "${HOLDER}" --no-descendants --interval-ms 20 \
     --db-batch-size "${BATCH}" --sqlite "${DB}" --no-banner --json \
-    --stats-interval-ms 0 > "${TMPDIR_BENCH}/out-${BATCH}.jsonl" 2>&1 || true
+    --stats-interval-ms 0 > "${TMPDIR_BENCH}/out-${BATCH}.jsonl" 2>&1 &
+  RANO_PID=$!
   wait "${HOLDER}" 2>/dev/null || true
+  kill -INT "${RANO_PID}" 2>/dev/null || true
+  wait "${RANO_PID}" 2>/dev/null || true
   END_NS=$(date +%s%N)
 
   ELAPSED_MS=$(( (END_NS - START_NS) / 1000000 ))

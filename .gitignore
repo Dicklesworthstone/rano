@@ -18,3 +18,7 @@ logs/
 # br transient write/sync locks
 .beads/*.lock
 .beads/.*.lock
+
+# SQLite database
+/observer.sqlite
+
