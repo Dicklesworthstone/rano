@@ -11,10 +11,10 @@
 # The ICE only surfaces on async-heavy code, so a repo compiling cleanly today is not
 # evidence that it is safe on a floating channel; it is evidence that it got lucky.
 #
-# nightly-2026-08-20 is the known-good date used across the workspace (beads_rust,
+# nightly-2026-08-25 is the known-good date used across the workspace (beads_rust,
 # franken_markdown, fastmcp_rust, charmed_rust, sqlmodel_rust, rich_rust and others).
 # If you need to move it, move it deliberately and re-run the full gate.
 
 [toolchain]
-channel = "nightly-2026-08-20"
+channel = "nightly-2026-08-25"
 components = ["rustfmt", "clippy"]
