@@ -16,5 +16,5 @@
 # If you need to move it, move it deliberately and re-run the full gate.
 
 [toolchain]
-channel = "nightly-2026-08-25"
+channel = "nightly-2026-08-31"
 components = ["rustfmt", "clippy"]
