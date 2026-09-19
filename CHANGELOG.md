@@ -13,6 +13,36 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [v0.2.1] -- 2026-09-19
+
+Maintenance release. **No functional change to rano itself** — `git diff v0.2.0..HEAD -- src/`
+is empty, so every line of program source is identical to v0.2.0. What this release
+carries is one installer fix and a dependency refresh.
+
+### Fixed
+
+- `install.sh` fell back to installing **v0.1.0** when it could not resolve the
+  latest release. Both resolution paths (the GitHub releases API, then the
+  `releases/latest` redirect) can fail on a rate limit or a transient API error,
+  and the last-resort constant had not been updated since v0.1.0 shipped in March.
+  A user hitting that path silently received a six-month-old binary with only a
+  warning. The fallback now matches the release it ships with.
+
+### Changed
+
+- Dependencies refreshed to current within their existing semver ranges:
+  `libc` 0.2.186 → 0.2.189, `pcap` 2.4 → 2.5.0, `rusqlite` 0.40 → 0.40.2,
+  `serde` 1.0.228 → 1.0.229, `toml` 1.1.2 → 1.1.6, `tempfile` → 3.27.0.
+  No manifest constraint needed widening.
+- Toolchain pinned to a dated nightly (`nightly-2026-08-31`) rather than a
+  floating channel, so the compiler cannot move under the repo between builds.
+- CI actions bumped (`actions/checkout` v7, `upload-artifact` v7); a stray tracked
+  `observer.sqlite` was removed from the repository and ignored; the bench harness
+  in `scripts/bench.sh` was corrected.
+
+Gate at `14de4c7c`: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings`
+clean, `cargo test` 197 tests with zero failures.
+
 ## [v0.2.0] -- 2026-08-25 (GitHub Release)
 
 115 commits since v0.1.0 (2026-03-19). The headline is the completion of the rano v2 epic —
