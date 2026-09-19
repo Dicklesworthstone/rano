@@ -3,6 +3,17 @@ name = "rano"
 version = "0.2.1"
 edition = "2024"
 description = "rano (short for rust_agent_network_observer): AI CLI network observer"
+license = "MIT"
+repository = "https://github.com/Dicklesworthstone/rano"
+
+# NOT publishable to crates.io: the name `rano` is already owned by an unrelated
+# crate -- "An Assembler and Emulator for the Mano Machine",
+# github.com/oldwomanjosiah/rano, owner `oldwomanjosiah`, first published
+# 2021-03-30, coincidentally also at version 0.2.0. This repo distributes via
+# GitHub release binaries instead. Setting publish = false so nobody can
+# accidentally attempt to push this crate into a stranger's namespace. If rano
+# should be on crates.io, it needs a different crate name first.
+publish = false
 
 [features]
 default = []
