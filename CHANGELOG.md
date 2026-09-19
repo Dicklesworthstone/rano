@@ -13,7 +13,16 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [v0.2.1] -- 2026-09-19
+## [v0.2.1] -- PREPARED, NOT YET RELEASED
+
+> **There is no `v0.2.1` tag and no GitHub release.** The version in `Cargo.toml`
+> is `0.2.1` and this entry is written, but the release itself has not been cut:
+> rano has no `dsr` build recipe (`repos.d/rano.yaml` does not exist), and dsr is
+> the release authority for this fleet. Cutting a tag without the accompanying
+> release would produce a tag pointing at no artifacts, so neither was done.
+> Gate at `82ce51f`: fmt clean, clippy clean, 197 tests, zero failures.
+> To finish: author `repos.d/rano.yaml`, build the platforms v0.2.0 shipped
+> (darwin arm64 + x86_64, linux arm64 + amd64), then tag and release together.
 
 Maintenance release. **No functional change to rano itself** — `git diff v0.2.0..HEAD -- src/`
 is empty, so every line of program source is identical to v0.2.0. What this release
