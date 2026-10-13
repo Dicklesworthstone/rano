@@ -10,14 +10,13 @@ set -euo pipefail
 
 TMP_DIR=$(mktemp -d)
 cleanup() {
-  rm -rf "${TMP_DIR}"
+  e2e_info "Retained diff fixtures: ${TMP_DIR}"
 }
 trap cleanup EXIT
 
 RANO_BIN="${RANO_BIN:-${E2E_RANO_RELEASE}}"
 if [ ! -x "${RANO_BIN}" ]; then
-  e2e_section "Building rano"
-  cargo build --release --quiet
+  e2e_fail "Compiled rano binary not found: ${RANO_BIN}"
 fi
 
 SQLITE_PATH="${TMP_DIR}/test-diff.sqlite"
@@ -146,4 +145,5 @@ e2e_run "rano diff missing session" \
 set -e
 
 e2e_assert_last_status 1
-e2e_assert_last_contains "No events found for session 'missing-session'"
+e2e_assert_last_contains "Session 'missing-session' not found"
+e2e_assert_last_contains "stored run ID or an unambiguous session name"

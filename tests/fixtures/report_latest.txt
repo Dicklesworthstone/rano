@@ -13,7 +13,7 @@ Session
 
 Summary
   Events:  5 total (3 connects, 2 closes)
-  Active:  1 connections
+  Observed connect-close balance: 1 (filtered history)
 
 Providers
   Provider   Events  Connects  Closes

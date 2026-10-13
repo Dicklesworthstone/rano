@@ -9,7 +9,7 @@
 #![allow(clippy::manual_map)]
 #![allow(clippy::needless_borrow)]
 
-use rusqlite::{Connection, params};
+use rusqlite::{Connection, OptionalExtension, params};
 use serde::Deserialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
@@ -1093,6 +1093,7 @@ struct RunContext {
     interval_ms: u64,
     stats_interval_ms: u64,
     session_name: String,
+    observer: Option<ProcessIdentity>,
 }
 
 impl RunContext {
@@ -1146,6 +1147,7 @@ impl RunContext {
             interval_ms: args.interval_ms,
             stats_interval_ms: args.stats_interval_ms,
             session_name,
+            observer: read_proc_stat(std::process::id()).map(|stat| stat.identity),
         }
     }
 }
@@ -1515,11 +1517,19 @@ struct SqliteEvent {
 
 enum SqliteMsg {
     Event(SqliteEvent),
+    Poll(SessionPoll),
     Shutdown {
         run_id: String,
         connects: u64,
         closes: u64,
     },
+}
+
+struct SessionPoll {
+    run_id: String,
+    ts: String,
+    active: u64,
+    valid: bool,
 }
 
 struct DropState {
@@ -1533,6 +1543,7 @@ struct SqliteOutcome {
     persisted: u64,
     queue_lost: u64,
     write_lost: u64,
+    metadata_lost: u64,
     failed: bool,
     error: Option<String>,
 }
@@ -1543,6 +1554,7 @@ struct SqliteCounters {
     persisted: AtomicU64,
     queue_lost: AtomicU64,
     write_lost: AtomicU64,
+    metadata_lost: AtomicU64,
     failed: AtomicBool,
     error: Mutex<Option<String>>,
 }
@@ -1576,6 +1588,7 @@ impl SqliteCounters {
         let observed = self.observed.load(Ordering::Relaxed);
         let persisted = self.persisted.load(Ordering::Relaxed);
         let queue_lost = self.queue_lost.load(Ordering::Relaxed);
+        let metadata_lost = self.metadata_lost.load(Ordering::Relaxed);
         // A panicked/disconnected writer may leave accepted events in its queue.
         let write_lost = self.write_lost.load(Ordering::Relaxed).max(
             observed
@@ -1587,7 +1600,11 @@ impl SqliteCounters {
             persisted,
             queue_lost,
             write_lost,
-            failed: self.failed.load(Ordering::Relaxed) || queue_lost > 0 || write_lost > 0,
+            metadata_lost,
+            failed: self.failed.load(Ordering::Relaxed)
+                || queue_lost > 0
+                || write_lost > 0
+                || metadata_lost > 0,
             error: self
                 .error
                 .lock()
@@ -1606,6 +1623,22 @@ struct SqliteWriter {
 }
 
 impl SqliteWriter {
+    fn publish_poll(&self, run_id: &str, active: u64, valid: bool, observed_at: SystemTime) {
+        let poll = SessionPoll {
+            run_id: run_id.to_string(),
+            ts: system_time_to_rfc3339(observed_at),
+            active,
+            valid: valid && !self.counters.failed.load(Ordering::Relaxed),
+        };
+        if let Err(error) = self.sender.try_send(SqliteMsg::Poll(poll)) {
+            self.counters.metadata_lost.fetch_add(1, Ordering::Relaxed);
+            self.counters.failure(
+                format!("sqlite poll-state publication failed: {}", error),
+                self.log_writer.as_ref(),
+            );
+        }
+    }
+
     fn enqueue(&self, event: SqliteEvent) {
         self.counters.observed.fetch_add(1, Ordering::Relaxed);
         match self.sender.try_send(SqliteMsg::Event(event)) {
@@ -2033,6 +2066,7 @@ fn main() {
             handle.drain_into(cache);
         }
 
+        let poll_started = SystemTime::now();
         let snapshot = collect_process_snapshot(&provider_matcher);
         ancestry_cache.retain_live(&snapshot);
         let excluded = excluded_processes(&args.exclude_patterns, &snapshot);
@@ -2431,6 +2465,15 @@ fn main() {
             for row in threshold_rows {
                 writer.enqueue(row);
             }
+        }
+
+        if let Some(writer) = &sqlite_writer {
+            writer.publish_poll(
+                &run_ctx.run_id,
+                stats.active,
+                stats.observation_errors == 0,
+                poll_started,
+            );
         }
 
         if args.stats_interval_ms > 0 && !args.json {
@@ -3326,8 +3369,8 @@ fn parse_diff_args(argv: &[String]) -> Result<DiffArgs, String> {
                 args.threshold_pct = value
                     .parse::<f64>()
                     .map_err(|_| "Invalid --threshold value".to_string())?;
-                if args.threshold_pct < 0.0 || args.threshold_pct > 100.0 {
-                    return Err("--threshold must be between 0 and 100".to_string());
+                if !args.threshold_pct.is_finite() || !(0.0..=100.0).contains(&args.threshold_pct) {
+                    return Err("--threshold must be finite and between 0 and 100".to_string());
                 }
                 i += 1;
             }
@@ -4127,11 +4170,12 @@ OPTIONS:\n\
   -h, --help        Show this help\n\
   -V, --version     Show version\n\n\
 TEMPLATE VARIABLES:\n\
-  {{active}}        Current active connection count\n\
-  {{total}}         Total connections this session\n\
-  {{anthropic}}     Anthropic provider connection count\n\
-  {{openai}}        OpenAI provider connection count\n\
-  {{google}}        Google provider connection count\n\
+  {{active}}        Fresh observed endpoint count (zero when unavailable)\n\
+  {{state}}         fresh/ended/stale/degraded/unverified/unavailable\n\
+  {{total}}         Historical connection observations this session\n\
+  {{anthropic}}     Historical Anthropic connection observations\n\
+  {{openai}}        Historical OpenAI connection observations\n\
+  {{google}}        Historical Google connection observations\n\
   {{session_name}}  Current session name (if available)\n\n\
 DEFAULT FORMAT:\n\
   {}\n\n\
@@ -5207,7 +5251,7 @@ fn summary(
         writer.write_record(
             &format_json_summary(stats, domain_mode, alert_count, suppressed_count),
             &format!(
-                "summary connects={} closes={} active={} peak_active={} sqlite_dropped={} alerts={} suppressed={} sqlite_observed={} sqlite_persisted={} sqlite_queue_lost={} sqlite_write_lost={} sqlite_failed={} log_failed={} listens={} binds={} observation_errors={} socket_active={} socket_closes={}",
+                "summary connects={} closes={} active={} peak_active={} sqlite_dropped={} alerts={} suppressed={} sqlite_observed={} sqlite_persisted={} sqlite_queue_lost={} sqlite_write_lost={} sqlite_metadata_lost={} sqlite_failed={} log_failed={} listens={} binds={} observation_errors={} socket_active={} socket_closes={}",
                 stats.connects,
                 stats.closes,
                 stats.active,
@@ -5217,6 +5261,7 @@ fn summary(
                 suppressed_count,
                 stats.sqlite_outcome.observed, stats.sqlite_outcome.persisted,
                 stats.sqlite_outcome.queue_lost, stats.sqlite_outcome.write_lost,
+                stats.sqlite_outcome.metadata_lost,
                 stats.sqlite_outcome.failed, stats.log_failed, stats.listens, stats.binds, stats.observation_errors, stats.socket_active, stats.socket_closes
             ),
         );
@@ -5306,11 +5351,12 @@ fn summary(
     }
     if stats.sqlite_enabled {
         println!(
-            "  sqlite observed={} persisted={} queue_lost={} write_lost={} failed={}",
+            "  sqlite observed={} persisted={} queue_lost={} write_lost={} metadata_lost={} failed={}",
             stats.sqlite_outcome.observed,
             stats.sqlite_outcome.persisted,
             stats.sqlite_outcome.queue_lost,
             stats.sqlite_outcome.write_lost,
+            stats.sqlite_outcome.metadata_lost,
             stats.sqlite_outcome.failed
         );
     }
@@ -5450,9 +5496,9 @@ fn format_json_summary(
         false,
     );
     out.push_str(",\"sqlite\":{");
-    out.push_str(&format!("\"enabled\":{},\"observed\":{},\"persisted\":{},\"queue_lost\":{},\"write_lost\":{},\"failed\":{}",
+    out.push_str(&format!("\"enabled\":{},\"observed\":{},\"persisted\":{},\"queue_lost\":{},\"write_lost\":{},\"metadata_lost\":{},\"failed\":{}",
         stats.sqlite_enabled, stats.sqlite_outcome.observed, stats.sqlite_outcome.persisted,
-        stats.sqlite_outcome.queue_lost, stats.sqlite_outcome.write_lost, stats.sqlite_outcome.failed));
+        stats.sqlite_outcome.queue_lost, stats.sqlite_outcome.write_lost, stats.sqlite_outcome.metadata_lost, stats.sqlite_outcome.failed));
     if let Some(error) = &stats.sqlite_outcome.error {
         push_json_str(&mut out, "error", error, false);
     }
@@ -5823,6 +5869,12 @@ fn sqlite_writer_loop(
             Ok(SqliteMsg::Event(event)) => {
                 batch.push(event);
             }
+            Ok(SqliteMsg::Poll(poll)) => {
+                flush_sqlite_batch(&mut conn, &batch, &counters, log_writer.as_ref());
+                batch.clear();
+                publish_session_poll(&mut conn, &poll, &counters, log_writer.as_ref());
+                last_flush = SystemTime::now();
+            }
             Ok(SqliteMsg::Shutdown {
                 run_id,
                 connects,
@@ -5851,6 +5903,11 @@ fn sqlite_writer_loop(
     while let Ok(msg) = receiver.try_recv() {
         match msg {
             SqliteMsg::Event(event) => batch.push(event),
+            SqliteMsg::Poll(poll) => {
+                flush_sqlite_batch(&mut conn, &batch, &counters, log_writer.as_ref());
+                batch.clear();
+                publish_session_poll(&mut conn, &poll, &counters, log_writer.as_ref());
+            }
             SqliteMsg::Shutdown {
                 run_id,
                 connects,
@@ -5871,6 +5928,50 @@ fn sqlite_writer_loop(
             );
         }
     }
+}
+
+fn publish_session_poll(
+    conn: &mut Connection,
+    poll: &SessionPoll,
+    counters: &SqliteCounters,
+    log_writer: Option<&Arc<LogWriter>>,
+) {
+    let mut failure = None;
+    for attempt in 0..3 {
+        let result = conn.execute(
+            "UPDATE sessions SET last_poll_ts=?1, active_at_poll=?2, poll_valid=?3 WHERE run_id=?4",
+            params![
+                poll.ts,
+                poll.active as i64,
+                poll.valid && !counters.failed.load(Ordering::Relaxed),
+                poll.run_id
+            ],
+        );
+        match result {
+            Ok(1) => return,
+            Ok(_) => {
+                failure =
+                    Some("monitoring session missing during poll-state publication".to_string());
+                break;
+            }
+            Err(error) => {
+                let retryable = matches!(&error, rusqlite::Error::SqliteFailure(code, _) if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked));
+                failure = Some(error.to_string());
+                if !retryable || attempt == 2 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25 * (attempt + 1)));
+            }
+        }
+    }
+    counters.metadata_lost.fetch_add(1, Ordering::Relaxed);
+    counters.failure(
+        format!(
+            "sqlite poll-state write failed: {}",
+            failure.unwrap_or_else(|| "unknown failure".to_string())
+        ),
+        log_writer,
+    );
 }
 
 fn flush_sqlite_batch(
@@ -6369,6 +6470,12 @@ fn map_inodes(targets: &HashSet<u32>, snapshot: &ProcessSnapshot) -> InodeScan {
         let Some(stat) = snapshot.stat.get(pid) else {
             continue;
         };
+        if read_proc_stat(*pid).as_ref() != Some(stat) {
+            if Path::new(&format!("/proc/{}", pid)).exists() {
+                errors.push((*pid, format!("PID {} identity/topology changed or became unreadable before fd scan; poll snapshot rejected", pid)));
+            }
+            continue;
+        }
         match (
             own_namespace.as_ref(),
             fs::read_link(format!("/proc/{}/ns/net", pid)),
@@ -6413,6 +6520,7 @@ fn map_inodes(targets: &HashSet<u32>, snapshot: &ProcessSnapshot) -> InodeScan {
                 continue;
             }
         };
+        let mut process_inodes = Vec::new();
         for entry in entries {
             let entry = match entry {
                 Ok(entry) => entry,
@@ -6424,7 +6532,7 @@ fn map_inodes(targets: &HashSet<u32>, snapshot: &ProcessSnapshot) -> InodeScan {
             match fs::read_link(entry.path()) {
                 Ok(link) => {
                     if let Some(inode) = parse_socket_inode(&link.to_string_lossy()) {
-                        map.entry(inode).or_default().push(stat.identity);
+                        process_inodes.push(inode);
                     }
                 }
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {}
@@ -6433,6 +6541,15 @@ fn map_inodes(targets: &HashSet<u32>, snapshot: &ProcessSnapshot) -> InodeScan {
                     format!("cannot inspect {}: {}", entry.path().display(), error),
                 )),
             }
+        }
+        if read_proc_stat(*pid).as_ref() != Some(stat) {
+            if Path::new(&format!("/proc/{}", pid)).exists() {
+                errors.push((*pid, format!("PID {} identity/topology changed or became unreadable during fd scan; socket ownership rejected", pid)));
+            }
+            continue;
+        }
+        for inode in process_inodes {
+            map.entry(inode).or_default().push(stat.identity);
         }
     }
     canonicalize_inode_owners(&mut map);
@@ -7006,7 +7123,8 @@ fn run_export(args: ExportArgs) -> Result<(), String> {
     }
 
     let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
-    set_busy_timeout(&conn);
+    configure_query_connection(&conn)
+        .map_err(|error| format!("Failed to configure SQLite queries: {}", error))?;
     // Late-added columns: migrate idempotently so exports from older
     // databases still prepare their default-field SELECT.
     let mut conn = conn;
@@ -7032,12 +7150,17 @@ fn run_export(args: ExportArgs) -> Result<(), String> {
 
     let since = parse_time_filter(&args.since)?;
     let until = parse_time_filter(&args.until)?;
+    validate_time_range(&since, &until)?;
 
     let providers = normalize_providers(&args.providers)?;
     let domain_patterns = normalize_domain_patterns(&args.domain_patterns)?;
 
     let filter = ExportFilter {
-        run_id: args.run_id.clone(),
+        run_id: args
+            .run_id
+            .as_ref()
+            .map(|reference| resolve_session_reference(&conn, reference))
+            .transpose()?,
         since,
         until,
         providers,
@@ -7258,11 +7381,11 @@ fn build_export_query(filter: &ExportFilter, fields: &[String]) -> (String, Vec<
         params.push(run_id.clone());
     }
     if let Some(ref since) = filter.since {
-        sql.push_str(" AND ts >= ?");
+        sql.push_str(" AND rano_utc(ts) >= rano_utc(?)");
         params.push(since.clone());
     }
     if let Some(ref until) = filter.until {
-        sql.push_str(" AND ts < ?");
+        sql.push_str(" AND rano_utc(ts) < rano_utc(?)");
         params.push(until.clone());
     }
 
@@ -7287,7 +7410,7 @@ fn build_export_query(filter: &ExportFilter, fields: &[String]) -> (String, Vec<
         }
     }
 
-    sql.push_str(" ORDER BY ts ASC");
+    sql.push_str(" ORDER BY rano_utc(ts) ASC, id ASC");
     (sql, params)
 }
 
@@ -7328,7 +7451,8 @@ fn run_diff(args: DiffArgs) -> Result<(), String> {
     }
 
     let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
-    set_busy_timeout(&conn);
+    configure_query_connection(&conn)
+        .map_err(|error| format!("Failed to configure SQLite queries: {}", error))?;
 
     let has_events = table_exists(&conn, "events")?;
     if !has_events {
@@ -7359,27 +7483,29 @@ fn compute_session_diff(
     new_id: &str,
     threshold_pct: f64,
 ) -> Result<DiffResult, String> {
-    // Validate that both sessions exist
-    validate_session_exists(conn, old_id)?;
-    validate_session_exists(conn, new_id)?;
+    if !threshold_pct.is_finite() || !(0.0..=100.0).contains(&threshold_pct) {
+        return Err("diff threshold must be finite and between 0 and 100".to_string());
+    }
+    let old_id = resolve_session_reference(conn, old_id)?;
+    let new_id = resolve_session_reference(conn, new_id)?;
 
     // Get domain counts for each session
-    let old_domains = get_session_domain_counts(conn, old_id)?;
-    let new_domains = get_session_domain_counts(conn, new_id)?;
+    let old_domains = get_session_domain_counts(conn, &old_id)?;
+    let new_domains = get_session_domain_counts(conn, &new_id)?;
 
     // Get process names for each session
-    let old_processes = get_session_processes(conn, old_id)?;
-    let new_processes = get_session_processes(conn, new_id)?;
+    let old_processes = get_session_processes(conn, &old_id)?;
+    let new_processes = get_session_processes(conn, &new_id)?;
 
     // Get provider counts for each session
-    let old_providers = get_session_provider_counts(conn, old_id)?;
-    let new_providers = get_session_provider_counts(conn, new_id)?;
+    let old_providers = get_session_provider_counts(conn, &old_id)?;
+    let new_providers = get_session_provider_counts(conn, &new_id)?;
 
     // Compute domain diffs
     let old_domain_set: HashSet<&String> = old_domains.keys().collect();
     let new_domain_set: HashSet<&String> = new_domains.keys().collect();
 
-    let added_domains: Vec<String> = new_domain_set
+    let mut added_domains: Vec<String> = new_domain_set
         .difference(&old_domain_set)
         .filter_map(|d| {
             // Filter out empty/null domains
@@ -7391,7 +7517,7 @@ fn compute_session_diff(
         })
         .collect();
 
-    let removed_domains: Vec<String> = old_domain_set
+    let mut removed_domains: Vec<String> = old_domain_set
         .difference(&new_domain_set)
         .filter_map(|d| {
             if d.is_empty() || *d == "unknown" {
@@ -7410,7 +7536,7 @@ fn compute_session_diff(
         if old_count > 0 {
             let change_pct =
                 ((new_count as f64 - old_count as f64) / old_count as f64).abs() * 100.0;
-            if change_pct >= threshold_pct {
+            if old_count != new_count && change_pct >= threshold_pct {
                 changed_domains.push(((*domain).clone(), old_count, new_count));
             }
         } else if new_count > 0 {
@@ -7421,13 +7547,18 @@ fn compute_session_diff(
     changed_domains.sort_by(|a, b| {
         let a_diff = (a.2 - a.1).abs();
         let b_diff = (b.2 - b.1).abs();
-        b_diff.cmp(&a_diff)
+        b_diff.cmp(&a_diff).then_with(|| a.0.cmp(&b.0))
     });
 
     // Compute process diffs
-    let added_processes: Vec<String> = new_processes.difference(&old_processes).cloned().collect();
-    let removed_processes: Vec<String> =
+    let mut added_processes: Vec<String> =
+        new_processes.difference(&old_processes).cloned().collect();
+    let mut removed_processes: Vec<String> =
         old_processes.difference(&new_processes).cloned().collect();
+    added_domains.sort();
+    removed_domains.sort();
+    added_processes.sort();
+    removed_processes.sort();
 
     // Compute provider changes
     let mut provider_changes: HashMap<String, (i64, i64)> = HashMap::new();
@@ -7453,20 +7584,56 @@ fn compute_session_diff(
     })
 }
 
-fn validate_session_exists(conn: &Connection, run_id: &str) -> Result<(), String> {
-    // Try to find events for this run_id
-    let sql = "SELECT COUNT(*) FROM events WHERE run_id = ?";
-    let count: i64 = conn
-        .query_row(sql, [run_id], |row| row.get(0))
-        .map_err(|e| format!("Failed to query session '{}': {}", run_id, e))?;
-
-    if count == 0 {
-        return Err(format!(
-            "No events found for session '{}'. Use 'rano report --latest' to see available sessions.",
-            run_id
-        ));
+fn resolve_session_reference(conn: &Connection, reference: &str) -> Result<String, String> {
+    let has_sessions = table_exists(conn, "sessions")?;
+    if has_sessions {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sessions WHERE run_id=?)",
+                [reference],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to query session metadata: {}", error))?;
+        if exists {
+            return Ok(reference.to_string());
+        }
     }
-    Ok(())
+    if table_exists(conn, "events")? {
+        let exists: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE run_id=?)",
+                [reference],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("Failed to query session events: {}", error))?;
+        if exists {
+            return Ok(reference.to_string());
+        }
+    }
+    if has_sessions && column_exists(conn, "sessions", "session_name")? {
+        let mut stmt = conn
+            .prepare("SELECT run_id FROM sessions WHERE session_name=? ORDER BY run_id LIMIT 2")
+            .map_err(|error| format!("Failed to prepare session-name query: {}", error))?;
+        let matches: Vec<String> = stmt
+            .query_map([reference], |row| row.get(0))
+            .map_err(|error| format!("Failed to query session names: {}", error))?
+            .collect::<rusqlite::Result<_>>()
+            .map_err(|error| format!("Failed to read session names: {}", error))?;
+        match matches.as_slice() {
+            [id] => return Ok(id.clone()),
+            [first, second] => {
+                return Err(format!(
+                    "Ambiguous session name '{}': at least '{}' and '{}' match; use an exact run ID",
+                    reference, first, second
+                ));
+            }
+            _ => {}
+        }
+    }
+    Err(format!(
+        "Session '{}' not found; use a stored run ID or an unambiguous session name",
+        reference
+    ))
 }
 
 fn get_session_domain_counts(
@@ -7778,6 +7945,7 @@ struct StatusData {
     openai: i64,
     google: i64,
     session_name: Option<String>,
+    state: Option<&'static str>,
 }
 
 fn run_status(args: StatusArgs) -> Result<(), String> {
@@ -7793,7 +7961,8 @@ fn run_status(args: StatusArgs) -> Result<(), String> {
     }
 
     let conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
-    set_busy_timeout(&conn);
+    configure_query_connection(&conn)
+        .map_err(|error| format!("Failed to configure SQLite queries: {}", error))?;
 
     // Check if events table exists
     let has_events = table_exists(&conn, "events")?;
@@ -7818,18 +7987,15 @@ fn run_status(args: StatusArgs) -> Result<(), String> {
 
 /// Query SQLite for the latest session's status data.
 fn get_status_data(conn: &Connection) -> Result<StatusData, String> {
+    // Counts, name and published activity must come from one SQLite snapshot
+    // while the monitor continues committing new events and poll metadata.
+    let snapshot = conn
+        .unchecked_transaction()
+        .map_err(|error| format!("Failed to begin status read snapshot: {}", error))?;
+    let conn: &Connection = &snapshot;
     let mut data = StatusData::default();
 
-    // Get the latest run_id
-    let latest_run_id: Option<String> = conn
-        .query_row(
-            "SELECT run_id FROM events ORDER BY ts DESC LIMIT 1",
-            [],
-            |row| row.get(0),
-        )
-        .ok();
-
-    let run_id = match latest_run_id {
+    let run_id = match find_latest_session(conn)? {
         Some(id) => id,
         None => return Ok(data), // No events yet
     };
@@ -7841,63 +8007,147 @@ fn get_status_data(conn: &Connection) -> Result<StatusData, String> {
             [&run_id],
             |row| row.get(0),
         )
-        .unwrap_or(0);
+        .map_err(|error| format!("Failed to query historical status total: {}", error))?;
     data.total = total;
 
-    // Active sampled socket episodes include explicitly requested listeners/bound UDP.
-    let connects: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM events WHERE run_id = ? AND event IN ('connect', 'listen', 'bind')",
-            [&run_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    let closes: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM events WHERE run_id = ? AND event = 'close'",
-            [&run_id],
-            |row| row.get(0),
-        )
-        .unwrap_or(0);
-    data.active = (connects - closes).max(0);
+    let (active, state) = current_session_activity(conn, &run_id)?;
+    data.active = active;
+    data.state = Some(state);
 
     // Get per-provider counts (connect events only)
     let provider_sql = "SELECT COALESCE(provider, 'unknown'), COUNT(*) FROM events \
                         WHERE run_id = ? AND event = 'connect' GROUP BY provider";
-    if let Ok(mut stmt) = conn.prepare(provider_sql) {
-        if let Ok(rows) = stmt.query_map([&run_id], |row| {
-            let provider: String = row.get(0)?;
-            let count: i64 = row.get(1)?;
-            Ok((provider, count))
-        }) {
-            for row in rows.flatten() {
-                let (provider, count) = row;
-                match provider.to_lowercase().as_str() {
-                    "anthropic" => data.anthropic = count,
-                    "openai" => data.openai = count,
-                    "google" => data.google = count,
-                    _ => {}
-                }
-            }
+    let mut stmt = conn
+        .prepare(provider_sql)
+        .map_err(|error| format!("Failed to prepare provider status: {}", error))?;
+    let rows = stmt
+        .query_map([&run_id], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .map_err(|error| format!("Failed to query provider status: {}", error))?;
+    for row in rows {
+        let (provider, count) =
+            row.map_err(|error| format!("Failed to read provider status: {}", error))?;
+        match provider.to_lowercase().as_str() {
+            "anthropic" => data.anthropic = count,
+            "openai" => data.openai = count,
+            "google" => data.google = count,
+            _ => {}
         }
     }
 
     // Try to get session name from sessions table (if it exists)
-    if table_exists(conn, "sessions").unwrap_or(false) {
-        if let Ok(name) = conn.query_row(
-            "SELECT session_name FROM sessions WHERE run_id = ?",
-            [&run_id],
-            |row| row.get::<_, Option<String>>(0),
-        ) {
-            data.session_name = name;
-        }
+    if table_exists(conn, "sessions")? && column_exists(conn, "sessions", "session_name")? {
+        data.session_name = conn
+            .query_row(
+                "SELECT session_name FROM sessions WHERE run_id = ?",
+                [&run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to query status session name: {}", error))?
+            .flatten();
     }
 
     Ok(data)
 }
 
+struct SessionActivity {
+    host: Option<String>,
+    pid: Option<i64>,
+    start: Option<String>,
+    poll: Option<String>,
+    active: Option<i64>,
+    valid: Option<bool>,
+    interval_ms: Option<i64>,
+}
+
+fn current_session_activity(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<(i64, &'static str), String> {
+    if !table_exists(conn, "sessions")? {
+        return Ok((0, "unverified"));
+    }
+    if column_exists(conn, "sessions", "end_ts")? {
+        let end: Option<Option<String>> = conn
+            .query_row(
+                "SELECT end_ts FROM sessions WHERE run_id=?",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to query session completion: {}", error))?;
+        if end.flatten().is_some() {
+            return Ok((0, "ended"));
+        }
+    }
+    for column in [
+        "host",
+        "observer_pid",
+        "observer_start_time",
+        "last_poll_ts",
+        "active_at_poll",
+        "poll_valid",
+        "interval_ms",
+    ] {
+        if !column_exists(conn, "sessions", column)? {
+            return Ok((0, "unverified"));
+        }
+    }
+    let activity = conn.query_row("SELECT host,observer_pid,observer_start_time,last_poll_ts,active_at_poll,poll_valid,interval_ms FROM sessions WHERE run_id=?", [run_id], |row| {
+        Ok(SessionActivity { host: row.get(0)?, pid: row.get(1)?, start: row.get(2)?, poll: row.get(3)?, active: row.get(4)?, valid: row.get(5)?, interval_ms: row.get(6)? })
+    }).optional().map_err(|error| format!("Failed to query current session proof: {}", error))?;
+    let Some(activity) = activity else {
+        return Ok((0, "unverified"));
+    };
+    if activity.valid == Some(false) {
+        return Ok((0, "degraded"));
+    }
+    let (Some(pid), Some(start), Some(poll), Some(active), Some(interval)) = (
+        activity.pid,
+        activity.start,
+        activity.poll,
+        activity.active,
+        activity.interval_ms,
+    ) else {
+        return Ok((0, "unverified"));
+    };
+    if activity.valid != Some(true) {
+        return Ok((0, "unverified"));
+    }
+    if active < 0 || interval < 0 {
+        return Err("Invalid negative session activity/interval".to_string());
+    }
+    let pid =
+        u32::try_from(pid).map_err(|_| "Invalid observer PID in session metadata".to_string())?;
+    let start = start
+        .parse::<u64>()
+        .map_err(|_| "Invalid observer start time in session metadata".to_string())?;
+    if activity.host.as_deref() != Some(hostname().as_str())
+        || read_proc_stat(pid).map(|stat| stat.identity)
+            != Some(ProcessIdentity {
+                pid,
+                start_time: start,
+            })
+    {
+        return Ok((0, "stale"));
+    }
+    let (seconds, nanos) = parse_utc_timestamp(&poll)?;
+    let timestamp = i128::from(seconds) * 1_000_000_000 + i128::from(nanos);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|error| format!("Cannot establish current UTC time: {}", error))?;
+    let age = now.as_nanos() as i128 - timestamp;
+    let freshness_ms = (interval as u64).saturating_mul(3).max(5000);
+    if age < 0 || age > i128::from(freshness_ms) * 1_000_000 {
+        return Ok((0, "stale"));
+    }
+    Ok((active, "fresh"))
+}
+
 /// Expand a status template string with data values.
-/// Template variables: {active}, {total}, {anthropic}, {openai}, {google}, {session_name}
+/// Template variables: {active}, {state}, {total}, {anthropic}, {openai}, {google}, {session_name}
 fn expand_status_template(template: &str, data: &StatusData) -> String {
     let mut result = template.to_string();
 
@@ -7906,6 +8156,7 @@ fn expand_status_template(template: &str, data: &StatusData) -> String {
     result = result.replace("{anthropic}", &data.anthropic.to_string());
     result = result.replace("{openai}", &data.openai.to_string());
     result = result.replace("{google}", &data.google.to_string());
+    result = result.replace("{state}", data.state.unwrap_or("unavailable"));
     result = result.replace("{session_name}", data.session_name.as_deref().unwrap_or(""));
 
     result
@@ -7922,7 +8173,8 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     }
 
     let mut conn = Connection::open(path).map_err(|e| format!("Failed to open database: {}", e))?;
-    set_busy_timeout(&conn);
+    configure_query_connection(&conn)
+        .map_err(|error| format!("Failed to configure SQLite queries: {}", error))?;
 
     // Late-added column: migrate idempotently so reports on pre-provenance
     // databases still prepare their queries.
@@ -7950,9 +8202,12 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
 
     // Determine run_id filter
     let run_id = if let Some(id) = args.run_id.clone() {
-        Some(id)
+        Some(resolve_session_reference(&conn, &id)?)
     } else if args.latest {
-        find_latest_session(&conn)?
+        Some(
+            find_latest_session(&conn)?
+                .ok_or_else(|| "No monitoring sessions found for --latest".to_string())?,
+        )
     } else {
         None
     };
@@ -7960,6 +8215,7 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
     // Parse time filters
     let since = parse_time_filter(&args.since)?;
     let until = parse_time_filter(&args.until)?;
+    validate_time_range(&since, &until)?;
 
     // Build filter context for queries
     let filter = ReportFilter {
@@ -7992,14 +8248,18 @@ struct ReportFilter {
 
 fn table_exists(conn: &Connection, table_name: &str) -> Result<bool, String> {
     let sql = "SELECT name FROM sqlite_master WHERE type='table' AND name=?";
-    let result: Option<String> = conn.query_row(sql, [table_name], |row| row.get(0)).ok();
-    Ok(result.is_some())
+    conn.query_row(sql, [table_name], |row| row.get::<_, String>(0))
+        .optional()
+        .map(|result| result.is_some())
+        .map_err(|error| format!("Failed to inspect tables: {}", error))
 }
 
 fn view_exists(conn: &Connection, view_name: &str) -> Result<bool, String> {
     let sql = "SELECT name FROM sqlite_master WHERE type='view' AND name=?";
-    let result: Option<String> = conn.query_row(sql, [view_name], |row| row.get(0)).ok();
-    Ok(result.is_some())
+    conn.query_row(sql, [view_name], |row| row.get::<_, String>(0))
+        .optional()
+        .map(|result| result.is_some())
+        .map_err(|error| format!("Failed to inspect views: {}", error))
 }
 
 fn column_exists(conn: &Connection, table_name: &str, column: &str) -> Result<bool, String> {
@@ -8086,19 +8346,24 @@ fn schema_hint(sqlite_path: &str) -> String {
 }
 
 fn find_latest_session(conn: &Connection) -> Result<Option<String>, String> {
-    let sql = "SELECT run_id FROM sessions ORDER BY start_ts DESC LIMIT 1";
-    match conn.query_row(sql, [], |row| row.get::<_, String>(0)) {
-        Ok(id) => Ok(Some(id)),
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
-            // No sessions table or no sessions, try events
-            let sql2 = "SELECT DISTINCT run_id FROM events WHERE run_id IS NOT NULL ORDER BY ts DESC LIMIT 1";
-            match conn.query_row(sql2, [], |row| row.get::<_, String>(0)) {
-                Ok(id) => Ok(Some(id)),
-                Err(_) => Ok(None),
-            }
+    if table_exists(conn, "sessions")? {
+        let latest = conn
+            .query_row(
+                "SELECT run_id FROM sessions ORDER BY rano_utc(start_ts) DESC, run_id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .map_err(|error| format!("Failed to query latest session metadata: {}", error))?;
+        if latest.is_some() {
+            return Ok(latest);
         }
-        Err(e) => Err(format!("Failed to query sessions: {}", e)),
     }
+    if !table_exists(conn, "events")? {
+        return Ok(None);
+    }
+    conn.query_row("SELECT run_id FROM events WHERE run_id IS NOT NULL GROUP BY run_id ORDER BY MAX(rano_utc(ts)) DESC, run_id DESC LIMIT 1", [], |row| row.get(0))
+        .optional().map_err(|error| format!("Failed to query latest legacy session: {}", error))
 }
 
 fn parse_time_filter(input: &Option<String>) -> Result<Option<String>, String> {
@@ -8111,20 +8376,151 @@ fn parse_time_filter(input: &Option<String>) -> Result<Option<String>, String> {
         return Ok(Some(ts));
     }
 
-    // Check for RFC3339 format
-    if s.contains('T') && s.contains(':') {
-        return Ok(Some(s.clone()));
-    }
+    normalize_utc_timestamp(s).map(Some)
+}
 
-    // Check for date-only format (YYYY-MM-DD)
-    if s.len() == 10 && s.chars().filter(|c| *c == '-').count() == 2 {
-        return Ok(Some(format!("{}T00:00:00Z", s)));
-    }
+// Proleptic Gregorian calendar arithmetic; Euclidean division also covers dates
+// before the Unix epoch. All query timestamps use fixed nanosecond UTC precision.
+fn calendar_days(year: i64, month: i64, day: i64) -> i64 {
+    let year = year - i64::from(month <= 2);
+    let era = year.div_euclid(400);
+    let year_of_era = year - era * 400;
+    let shifted_month = month + if month > 2 { -3 } else { 9 };
+    let day_of_year = (153 * shifted_month + 2) / 5 + day - 1;
+    let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+    era * 146097 + day_of_era - 719468
+}
 
-    Err(format!(
-        "Invalid timestamp format: {} (use RFC3339, YYYY-MM-DD, or relative like 1h/24h/7d)",
-        s
+fn format_utc_seconds(seconds: i64, nanos: u32) -> Result<String, String> {
+    let days = seconds.div_euclid(86400);
+    let time = seconds.rem_euclid(86400);
+    let shifted = days + 719468;
+    let era = shifted.div_euclid(146097);
+    let day_of_era = shifted - era * 146097;
+    let year_of_era =
+        (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let shifted_month = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * shifted_month + 2) / 5 + 1;
+    let month = shifted_month + if shifted_month < 10 { 3 } else { -9 };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    if !(0..=9999).contains(&year) || nanos >= 1_000_000_000 {
+        return Err(
+            "UTC timestamp is outside years 0000..9999 or nanosecond precision".to_string(),
+        );
+    }
+    Ok(format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}Z",
+        year,
+        month,
+        day,
+        time / 3600,
+        time % 3600 / 60,
+        time % 60,
+        nanos
     ))
+}
+
+fn normalize_utc_timestamp(input: &str) -> Result<String, String> {
+    let (seconds, nanos) = parse_utc_timestamp(input)?;
+    format_utc_seconds(seconds, nanos)
+}
+
+fn parse_utc_timestamp(input: &str) -> Result<(i64, u32), String> {
+    let text = input.trim();
+    let invalid = || {
+        format!(
+            "Invalid UTC timestamp '{}': use a real YYYY-MM-DD or RFC3339 date/time with a known offset and at most 9 fractional digits",
+            input
+        )
+    };
+    if !text.is_ascii() || text.len() < 10 {
+        return Err(invalid());
+    }
+    let bytes = text.as_bytes();
+    let number = |start: usize, len: usize| -> Result<i64, String> {
+        let digits = bytes.get(start..start + len).ok_or_else(&invalid)?;
+        if !digits.iter().all(u8::is_ascii_digit) {
+            return Err(invalid());
+        }
+        text[start..start + len].parse().map_err(|_| invalid())
+    };
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return Err(invalid());
+    }
+    let year = number(0, 4)?;
+    let month = number(5, 2)?;
+    let day = number(8, 2)?;
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 if leap => 29,
+        2 => 28,
+        _ => return Err(invalid()),
+    };
+    if !(1..=days_in_month).contains(&day) {
+        return Err(invalid());
+    }
+    let date_seconds = calendar_days(year, month, day) * 86400;
+    if text.len() == 10 {
+        return Ok((date_seconds, 0));
+    }
+    if text.len() < 20
+        || !matches!(bytes[10], b'T' | b't')
+        || bytes[13] != b':'
+        || bytes[16] != b':'
+    {
+        return Err(invalid());
+    }
+    let hour = number(11, 2)?;
+    let minute = number(14, 2)?;
+    let second = number(17, 2)?;
+    if hour > 23 || minute > 59 || second > 59 {
+        return Err(format!("{}; leap-second inputs are unsupported", invalid()));
+    }
+    let mut cursor = 19;
+    let mut nanos = 0;
+    if bytes.get(cursor) == Some(&b'.') {
+        cursor += 1;
+        let start = cursor;
+        while bytes.get(cursor).is_some_and(u8::is_ascii_digit) {
+            cursor += 1;
+        }
+        let len = cursor - start;
+        if !(1..=9).contains(&len) {
+            return Err(invalid());
+        }
+        nanos = number(start, len)? as u32 * 10u32.pow(9 - len as u32);
+    }
+    let offset = match bytes.get(cursor) {
+        Some(b'Z' | b'z') if cursor + 1 == bytes.len() => 0,
+        Some(sign @ (b'+' | b'-')) if cursor + 6 == bytes.len() && bytes[cursor + 3] == b':' => {
+            let hours = number(cursor + 1, 2)?;
+            let minutes = number(cursor + 4, 2)?;
+            if hours > 23 || minutes > 59 || (*sign == b'-' && hours == 0 && minutes == 0) {
+                return Err(format!("{}; -00:00 denotes an unknown offset", invalid()));
+            }
+            (hours * 3600 + minutes * 60) * if *sign == b'-' { -1 } else { 1 }
+        }
+        _ => return Err(invalid()),
+    };
+    let seconds = date_seconds + hour * 3600 + minute * 60 + second - offset;
+    if seconds < calendar_days(0, 1, 1) * 86400 || seconds >= calendar_days(10000, 1, 1) * 86400 {
+        return Err("UTC offset moves timestamp outside years 0000..9999".to_string());
+    }
+    Ok((seconds, nanos))
+}
+
+fn validate_time_range(since: &Option<String>, until: &Option<String>) -> Result<(), String> {
+    if let (Some(since), Some(until)) = (since, until) {
+        if since >= until {
+            return Err(
+                "--since must precede --until (inclusive start, exclusive end)".to_string(),
+            );
+        }
+    }
+    Ok(())
 }
 
 fn parse_relative_time(s: &str) -> Option<String> {
@@ -8144,21 +8540,24 @@ fn parse_relative_time(s: &str) -> Option<String> {
         (stripped, "w")
     };
 
+    if num_str.is_empty() || !num_str.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
     let num: u64 = num_str.parse().ok()?;
-    let secs = match unit {
-        "m" => num * 60,
-        "h" => num * 3600,
-        "d" => num * 86400,
-        "w" => num * 604800,
+    let multiplier = match unit {
+        "m" => 60,
+        "h" => 3600,
+        "d" => 86400,
+        "w" => 604800,
         _ => return None,
     };
+    let secs = num.checked_mul(multiplier)?;
 
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let target = now.as_secs().saturating_sub(secs);
-    let dt = UNIX_EPOCH + Duration::from_secs(target);
-    Some(system_time_to_rfc3339(dt))
+    let target = now.as_secs().checked_sub(secs)?;
+    format_utc_seconds(i64::try_from(target).ok()?, 0).ok()
 }
 
 fn output_report_json(
@@ -8420,7 +8819,7 @@ fn output_report_pretty(
         summary.total_events, summary.connects, summary.closes
     );
     println!(
-        "  Active:  {} connections",
+        "  Observed connect-close balance: {} (filtered history)",
         summary.connects.saturating_sub(summary.closes)
     );
 
@@ -8655,10 +9054,13 @@ fn truncate_ascii(value: &str, max: usize) -> String {
     if value.len() <= max {
         return value.to_string();
     }
-    if max <= 3 {
-        return value.chars().take(max).collect();
+    let mut head = if max <= 3 { max } else { max - 3 };
+    while !value.is_char_boundary(head) {
+        head -= 1;
     }
-    let head = max - 3;
+    if max <= 3 {
+        return value[..head].to_string();
+    }
     let mut out = String::with_capacity(max);
     out.push_str(&value[..head]);
     out.push_str("...");
@@ -8667,35 +9069,16 @@ fn truncate_ascii(value: &str, max: usize) -> String {
 
 /// Calculate duration between two RFC3339 timestamps and format as human-readable
 fn format_session_duration(start: &str, end: &str) -> Option<String> {
-    let start_secs = parse_rfc3339_secs(start)?;
-    let end_secs = parse_rfc3339_secs(end)?;
-    if end_secs < start_secs {
+    let (start_secs, start_nanos) = parse_utc_timestamp(start).ok()?;
+    let (end_secs, end_nanos) = parse_utc_timestamp(end).ok()?;
+    let start = i128::from(start_secs) * 1_000_000_000 + i128::from(start_nanos);
+    let end = i128::from(end_secs) * 1_000_000_000 + i128::from(end_nanos);
+    if end < start {
         return None;
     }
-    let diff = end_secs - start_secs;
-    Some(format_duration_human(diff))
-}
-
-/// Parse RFC3339 timestamp to Unix seconds (simplified)
-fn parse_rfc3339_secs(ts: &str) -> Option<u64> {
-    // Format: 2026-01-17T12:34:56Z or 2026-01-17T12:34:56.123Z
-    if ts.len() < 19 {
-        return None;
-    }
-    let year: i32 = ts.get(0..4)?.parse().ok()?;
-    let month: u32 = ts.get(5..7)?.parse().ok()?;
-    let day: u32 = ts.get(8..10)?.parse().ok()?;
-    let hour: u32 = ts.get(11..13)?.parse().ok()?;
-    let min: u32 = ts.get(14..16)?.parse().ok()?;
-    let sec: u32 = ts.get(17..19)?.parse().ok()?;
-
-    // Days since epoch using a simplified Gregorian calculation
-    let y = if month <= 2 { year - 1 } else { year } as i64;
-    let m = if month <= 2 { month + 12 } else { month } as i64;
-    let d = day as i64;
-    let days = 365 * y + y / 4 - y / 100 + y / 400 + (153 * (m - 3) + 2) / 5 + d - 719528;
-
-    Some((days as u64) * 86400 + (hour as u64) * 3600 + (min as u64) * 60 + (sec as u64))
+    Some(format_duration_human(
+        u64::try_from((end - start) / 1_000_000_000).ok()?,
+    ))
 }
 
 /// Format seconds into human-readable duration (e.g., "1h 25m 4s")
@@ -8814,11 +9197,11 @@ fn build_summary_query(filter: &ReportFilter) -> (String, Vec<String>) {
         params.push(run_id.clone());
     }
     if let Some(ref since) = filter.since {
-        sql.push_str(" AND ts >= ?");
+        sql.push_str(" AND rano_utc(ts) >= rano_utc(?)");
         params.push(since.clone());
     }
     if let Some(ref until) = filter.until {
-        sql.push_str(" AND ts < ?");
+        sql.push_str(" AND rano_utc(ts) < rano_utc(?)");
         params.push(until.clone());
     }
 
@@ -8867,11 +9250,11 @@ fn build_providers_query(filter: &ReportFilter) -> (String, Vec<String>) {
         params.push(run_id.clone());
     }
     if let Some(ref since) = filter.since {
-        sql.push_str(" AND ts >= ?");
+        sql.push_str(" AND rano_utc(ts) >= rano_utc(?)");
         params.push(since.clone());
     }
     if let Some(ref until) = filter.until {
-        sql.push_str(" AND ts < ?");
+        sql.push_str(" AND rano_utc(ts) < rano_utc(?)");
         params.push(until.clone());
     }
 
@@ -8938,11 +9321,11 @@ fn build_ancestry_roots_query(filter: &ReportFilter, top: usize) -> (String, Vec
         params.push(run_id.clone());
     }
     if let Some(ref since) = filter.since {
-        sql.push_str(" AND ts >= ?");
+        sql.push_str(" AND rano_utc(ts) >= rano_utc(?)");
         params.push(since.clone());
     }
     if let Some(ref until) = filter.until {
-        sql.push_str(" AND ts < ?");
+        sql.push_str(" AND rano_utc(ts) < rano_utc(?)");
         params.push(until.clone());
     }
 
@@ -9002,11 +9385,11 @@ fn build_domains_query(filter: &ReportFilter, top: usize) -> (String, Vec<String
         params.push(run_id.clone());
     }
     if let Some(ref since) = filter.since {
-        sql.push_str(" AND ts >= ?");
+        sql.push_str(" AND rano_utc(ts) >= rano_utc(?)");
         params.push(since.clone());
     }
     if let Some(ref until) = filter.until {
-        sql.push_str(" AND ts < ?");
+        sql.push_str(" AND rano_utc(ts) < rano_utc(?)");
         params.push(until.clone());
     }
 
@@ -9061,11 +9444,11 @@ fn build_ips_query(filter: &ReportFilter, top: usize) -> (String, Vec<String>) {
         params.push(run_id.clone());
     }
     if let Some(ref since) = filter.since {
-        sql.push_str(" AND ts >= ?");
+        sql.push_str(" AND rano_utc(ts) >= rano_utc(?)");
         params.push(since.clone());
     }
     if let Some(ref until) = filter.until {
-        sql.push_str(" AND ts < ?");
+        sql.push_str(" AND rano_utc(ts) < rano_utc(?)");
         params.push(until.clone());
     }
 
@@ -9077,6 +9460,7 @@ fn build_ips_query(filter: &ReportFilter, top: usize) -> (String, Vec<String>) {
 }
 
 fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
+    configure_query_connection(conn)?;
     // Phase 1: pragmas + base tables only. Must not reference columns that older
     // databases may lack, or CREATE INDEX/VIEW would fail before migration runs.
     conn.execute_batch(
@@ -9138,6 +9522,11 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "sessions", "session_name", "TEXT")?;
 
     // Phase 3: indexes and views (safe now that all columns exist).
+    ensure_column(conn, "sessions", "observer_pid", "INTEGER")?;
+    ensure_column(conn, "sessions", "observer_start_time", "TEXT")?;
+    ensure_column(conn, "sessions", "last_poll_ts", "TEXT")?;
+    ensure_column(conn, "sessions", "active_at_poll", "INTEGER")?;
+    ensure_column(conn, "sessions", "poll_valid", "INTEGER")?;
     conn.execute_batch(
         "
         CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
@@ -9198,13 +9587,32 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
 
 /// Allow concurrent readers (report/export/diff/status) to wait briefly instead of
 /// failing with SQLITE_BUSY while the monitor's writer thread holds the database.
-fn set_busy_timeout(conn: &Connection) {
-    let _ = conn.execute_batch("PRAGMA busy_timeout=5000;");
+fn configure_query_connection(conn: &Connection) -> rusqlite::Result<()> {
+    conn.busy_timeout(Duration::from_millis(5000))?;
+    conn.create_scalar_function(
+        "rano_utc",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let value: Option<String> = context.get(0)?;
+            value
+                .map(|value| {
+                    normalize_utc_timestamp(&value).map_err(|message| {
+                        rusqlite::Error::UserFunctionError(Box::new(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            message,
+                        )))
+                    })
+                })
+                .transpose()
+        },
+    )
 }
 fn insert_session(conn: &mut Connection, ctx: &RunContext) -> rusqlite::Result<()> {
     conn.execute(
-        "INSERT OR REPLACE INTO sessions (run_id, start_ts, host, user, patterns, domain_mode, args, interval_ms, stats_interval_ms, session_name)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        "INSERT OR REPLACE INTO sessions (run_id, start_ts, host, user, patterns, domain_mode, args, interval_ms, stats_interval_ms, session_name, observer_pid, observer_start_time)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         params![
             &ctx.run_id,
             &ctx.start_ts,
@@ -9216,6 +9624,8 @@ fn insert_session(conn: &mut Connection, ctx: &RunContext) -> rusqlite::Result<(
             ctx.interval_ms as i64,
             ctx.stats_interval_ms as i64,
             &ctx.session_name,
+            ctx.observer.map(|identity| identity.pid),
+            ctx.observer.map(|identity| identity.start_time.to_string()),
         ],
     )?;
     Ok(())
@@ -9425,6 +9835,39 @@ fn push_json_map_provider(out: &mut String, key: &str, map: &BTreeMap<Provider, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn real_socket_owner_scan_rejects_stale_process_generation_and_topology() {
+        use std::os::fd::AsRawFd;
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let inode = parse_socket_inode(
+            &fs::read_link(format!("/proc/self/fd/{}", listener.as_raw_fd()))
+                .unwrap()
+                .to_string_lossy(),
+        )
+        .unwrap();
+        let pid = std::process::id();
+        let actual = read_proc_stat(pid).unwrap();
+        let mut snapshot = ProcessSnapshot::default();
+        snapshot.stat.insert(pid, actual.clone());
+        let targets = HashSet::from([pid]);
+        let scan = map_inodes(&targets, &snapshot);
+        assert_eq!(scan.owners[&inode], vec![actual.identity]);
+        assert!(scan.errors.is_empty());
+        let mut stale_generation = actual.clone();
+        stale_generation.identity.start_time += 1;
+        let mut stale_parent = actual.clone();
+        stale_parent.ppid = stale_parent.ppid.saturating_add(1);
+        let mut stale_comm = actual;
+        stale_comm.comm.push_str("-changed");
+        for stale in [stale_generation, stale_parent, stale_comm] {
+            snapshot.stat.insert(pid, stale);
+            let rejected = map_inodes(&targets, &snapshot);
+            assert!(!rejected.owners.contains_key(&inode));
+            assert!(!rejected.errors.is_empty());
+        }
+    }
+
     #[test]
     fn socket_admission_preserves_endpoints_and_requested_local_sockets() {
         let mut args = MonitorArgs::default();
@@ -9900,8 +10343,8 @@ mod tests {
         };
         let (sql, params) = build_summary_query(&filter);
         assert!(sql.contains("run_id = ?"));
-        assert!(sql.contains("ts >= ?"));
-        assert!(sql.contains("ts < ?"));
+        assert!(sql.contains("rano_utc(ts) >= rano_utc(?)"));
+        assert!(sql.contains("rano_utc(ts) < rano_utc(?)"));
         assert_eq!(
             params,
             vec![
@@ -9929,11 +10372,11 @@ mod tests {
     fn parse_time_filter_accepts_rfc3339_and_date() {
         let rfc = Some("2026-01-17T12:00:00Z".to_string());
         let parsed = parse_time_filter(&rfc).expect("rfc3339 should parse");
-        assert_eq!(parsed, Some("2026-01-17T12:00:00Z".to_string()));
+        assert_eq!(parsed, Some("2026-01-17T12:00:00.000000000Z".to_string()));
 
         let date = Some("2026-01-17".to_string());
         let parsed = parse_time_filter(&date).expect("date should parse");
-        assert_eq!(parsed, Some("2026-01-17T00:00:00Z".to_string()));
+        assert_eq!(parsed, Some("2026-01-17T00:00:00.000000000Z".to_string()));
     }
 
     #[test]
@@ -9949,6 +10392,324 @@ mod tests {
     fn parse_time_filter_rejects_invalid() {
         let invalid = Some("oops".to_string());
         assert!(parse_time_filter(&invalid).is_err());
+    }
+
+    #[test]
+    fn utc_calendar_offsets_and_nanoseconds_preserve_exact_instants() {
+        assert_eq!(calendar_days(1970, 1, 1), 0);
+        assert_eq!(
+            parse_utc_timestamp("1969-12-31T23:59:59Z").unwrap(),
+            (-1, 0)
+        );
+        for (input, expected) in [
+            ("2000-02-29", "2000-02-29T00:00:00.000000000Z"),
+            (
+                "2024-03-01T00:15:00+01:00",
+                "2024-02-29T23:15:00.000000000Z",
+            ),
+            (
+                "2026-01-01t00:00:00.123456789+02:30",
+                "2025-12-31T21:30:00.123456789Z",
+            ),
+            (
+                "2025-12-31T23:30:00.5-01:00",
+                "2026-01-01T00:30:00.500000000Z",
+            ),
+            ("0000-02-29T00:00:00z", "0000-02-29T00:00:00.000000000Z"),
+            (
+                "9999-12-31T23:59:59.999999999Z",
+                "9999-12-31T23:59:59.999999999Z",
+            ),
+        ] {
+            assert_eq!(normalize_utc_timestamp(input).unwrap(), expected);
+        }
+        assert_eq!(
+            format_session_duration("1969-12-31T23:59:59.9Z", "1970-01-01T00:00:01.1Z"),
+            Some("1s".to_string())
+        );
+        assert_eq!(
+            format_session_duration("2026-01-01T12:00:00+02:00", "2026-01-01T10:00:01Z"),
+            Some("1s".to_string())
+        );
+    }
+
+    #[test]
+    fn malformed_calendar_and_duration_bounds_fail_without_panicking() {
+        for input in [
+            "2026-99-99",
+            "1900-02-29",
+            "2023-02-29",
+            "2026-04-31",
+            "2026-01-00",
+            "2026-01-01T24:00:00Z",
+            "2026-01-01T12:60:00Z",
+            "2026-01-01T12:00:60Z",
+            "2026-01-01T12:00:00-00:00",
+            "2026-01-01T12:00:00+24:00",
+            "2026-01-01T12:00:00",
+            "2026-01-01T12:00:00.Z",
+            "2026-01-01T12:00:00.1234567890Z",
+            "2026-01-01T12:00:00Zjunk",
+            "雪雪雪雪雪雪雪",
+            "0000-01-01T00:00:00+01:00",
+            "9999-12-31T23:59:59-01:00",
+        ] {
+            assert!(normalize_utc_timestamp(input).is_err(), "accepted {input}");
+        }
+        for input in [
+            "18446744073709551615w",
+            "18446744073709551615m",
+            "99999999999999999999h",
+            "999999999999d",
+            "+1h",
+        ] {
+            assert!(
+                parse_time_filter(&Some(input.to_string())).is_err(),
+                "accepted {input}"
+            );
+        }
+        let same = Some("2026-01-01T00:00:00.000000000Z".to_string());
+        assert!(validate_time_range(&same, &same).is_err());
+        assert!(
+            validate_time_range(&Some("2026-02-01T00:00:00.000000000Z".to_string()), &same)
+                .is_err()
+        );
+        assert!(validate_time_range(&same, &None).is_ok());
+    }
+
+    #[test]
+    fn normalized_sql_filters_keep_inclusive_start_exclusive_end_and_fraction_order() {
+        let mut conn = setup_test_db();
+        let rows = [
+            create_test_event(
+                "2026-01-01T01:00:00.000000001+01:00",
+                "connect",
+                Provider::Anthropic,
+            ),
+            create_test_event(
+                "2026-01-01T00:00:00.000000002Z",
+                "connect",
+                Provider::OpenAI,
+            ),
+            create_test_event(
+                "2025-12-31T19:00:00.000000003-05:00",
+                "close",
+                Provider::Anthropic,
+            ),
+        ];
+        write_sqlite_batch(&mut conn, &rows).unwrap();
+        let filter = ReportFilter {
+            run_id: Some("test-run".to_string()),
+            since: Some("2026-01-01T00:00:00.000000001Z".to_string()),
+            until: Some("2026-01-01T00:00:00.000000003Z".to_string()),
+        };
+        let result = query_summary(&conn, &filter).unwrap();
+        assert_eq!(
+            (result.total_events, result.connects, result.closes),
+            (2, 2, 0)
+        );
+        let export_filter = ExportFilter {
+            run_id: filter.run_id,
+            since: None,
+            until: None,
+            providers: Vec::new(),
+            domain_patterns: Vec::new(),
+        };
+        let (sql, params) = build_export_query(&export_filter, &["ts".to_string()]);
+        let mut stmt = conn.prepare(&sql).unwrap();
+        let times: Vec<String> = stmt
+            .query_map(params![params[0]], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(
+            times,
+            rows.iter().map(|row| row.ts.clone()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn latest_empty_metadata_wins_over_later_old_events_and_names_resolve() {
+        let mut conn = setup_test_db();
+        let mut older = RunContext::new(&MonitorArgs::default(), "off", None);
+        older.run_id = "older".to_string();
+        older.start_ts = "2026-01-01T23:00:00-01:00".to_string();
+        older.session_name = "old-name".to_string();
+        insert_session(&mut conn, &older).unwrap();
+        let mut newer = older.clone();
+        newer.run_id = "empty".to_string();
+        newer.start_ts = "2026-01-02T01:00:00Z".to_string();
+        newer.session_name = "empty-name".to_string();
+        insert_session(&mut conn, &newer).unwrap();
+        let mut event = create_test_event("2026-01-03T00:00:00Z", "connect", Provider::Anthropic);
+        event.run_id = older.run_id;
+        write_sqlite_batch(&mut conn, &[event]).unwrap();
+        assert_eq!(
+            find_latest_session(&conn).unwrap().as_deref(),
+            Some("empty")
+        );
+        assert_eq!(
+            resolve_session_reference(&conn, "empty-name").unwrap(),
+            "empty"
+        );
+        let status = get_status_data(&conn).unwrap();
+        assert_eq!(status.session_name.as_deref(), Some("empty-name"));
+        assert_eq!((status.total, status.active), (0, 0));
+        assert!(compute_session_diff(&conn, "old-name", "empty-name", 10.0).is_ok());
+        assert!(resolve_session_reference(&conn, "missing").is_err());
+        newer.run_id = "duplicate".to_string();
+        insert_session(&mut conn, &newer).unwrap();
+        let error = resolve_session_reference(&conn, "empty-name").unwrap_err();
+        assert!(
+            error.contains("Ambiguous") && error.contains("duplicate") && error.contains("empty")
+        );
+        assert_eq!(
+            find_latest_session(&conn).unwrap().as_deref(),
+            Some("empty")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn current_status_requires_fresh_alive_identity_and_keeps_history_after_end() {
+        let mut conn = setup_test_db();
+        let mut ctx = RunContext::new(&MonitorArgs::default(), "off", None);
+        ctx.run_id = "current".to_string();
+        insert_session(&mut conn, &ctx).unwrap();
+        let mut event = create_test_event(&ctx.start_ts, "connect", Provider::Anthropic);
+        event.run_id = ctx.run_id.clone();
+        write_sqlite_batch(&mut conn, &[event]).unwrap();
+        let counters = SqliteCounters::default();
+        let poll = SessionPoll {
+            run_id: ctx.run_id.clone(),
+            ts: now_rfc3339(),
+            active: 7,
+            valid: true,
+        };
+        publish_session_poll(&mut conn, &poll, &counters, None);
+        let status = get_status_data(&conn).unwrap();
+        assert_eq!(
+            (status.active, status.total, status.state),
+            (7, 1, Some("fresh"))
+        );
+        conn.execute(
+            "UPDATE sessions SET last_poll_ts='1970-01-01T00:00:00Z'",
+            [],
+        )
+        .unwrap();
+        assert_eq!(get_status_data(&conn).unwrap().state, Some("stale"));
+        publish_session_poll(&mut conn, &poll, &counters, None);
+        conn.execute("UPDATE sessions SET observer_start_time='0'", [])
+            .unwrap();
+        assert_eq!(get_status_data(&conn).unwrap().active, 0);
+        conn.execute(
+            "UPDATE sessions SET observer_start_time=?1,poll_valid=0",
+            [ctx.observer.unwrap().start_time.to_string()],
+        )
+        .unwrap();
+        assert_eq!(get_status_data(&conn).unwrap().state, Some("degraded"));
+        finalize_session(&mut conn, &ctx.run_id, 1, 0).unwrap();
+        let status = get_status_data(&conn).unwrap();
+        assert_eq!(
+            (status.active, status.total, status.state),
+            (0, 1, Some("ended"))
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE event='close'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn missing_poll_metadata_and_nonfinite_diff_thresholds_are_explicit() {
+        let mut conn = setup_test_db();
+        let counters = SqliteCounters::default();
+        publish_session_poll(
+            &mut conn,
+            &SessionPoll {
+                run_id: "absent".to_string(),
+                ts: now_rfc3339(),
+                active: 1,
+                valid: true,
+            },
+            &counters,
+            None,
+        );
+        let outcome = counters.outcome();
+        assert!(outcome.failed);
+        assert_eq!(outcome.metadata_lost, 1);
+        assert_eq!(outcome.observed, 0);
+        for threshold in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(compute_session_diff(&conn, "old", "new", threshold).is_err());
+        }
+        let mut event = create_test_event("2026-01-01T00:00:00Z", "connect", Provider::Anthropic);
+        event.run_id = "same".to_string();
+        write_sqlite_batch(&mut conn, &[event]).unwrap();
+        assert!(
+            compute_session_diff(&conn, "same", "same", 0.0)
+                .unwrap()
+                .changed_domains
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn poll_publication_preserves_observation_time_and_accounts_metadata_queue_loss() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let counters = Arc::new(SqliteCounters::default());
+        let writer = SqliteWriter {
+            sender,
+            handle: None,
+            counters: counters.clone(),
+            drop_state: Mutex::new(DropState {
+                last_warn: SystemTime::now(),
+                dropped_since_warn: 0,
+            }),
+            log_writer: None,
+        };
+        let observed = UNIX_EPOCH + Duration::from_secs(1);
+        writer.publish_poll("test", 2, true, observed);
+        writer.publish_poll("test", 3, true, observed);
+        let outcome = counters.outcome();
+        assert_eq!(
+            (
+                outcome.observed,
+                outcome.queue_lost,
+                outcome.write_lost,
+                outcome.metadata_lost
+            ),
+            (0, 0, 0, 1)
+        );
+        assert!(outcome.failed);
+        let message = receiver.try_recv().unwrap();
+        assert!(matches!(&message, SqliteMsg::Poll(_)));
+        if let SqliteMsg::Poll(poll) = message {
+            assert_eq!(poll.ts, "1970-01-01T00:00:01Z");
+            assert_eq!(poll.active, 2);
+            assert!(poll.valid);
+        }
+    }
+
+    #[test]
+    fn unicode_report_truncation_and_literal_session_names_are_preserved() {
+        assert_eq!(truncate_ascii("長長長", 6), "長...");
+        assert_eq!(truncate_ascii("長長長", 4), "...");
+        assert_eq!(truncate_ascii("長長", 2), "");
+        assert_eq!(truncate_ascii("abcdef", 4), "a...");
+        let data = StatusData {
+            state: Some("fresh"),
+            session_name: Some("{state}:{active}".to_string()),
+            ..StatusData::default()
+        };
+        assert_eq!(
+            expand_status_template("{state}|{session_name}", &data),
+            "fresh|{state}:{active}"
+        );
     }
 
     // Batching unit tests
@@ -11186,8 +11947,8 @@ mod tests {
         };
         let fields = vec!["ts".to_string()];
         let (sql, params) = build_export_query(&filter, &fields);
-        assert!(sql.contains("ts >= ?"));
-        assert!(sql.contains("ts < ?"));
+        assert!(sql.contains("rano_utc(ts) >= rano_utc(?)"));
+        assert!(sql.contains("rano_utc(ts) < rano_utc(?)"));
         assert_eq!(params.len(), 2);
     }
 
@@ -12876,6 +13637,7 @@ mod tests {
             openai: 30,
             google: 20,
             session_name: Some("morning-anthropic-claude-2026-01-21".to_string()),
+            state: None,
         };
 
         let output = expand_status_template("{active} active | total:{total}", &data);
@@ -12891,6 +13653,7 @@ mod tests {
             openai: 15,
             google: 10,
             session_name: None,
+            state: None,
         };
 
         let output = expand_status_template("A:{anthropic} O:{openai} G:{google}", &data);
@@ -12906,6 +13669,7 @@ mod tests {
             openai: 0,
             google: 0,
             session_name: Some("my-session".to_string()),
+            state: None,
         };
 
         let output = expand_status_template("session: {session_name}", &data);
@@ -12921,6 +13685,7 @@ mod tests {
             openai: 0,
             google: 0,
             session_name: None,
+            state: None,
         };
 
         let output = expand_status_template("session: {session_name}", &data);
@@ -12936,6 +13701,7 @@ mod tests {
             openai: 3,
             google: 2,
             session_name: None,
+            state: None,
         };
 
         let output = expand_status_template(STATUS_DEFAULT_FORMAT, &data);

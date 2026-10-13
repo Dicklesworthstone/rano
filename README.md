@@ -299,7 +299,7 @@ rano report --latest --color always
 **Report sections**
 
 - **Session**: run ID, start/end times, duration, host, patterns
-- **Summary**: total events, connects, closes, active connections
+- **Summary**: total events, connects, closes, and the observed connect-close balance in the filtered history
 - **Providers**: event counts per provider (anthropic, openai, google, unknown)
 - **Top Domains**: most active domains with provider attribution
 - **Top IPs**: most active remote IPs with reverse DNS
@@ -309,6 +309,10 @@ rano report --latest --color always
 - Relative: `1h`, `24h`, `7d`, `30m`, `1w`
 - Date: `2026-01-17` (interpreted as midnight UTC)
 - RFC3339: `2026-01-17T10:00:00Z`
+
+Dates are checked against the Gregorian calendar. Timestamps accept a known numeric offset or `Z`, lower-case `t`/`z`, and up to nine fractional digits; query comparisons normalize both stored timestamps and boundaries to fixed nanosecond UTC precision. Leap-second inputs and the unknown offset `-00:00` are rejected explicitly. Relative arithmetic is checked, and `--since` must precede `--until`; the start is inclusive and the end exclusive.
+
+`--latest` selects the newest session by metadata start time, including a valid empty session, with run ID as a deterministic tie-breaker. An events-only legacy database falls back to each run's latest normalized event. Explicit run IDs and unambiguous session names are accepted by report/export/diff; a missing reference or duplicate name fails with an actionable error. Diff thresholds must be finite and within `0..100`, and lists/count ties have stable ordering.
 
 ### `rano diff`
 
@@ -352,14 +356,17 @@ rano status --sqlite /path/to/rano.sqlite
 
 | Variable | Description |
 |----------|-------------|
-| `{active}` | Current active connection count |
-| `{total}` | Total connections this session |
-| `{anthropic}` | Anthropic provider connection count |
-| `{openai}` | OpenAI provider connection count |
-| `{google}` | Google provider connection count |
+| `{active}` | Endpoint count in a fresh valid poll from the live observer |
+| `{total}` | Historical endpoint observations this session |
+| `{anthropic}` | Historical Anthropic endpoint observations |
+| `{openai}` | Historical OpenAI endpoint observations |
+| `{google}` | Historical Google endpoint observations |
 | `{session_name}` | Current session name (if available) |
+| `{state}` | `fresh`, `ended`, `stale`, `degraded`, `unverified`, or `unavailable` |
 
 **Default format**: `{active} active | anthropic:{anthropic} openai:{openai}`
+
+Activity comes from the monitor's published poll count, with its host and PID/kernel-start-time identity checked. Its observation timestamp must be no older than the greater of five seconds or three configured poll intervals; a blocked or stopped monitor cannot refresh it by publishing old observations later. Finalized sessions always return zero current activity without inventing close events. Legacy history lacks this proof and returns zero activity with `unverified`; its totals and name remain available. A newer empty session still takes precedence. Counts and metadata are read from one SQLite snapshot while the monitor keeps writing. Database/query errors are returned explicitly.
 
 **Shell integration examples**
 

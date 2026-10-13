@@ -12,15 +12,14 @@ set -euo pipefail
 
 TMP_DIR=$(mktemp -d)
 cleanup() {
-  rm -rf "${TMP_DIR}"
+  e2e_info "Retained status fixtures: ${TMP_DIR}"
 }
 trap cleanup EXIT
 
 # Ensure binary is built before test
 RANO_BIN="${RANO_BIN:-${E2E_RANO_RELEASE}}"
 if [ ! -x "${RANO_BIN}" ]; then
-  e2e_section "Building rano"
-  cargo build --release --quiet
+  e2e_fail "rano binary missing at ${RANO_BIN}; build the intended revision first"
 fi
 
 SQLITE_PATH="${TMP_DIR}/test-status.sqlite"
@@ -83,7 +82,7 @@ VALUES
 
 -- Seed events for status-test-001
 -- 10 connect events (5 anthropic, 3 openai, 2 google) with 5 closes
--- Active connections = 10 - 5 = 5
+-- Historical connect-close balance = 5; no live observer/poll proof exists.
 
 -- Anthropic connects (5)
 INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, remote_is_private, ip_version)
@@ -120,7 +119,7 @@ SQL
 e2e_info "Seeded 1 session, 15 events total"
 e2e_info "status-test-001: 10 connects, 5 closes"
 e2e_info "anthropic:5, openai:3, google:2 (connect events)"
-e2e_info "active connections: 5"
+e2e_info "historical balance: 5; current activity unverified (0)"
 
 # Verify seed data
 event_count=$(sqlite3 "${SQLITE_PATH}" "SELECT COUNT(*) FROM events")
@@ -131,13 +130,13 @@ e2e_info "Verified: ${event_count} events, ${session_count} sessions"
 # Test 1: Default format output
 # =============================================================================
 e2e_section "Test 1: Default format output"
-e2e_info "Expected: '5 active | anthropic:5 openai:3'"
+e2e_info "Expected: '0 active | anthropic:5 openai:3' (legacy history)"
 
 e2e_run "rano status (default format)" \
   "${RANO_BIN}" status --sqlite "${SQLITE_PATH}"
 
 e2e_assert_last_status 0
-e2e_assert_last_contains "5 active"
+e2e_assert_last_contains "0 active"
 e2e_assert_last_contains "anthropic:5"
 e2e_assert_last_contains "openai:3"
 
@@ -149,15 +148,16 @@ e2e_info "Testing all template variables: {active}, {total}, {anthropic}, {opena
 
 e2e_run "rano status (custom format)" \
   "${RANO_BIN}" status --sqlite "${SQLITE_PATH}" \
-    --format "A:{active} T:{total} An:{anthropic} Op:{openai} Go:{google} S:{session_name}"
+    --format "A:{active} T:{total} An:{anthropic} Op:{openai} Go:{google} S:{session_name} State:{state}"
 
 e2e_assert_last_status 0
-e2e_assert_last_contains "A:5"
+e2e_assert_last_contains "A:0"
 e2e_assert_last_contains "T:10"
 e2e_assert_last_contains "An:5"
 e2e_assert_last_contains "Op:3"
 e2e_assert_last_contains "Go:2"
 e2e_assert_last_contains "morning-anthropic-claude-2026-01-22"
+e2e_assert_last_contains "State:unverified"
 
 # =============================================================================
 # Test 3: Provider-only format
@@ -298,6 +298,81 @@ e2e_assert_last_contains "--format"
 e2e_assert_last_contains "--sqlite"
 
 # =============================================================================
+# Real current activity, stalled observer and finalized history.
+# The seed above intentionally cannot establish a live observer.
+e2e_section "Real fresh/stale/ended activity with held sockets"
+python3 - "${RANO_BIN}" "${TMP_DIR}" <<'PY' || e2e_fail "live status state matrix failed"
+import json,os,pathlib,signal,socket,sqlite3,statistics,subprocess,sys,time
+binary=sys.argv[1];root=pathlib.Path(sys.argv[2])/'live-status';root.mkdir();database=root/'events.sqlite'
+code=r'''
+import json,os,socket,sys
+listener=socket.socket();listener.bind(('127.0.0.1',0));listener.listen()
+client=socket.create_connection(listener.getsockname());accepted,_=listener.accept()
+print(json.dumps({'pid':os.getpid(),'port':listener.getsockname()[1]}),flush=True)
+sys.stdin.read(1)
+'''
+holder=subprocess.Popen([sys.executable,'-u','-c',code,'claude'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+ready=json.loads(holder.stdout.readline());monitor=None;stdout=open(root/'monitor.jsonl','w');stderr=open(root/'monitor.stderr','w')
+name='held-{state}:{active}'
+def status(label):
+    result=subprocess.run([binary,'status','--sqlite',str(database),'--format','{active}|{total}|{anthropic}|{session_name}|{state}'],capture_output=True,text=True,timeout=10)
+    (root/f'{label}.stdout').write_text(result.stdout);(root/f'{label}.stderr').write_text(result.stderr)
+    assert result.returncode==0,f'status failed: {result.stderr}'
+    return result.stdout.strip().split('|')
+def await_state(expected,label):
+    deadline=time.monotonic()+20;last=None
+    while time.monotonic()<deadline:
+        assert holder.poll() is None and monitor.poll() is None,'fixture/monitor exited'
+        if database.exists():
+            last=status(label)
+            if last==expected:return
+        time.sleep(.1)
+    raise AssertionError(f'no {expected}: last={last}; captures retained')
+try:
+    monitor=subprocess.Popen([binary,'--no-config','--pid',str(ready['pid']),'--no-descendants','--no-dns','--no-banner','--json',
+        '--interval-ms','50','--sqlite',str(database),'--session-name',name],stdout=stdout,stderr=stderr)
+    expected=['2','2','2',name,'fresh'];await_state(expected,'fresh')
+    # Seeded history is explicit; the two current endpoints above are real.
+    with sqlite3.connect(database,timeout=10) as conn:
+        conn.execute("INSERT INTO sessions(run_id,start_ts,end_ts,session_name) VALUES('history-100k','2020-01-01T00:00:00Z','2020-01-01T01:00:00Z','historical')")
+        conn.executemany("INSERT INTO events(ts,run_id,event,provider) VALUES('2020-01-01T00:00:00Z','history-100k','connect','unknown')",[() for _ in range(100000)])
+    await_state(expected,'after-history-seed')
+    with sqlite3.connect(database) as conn:before_poll=conn.execute("SELECT last_poll_ts FROM sessions WHERE run_id!='history-100k'").fetchone()[0]
+    latencies=[]
+    for index in range(25):
+        start=time.monotonic_ns();assert status(f'large-{index}')==expected,'large-history status selected wrong session or became unhealthy'
+        latencies.append((time.monotonic_ns()-start)/1_000_000);time.sleep(.1)
+    with sqlite3.connect(database) as conn:
+        after_poll=conn.execute("SELECT last_poll_ts FROM sessions WHERE run_id!='history-100k'").fetchone()[0]
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE run_id='history-100k'").fetchone()[0]==100000,'large history fixture incomplete'
+    assert after_poll>before_poll,'observer did not publish during large-history reader measurement'
+    (root/'large-status-latency.json').write_text(json.dumps({'history_rows':100000,'reads':25,'milliseconds':latencies,'median_ms':statistics.median(latencies),'max_ms':max(latencies),'before_poll':before_poll,'after_poll':after_poll},indent=2))
+    print(f'large-history status latency: n=25 median={statistics.median(latencies):.3f}ms max={max(latencies):.3f}ms; actual poll updates progressed',flush=True)
+    monitor.send_signal(signal.SIGSTOP)
+    await_state(['0','2','2',name,'stale'],'stopped-observer')
+    monitor.send_signal(signal.SIGCONT);await_state(expected,'resumed-observer')
+    # Physical socket holders remain alive; observer finalization cannot imply a
+    # network close. Current activity becomes zero while historical totals stay2.
+    monitor.send_signal(signal.SIGTERM);assert monitor.wait(timeout=15)==0,'monitor failed to finalize'
+    stdout.close();stderr.close()
+    assert status('ended')==['0','2','2',name,'ended'],'finalized history advertised live activity'
+    with sqlite3.connect(database) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE event='connect' AND run_id!='history-100k'").fetchone()[0]==2,'positive observations absent'
+        assert conn.execute("SELECT COUNT(*) FROM events WHERE event='close' AND run_id!='history-100k'").fetchone()[0]==0,'observer fabricated network closes'
+    held=[os.readlink(path) for path in pathlib.Path(f"/proc/{ready['pid']}/fd").iterdir() if os.readlink(path).startswith('socket:[')]
+    assert len(held)==3,'held listener and two real endpoints disappeared'
+    summary=next(row['summary'] for row in map(json.loads,(root/'monitor.jsonl').read_text().splitlines()) if 'summary' in row)
+    assert summary['sqlite']['persisted']==summary['sqlite']['observed']==2 and not summary['sqlite']['failed'],'durable summary unhealthy'
+    print('PASS live fresh2 -> stopped stale0 -> resumed fresh2 -> finalized ended0; history2 and physical sockets retained',flush=True)
+finally:
+    if monitor is not None and monitor.poll() is None:
+        monitor.send_signal(signal.SIGCONT);monitor.send_signal(signal.SIGTERM)
+        try:monitor.wait(timeout=15)
+        except subprocess.TimeoutExpired:monitor.kill();monitor.wait(timeout=5)
+    if holder.poll() is None:holder.stdin.write('x');holder.stdin.flush();holder.wait(timeout=5)
+    stdout.close();stderr.close()
+PY
+
 # Summary
 # =============================================================================
 e2e_section "Summary"

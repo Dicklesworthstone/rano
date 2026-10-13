@@ -58,9 +58,12 @@ try:
         time.sleep(.05)
     assert before>0,'writer never persisted positive observations'
     for index in range(int(sys.argv[3])):
-        alive();result=subprocess.run([binary,'status','--sqlite',str(database)],capture_output=True,text=True,timeout=10)
+        alive();result=subprocess.run([binary,'status','--sqlite',str(database),'--format','{total}|{anthropic}|{openai}|{google}|{active}|{state}'],capture_output=True,text=True,timeout=10)
         (root/f'status-{index}.stdout').write_text(result.stdout);(root/f'status-{index}.stderr').write_text(result.stderr)
         assert result.returncode==0,f'status read failed: {result.stderr}'
+        total,anthropic,openai,google,active,state=result.stdout.strip().split('|')
+        assert int(total)==int(anthropic)>0 and int(openai)==int(google)==0,'status returned incoherent historical counts during writes'
+        assert state=='fresh' and 0<=int(active)<=int(total),'status lost current valid observation proof during writes'
         time.sleep(.1)
     after=count();assert after>before,'status reads ran against a stopped writer'
     for index in range(3):
