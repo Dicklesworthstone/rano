@@ -229,13 +229,14 @@ else:
 '''
 
 def encoded(value): return base64.b64encode(value.encode()).decode()
-def launch(mode, comm):
-    if mode == 'excluded':
-        arguments = [encoded(middle_code), encoded('skip-subtree'), encoded(leaf_code), encoded(comm)]
+def launch(mode, comm, marker='claude', credential=False):
+    if mode in ['excluded', 'nested']:
+        arguments = [encoded(middle_code), encoded('codex' if mode=='nested' else 'skip-subtree'), encoded(leaf_code), encoded(comm)]
     else:
         arguments = [encoded(leaf_code), encoded(comm)]
+    if credential: arguments += ['--password', 'FAKE MULTIWORD CREDENTIAL']
     # The marker is a real final argv argument. Helper source contains no provider names.
-    holder = subprocess.Popen([sys.executable, '-u', '-c', parent_code, mode, *arguments, 'claude'],
+    holder = subprocess.Popen([sys.executable, '-u', '-c', parent_code, mode, *arguments, marker],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
     return holder, json.loads(holder.stdout.readline())
 
@@ -244,7 +245,7 @@ def proc_identity(pid):
     fields = raw.rsplit(') ', 1)[1].split()
     return {'pid': pid, 'start_time': fields[19]}, int(fields[1])
 
-def inspect(holder, ready, label, flags, expected, owner_ids):
+def inspect(holder, ready, label, flags, expected, owner_ids, selected_root=None):
     case = root / label; case.mkdir()
     command = [binary, '--no-config', '--pid', str(holder.pid), '--once', '--json', '--no-banner',
         '--no-dns', '--show-ancestry', '--sqlite', str(case / 'events.sqlite'), *flags]
@@ -260,10 +261,11 @@ def inspect(holder, ready, label, flags, expected, owner_ids):
         ownership = json.loads(event['ownership_json'])
         primary = min(owner_ids)
         identity, ppid = proc_identity(primary)
-        root_identity, _ = proc_identity(holder.pid)
+        root_pid = holder.pid if selected_root is None else selected_root
+        root_identity, _ = proc_identity(root_pid)
         assert event['pid'] == primary and ownership['pid'] == primary, f'{label}: nondeterministic owner'
         assert ownership['start_time'] == identity['start_time'], f'{label}: stale owner identity'
-        assert ownership['root_pid'] == holder.pid and ownership['root_start_time'] == root_identity['start_time'], f'{label}: wrong monitored root'
+        assert ownership['root_pid'] == root_pid and ownership['root_start_time'] == root_identity['start_time'], f'{label}: wrong monitored root'
         expected_owners = [proc_identity(pid)[0] for pid in sorted(owner_ids)]
         assert ownership['owners'] == expected_owners, f'{label}: shared holders lost'
         assert f'root-holder({holder.pid})' in event['ancestry'], f'{label}: missing root ancestry'
@@ -275,8 +277,8 @@ def inspect(holder, ready, label, flags, expected, owner_ids):
     rows = list(csv.DictReader(io.StringIO(export.stdout)))
     assert len(rows) == expected, f'{label}: export dropped rows'
     for row in rows:
-        assert row['ancestry_path'] and json.loads(row['ownership_json'])['root_pid'] == holder.pid, f'{label}: export lost provenance'
-    return [event['pid'] for event in events]
+        assert row['ancestry_path'] and json.loads(row['ownership_json'])['root_pid'] == (holder.pid if selected_root is None else selected_root), f'{label}: export lost provenance'
+    return events
 
 for mode, comm in [('leaf', 'odd name)'), ('excluded', 'socket-child'), ('shared', 'unused')]:
     holder, ready = launch(mode, comm)
@@ -293,6 +295,65 @@ for mode, comm in [('leaf', 'odd name)'), ('excluded', 'socket-child'), ('shared
         print(f'  PASS {mode}: real sockets, ancestry, ownership, identities, SQLite and export')
     finally:
         holder.stdin.write('x'); holder.stdin.flush(); holder.wait(timeout=5)
+
+for marker, expected in [('claude','anthropic'), ('codex','openai'), ('gemini','google'), ('unrelated','unknown')]:
+    holder, ready = launch('leaf', 'helper', marker, True)
+    try:
+        events = inspect(holder, ready, f'provider-{marker}', ['--redact-cmdline','secrets'], 2, [ready['leaf']])
+        for event in events:
+            assert event['provider']==expected, f'{marker}: leaf did not inherit expected provider'
+            origin = json.loads(event['ownership_json'])['provider_origin']
+            if expected=='unknown': assert origin is None, 'unclassified root invented a provider'
+            else: assert origin['pid']==holder.pid and origin['kind']=='ancestor', f'{marker}: wrong provider origin'
+        case=root/f'provider-{marker}'
+        with sqlite3.connect(case/'events.sqlite') as conn:
+            rows=conn.execute('SELECT provider, cmdline FROM events').fetchall()
+        assert all(provider==expected and 'FAKE MULTIWORD CREDENTIAL' not in cmdline and '<redacted>' in cmdline for provider,cmdline in rows), 'redaction changed attribution or leaked value'
+        exported=list(csv.DictReader(io.StringIO((case/'export.csv').read_text())))
+        assert all(row['provider']==expected and 'CREDENTIAL' not in row['cmdline'] for row in exported), 'export lost privacy/provider semantics'
+        report=subprocess.run([binary,'report','--sqlite',str(case/'events.sqlite'),'--latest','--json'],capture_output=True,text=True,timeout=20)
+        (case/'report.json').write_text(report.stdout);(case/'report.stderr').write_text(report.stderr)
+        assert report.returncode==0 and json.loads(report.stdout)['providers'][0]['provider']==expected, 'report provider disagrees'
+        print(f'  PASS provider-{marker}: inherited/direct origin, durable/export/report, privacy')
+    finally:
+        holder.stdin.write('x');holder.stdin.flush();holder.wait(timeout=5)
+
+holder,ready=launch('leaf','codex','claude')
+try:
+    events=inspect(holder,ready,'provider-direct-conflict',[],2,[ready['leaf']])
+    assert all(event['provider']=='openai' and json.loads(event['ownership_json'])['provider_origin']['pid']==ready['leaf'] for event in events), 'direct leaf did not override ancestor'
+finally:
+    holder.stdin.write('x');holder.stdin.flush();holder.wait(timeout=5)
+
+holder,ready=launch('nested','helper','claude')
+try:
+    events=inspect(holder,ready,'provider-nested-roots',['--pid',str(ready['middle'])],2,[ready['leaf']],ready['middle'])
+    assert all(event['provider']=='openai' and json.loads(event['ownership_json'])['provider_origin']['pid']==ready['middle'] for event in events), 'nearest nested provider/root failed'
+    print('  PASS nested conflicting roots')
+finally:
+    holder.stdin.write('x');holder.stdin.flush();holder.wait(timeout=5)
+
+holders=[launch('leaf','helper',marker) for marker in ['claude','codex','gemini','unrelated']]
+try:
+    case=root/'simultaneous-providers';case.mkdir()
+    command=[binary,'--no-config','--once','--json','--no-banner','--no-dns','--show-ancestry','--sqlite',str(case/'events.sqlite')]
+    expected={}
+    for (holder,ready),provider in zip(holders[:3],['anthropic','openai','google']):
+        command+=['--pid',str(holder.pid)];expected[ready['leaf']]=(provider,holder.pid)
+    result=subprocess.run(command,capture_output=True,text=True,timeout=20)
+    (case/'stdout.jsonl').write_text(result.stdout);(case/'stderr').write_text(result.stderr)
+    assert result.returncode==0, 'simultaneous monitor failed'
+    events=[row for row in map(json.loads,result.stdout.splitlines()) if row.get('event')=='connect']
+    assert len(events)==6 and set(row['pid'] for row in events)==set(expected), 'simultaneous/unrelated isolation failed'
+    for event in events:
+        provider,origin_pid=expected[event['pid']]
+        assert event['provider']==provider and json.loads(event['ownership_json'])['provider_origin']['pid']==origin_pid, 'global provider assumption contaminated tree'
+    with sqlite3.connect(case/'events.sqlite') as conn:
+        assert set(conn.execute('SELECT DISTINCT pid,provider FROM events'))=={(pid,provider) for pid,(provider,_) in expected.items()}, 'durable provider isolation failed'
+    print('  PASS simultaneous providers and unrelated control')
+finally:
+    for holder,_ in holders:
+        holder.stdin.write('x');holder.stdin.flush();holder.wait(timeout=5)
 PY
 
 # Summary

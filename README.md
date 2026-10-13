@@ -746,6 +746,8 @@ Each poll uses a process snapshot with kernel start times. Ancestry is cached fo
 
 Exclusions prune the matching process and its descendants, including explicitly selected PIDs and nested pattern matches. The nearest selected ancestor defines each monitored root. For a socket shared by multiple monitored processes, the lowest PID is the primary owner. `ownership_json` in JSON events, SQLite and exports contains the socket inode, owner/root PID and kernel start time, and all observed monitored holders; decode this field as JSON to inspect shared ownership. PID reuse, inode replacement or a change of monitored root starts a new observation episode rather than reusing stale metadata. These records describe sampled ownership; they do not prove which holder initiated a shared socket.
 
+Provider matching uses original comm/argv before redaction. A unique direct match wins even when the monitored ancestor belongs to another provider. An unmarked or ambiguous process inherits the nearest uniquely matched ancestor within the monitored tree; an unclassifiable root stays `unknown`. Nested roots and simultaneous providers are resolved per process. `ownership_json.provider_origin` identifies the supplying PID/start time and whether the match was `direct` or inherited from an `ancestor`; the owner and monitored root remain separate identities. Changes of provider or origin start a new observation episode.
+
 ---
 
 ## Exporting Data

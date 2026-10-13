@@ -893,6 +893,8 @@ struct ConnKey {
     inode: u64,
     process: ProcessIdentity,
     root: ProcessIdentity,
+    provider: Provider,
+    provider_origin: Option<ProcessIdentity>,
     proto: Proto,
     local_ip: IpAddr,
     local_port: u16,
@@ -1982,7 +1984,7 @@ fn main() {
         let monitored_roots = monitored_roots(&roots, args.no_descendants, &snapshot, &excluded);
         let targets: HashSet<_> = monitored_roots.keys().copied().collect();
         let inode_owners = map_inodes(&targets, &snapshot);
-        let pid_meta = &snapshot.meta;
+        let pid_meta = resolve_provider_meta(&monitored_roots, &snapshot);
 
         let mut seen_keys: HashSet<ConnKey> = HashSet::new();
         let entries = gather_net_entries(args.include_udp);
@@ -2007,11 +2009,16 @@ fn main() {
             if !targets.contains(&pid) {
                 continue;
             }
+            let Some(meta) = pid_meta.get(&pid) else {
+                continue;
+            };
 
             let key = ConnKey {
                 inode: entry.inode,
                 process: identity,
                 root: monitored_roots[&pid],
+                provider: meta.provider,
+                provider_origin: meta.provider_origin,
                 proto,
                 local_ip: entry.local_ip,
                 local_port: entry.local_port,
@@ -2037,12 +2044,6 @@ fn main() {
                 } else {
                     (None, None)
                 };
-                let meta = pid_meta.get(&pid).cloned().unwrap_or_else(|| PidMeta {
-                    comm: "unknown".to_string(),
-                    cmdline: "".to_string(),
-                    argv: Vec::new(),
-                    provider: Provider::Unknown,
-                });
                 let (ancestry, ancestry_path) = if args.show_ancestry {
                     let chain = ancestry_cache.get_or_compute(pid, &snapshot);
                     (
@@ -2055,8 +2056,13 @@ fn main() {
 
                 // Durable sinks get the masked cmdline; display keeps the original.
                 let log_cmdline = redact_argv(&meta.argv, args.redact_cmdline);
-                let ownership_json =
-                    format_ownership_json(entry.inode, identity, monitored_roots[&pid], owners);
+                let ownership_json = format_ownership_json(
+                    entry.inode,
+                    identity,
+                    monitored_roots[&pid],
+                    owners,
+                    meta.provider_origin,
+                );
 
                 let info = ConnInfo {
                     pid,
@@ -2159,8 +2165,13 @@ fn main() {
                 }
             } else if let Some(info) = active.get_mut(&key) {
                 info.last_seen = now;
-                info.ownership_json =
-                    format_ownership_json(entry.inode, identity, monitored_roots[&pid], owners);
+                info.ownership_json = format_ownership_json(
+                    entry.inode,
+                    identity,
+                    monitored_roots[&pid],
+                    owners,
+                    meta.provider_origin,
+                );
                 if args.show_ancestry {
                     let chain = ancestry_cache.get_or_compute(pid, &snapshot);
                     info.ancestry = Some(format_ancestry_list(&chain));
@@ -4702,6 +4713,8 @@ fn synthesized_alert_event(ts: &str, run_id: &str, provider: Provider) -> Sqlite
             inode: 0,
             process: ProcessIdentity::default(),
             root: ProcessIdentity::default(),
+            provider,
+            provider_origin: None,
             proto: Proto::Tcp,
             local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             local_port: 0,
@@ -6087,6 +6100,7 @@ struct PidMeta {
     cmdline: String,
     argv: Vec<String>,
     provider: Provider,
+    provider_origin: Option<ProcessIdentity>,
 }
 
 fn find_root_pids(
@@ -6241,6 +6255,7 @@ fn collect_process_snapshot(matcher: &ProviderMatcher) -> ProcessSnapshot {
         let comm = after.comm.clone();
         let cmdline = argv.join(" ");
         let provider = provider_from_text(&comm, &cmdline, matcher);
+        let provider_origin = (provider != Provider::Unknown).then_some(after.identity);
         snapshot.stat.insert(pid, after);
         snapshot.meta.insert(
             pid,
@@ -6249,6 +6264,7 @@ fn collect_process_snapshot(matcher: &ProviderMatcher) -> ProcessSnapshot {
                 cmdline,
                 argv,
                 provider,
+                provider_origin,
             },
         );
     }
@@ -6257,15 +6273,56 @@ fn collect_process_snapshot(matcher: &ProviderMatcher) -> ProcessSnapshot {
 
 fn provider_from_text(comm: &str, cmdline: &str, matcher: &ProviderMatcher) -> Provider {
     let text = format!("{} {}", comm.to_lowercase(), cmdline.to_lowercase());
-    if matcher.anthropic.iter().any(|p| text.contains(p)) {
-        Provider::Anthropic
-    } else if matcher.openai.iter().any(|p| text.contains(p)) {
-        Provider::OpenAI
-    } else if matcher.google.iter().any(|p| text.contains(p)) {
-        Provider::Google
+    let matches: Vec<_> = [
+        (Provider::Anthropic, &matcher.anthropic),
+        (Provider::OpenAI, &matcher.openai),
+        (Provider::Google, &matcher.google),
+    ]
+    .into_iter()
+    .filter_map(|(provider, patterns)| {
+        patterns
+            .iter()
+            .any(|pattern| text.contains(pattern))
+            .then_some(provider)
+    })
+    .collect();
+    if matches.len() == 1 {
+        matches[0]
     } else {
         Provider::Unknown
     }
+}
+
+fn resolve_provider_meta(
+    monitored: &HashMap<u32, ProcessIdentity>,
+    snapshot: &ProcessSnapshot,
+) -> HashMap<u32, PidMeta> {
+    let mut resolved = HashMap::new();
+    for &pid in monitored.keys() {
+        let Some(original) = snapshot.meta.get(&pid) else {
+            continue;
+        };
+        let mut meta = original.clone();
+        if meta.provider == Provider::Unknown {
+            let mut current = snapshot.stat.get(&pid).map(|stat| stat.ppid).unwrap_or(0);
+            let mut seen = HashSet::from([pid]);
+            while monitored.contains_key(&current) && seen.insert(current) {
+                let Some(stat) = snapshot.stat.get(&current) else {
+                    break;
+                };
+                if let Some(ancestor) = snapshot.meta.get(&current) {
+                    if ancestor.provider != Provider::Unknown {
+                        meta.provider = ancestor.provider;
+                        meta.provider_origin = Some(stat.identity);
+                        break;
+                    }
+                }
+                current = stat.ppid;
+            }
+        }
+        resolved.insert(pid, meta);
+    }
+    resolved
 }
 
 fn parse_socket_inode(link: &str) -> Option<u64> {
@@ -6345,6 +6402,7 @@ fn format_ownership_json(
     process: ProcessIdentity,
     root: ProcessIdentity,
     owners: &[ProcessIdentity],
+    provider_origin: Option<ProcessIdentity>,
 ) -> String {
     let owners: Vec<_> = owners
         .iter()
@@ -6355,14 +6413,29 @@ fn format_ownership_json(
             )
         })
         .collect();
+    let origin = provider_origin
+        .map(|origin| {
+            format!(
+                "{{\"pid\":{},\"start_time\":\"{}\",\"kind\":\"{}\"}}",
+                origin.pid,
+                origin.start_time,
+                if origin == process {
+                    "direct"
+                } else {
+                    "ancestor"
+                }
+            )
+        })
+        .unwrap_or_else(|| "null".to_string());
     format!(
-        "{{\"inode\":\"{}\",\"pid\":{},\"start_time\":\"{}\",\"root_pid\":{},\"root_start_time\":\"{}\",\"owners\":[{}]}}",
+        "{{\"inode\":\"{}\",\"pid\":{},\"start_time\":\"{}\",\"root_pid\":{},\"root_start_time\":\"{}\",\"owners\":[{}],\"provider_origin\":{}}}",
         inode,
         process.pid,
         process.start_time,
         root.pid,
         root.start_time,
-        owners.join(",")
+        owners.join(","),
+        origin
     )
 }
 
@@ -9527,6 +9600,8 @@ mod tests {
                     pid: 1234,
                     start_time: 1,
                 },
+                provider,
+                provider_origin: None,
                 proto: Proto::Tcp,
                 local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
                 local_port: 12345,
@@ -10202,6 +10277,8 @@ mod tests {
                 pid: 4242,
                 start_time: 1,
             },
+            provider: Provider::Anthropic,
+            provider_origin: None,
             proto: Proto::Tcp,
             local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             local_port: 40000,
@@ -11047,6 +11124,7 @@ mod tests {
                     cmdline: comm.to_string(),
                     argv: vec![comm.to_string()],
                     provider: Provider::Unknown,
+                    provider_origin: None,
                 },
             );
         }
@@ -11095,6 +11173,112 @@ mod tests {
         assert_eq!(monitored[&3], snapshot.stat[&3].identity);
         assert_eq!(monitored[&4], snapshot.stat[&3].identity);
         assert!(!monitored.contains_key(&5));
+    }
+
+    fn classify_fixture(snapshot: &mut ProcessSnapshot, matcher: &ProviderMatcher) {
+        for (&pid, meta) in &mut snapshot.meta {
+            meta.provider = provider_from_text(&meta.comm, &meta.cmdline, matcher);
+            meta.provider_origin =
+                (meta.provider != Provider::Unknown).then_some(snapshot.stat[&pid].identity);
+        }
+    }
+
+    #[test]
+    fn unknown_leaves_inherit_each_provider_without_changing_original_argv() {
+        for (name, provider) in [
+            ("claude", Provider::Anthropic),
+            ("codex", Provider::OpenAI),
+            ("gemini", Provider::Google),
+        ] {
+            let mut snapshot = topology_fixture(&[
+                (1, 0, 1, "init"),
+                (2, 1, 2, name),
+                (3, 2, 3, "socket-helper"),
+            ]);
+            snapshot.meta.get_mut(&3).unwrap().argv = vec![
+                "socket-helper".to_string(),
+                "--password".to_string(),
+                "FAKE WORDS CREDENTIAL".to_string(),
+            ];
+            classify_fixture(&mut snapshot, &ProviderMatcher::default());
+            let monitored = monitored_roots(&[2], false, &snapshot, &HashSet::new());
+            let resolved = resolve_provider_meta(&monitored, &snapshot);
+            assert_eq!(resolved[&3].provider, provider);
+            assert_eq!(
+                resolved[&3].provider_origin,
+                Some(snapshot.stat[&2].identity)
+            );
+            assert_eq!(resolved[&3].argv, snapshot.meta[&3].argv);
+            assert_eq!(
+                redact_argv(&resolved[&3].argv, RedactMode::Secrets),
+                "socket-helper --password <redacted>"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_unique_provider_wins_and_nested_origins_stay_distinct() {
+        let mut snapshot = topology_fixture(&[
+            (1, 0, 1, "init"),
+            (2, 1, 2, "claude"),
+            (3, 2, 3, "codex"),
+            (4, 3, 4, "helper"),
+            (5, 2, 5, "gemini"),
+            (6, 1, 6, "unrelated"),
+        ]);
+        classify_fixture(&mut snapshot, &ProviderMatcher::default());
+        let monitored = monitored_roots(&[2, 3, 6], false, &snapshot, &HashSet::new());
+        let resolved = resolve_provider_meta(&monitored, &snapshot);
+        assert_eq!(resolved[&3].provider, Provider::OpenAI);
+        assert_eq!(
+            resolved[&3].provider_origin,
+            Some(snapshot.stat[&3].identity)
+        );
+        assert_eq!(resolved[&4].provider, Provider::OpenAI);
+        assert_eq!(
+            resolved[&4].provider_origin,
+            Some(snapshot.stat[&3].identity)
+        );
+        assert_eq!(resolved[&5].provider, Provider::Google);
+        assert_eq!(
+            resolved[&5].provider_origin,
+            Some(snapshot.stat[&5].identity)
+        );
+        assert_eq!(resolved[&6].provider, Provider::Unknown);
+        assert_eq!(resolved[&6].provider_origin, None);
+        let isolated = monitored_roots(&[4], true, &snapshot, &HashSet::new());
+        assert_eq!(
+            resolve_provider_meta(&isolated, &snapshot)[&4].provider,
+            Provider::Unknown,
+            "unmonitored ancestors cannot supply provider attribution"
+        );
+    }
+
+    #[test]
+    fn ambiguous_leaf_inherits_unique_ancestor_and_custom_patterns_apply() {
+        let matcher = ProviderMatcher {
+            anthropic: vec!["custom-root".to_string()],
+            openai: vec!["open-marker".to_string()],
+            google: vec!["other-marker".to_string()],
+        };
+        let mut snapshot = topology_fixture(&[
+            (1, 0, 1, "init"),
+            (2, 1, 2, "CUSTOM-ROOT"),
+            (3, 2, 3, "open-marker other-marker"),
+        ]);
+        classify_fixture(&mut snapshot, &matcher);
+        assert_eq!(snapshot.meta[&3].provider, Provider::Unknown);
+        let monitored = monitored_roots(&[2], false, &snapshot, &HashSet::new());
+        let resolved = resolve_provider_meta(&monitored, &snapshot);
+        assert_eq!(resolved[&3].provider, Provider::Anthropic);
+        assert_eq!(
+            resolved[&3].provider_origin,
+            Some(snapshot.stat[&2].identity)
+        );
+        assert_eq!(
+            provider_from_text("helper", "claude codex", &ProviderMatcher::default()),
+            Provider::Unknown
+        );
     }
 
     #[test]
@@ -11168,10 +11352,11 @@ mod tests {
                 start_time: 10,
             },
             &owners[&99],
+            None,
         );
         assert_eq!(
             json,
-            "{\"inode\":\"99\",\"pid\":2,\"start_time\":\"20\",\"root_pid\":1,\"root_start_time\":\"10\",\"owners\":[{\"pid\":2,\"start_time\":\"20\"},{\"pid\":5,\"start_time\":\"50\"}]}"
+            "{\"inode\":\"99\",\"pid\":2,\"start_time\":\"20\",\"root_pid\":1,\"root_start_time\":\"10\",\"owners\":[{\"pid\":2,\"start_time\":\"20\"},{\"pid\":5,\"start_time\":\"50\"}],\"provider_origin\":null}"
         );
         let first = ConnKey {
             inode: 99,
@@ -11180,6 +11365,8 @@ mod tests {
                 pid: 1,
                 start_time: 10,
             },
+            provider: Provider::Unknown,
+            provider_origin: None,
             proto: Proto::Tcp,
             local_ip: "127.0.0.1".parse().unwrap(),
             local_port: 123,
