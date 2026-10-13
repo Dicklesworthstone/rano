@@ -890,6 +890,9 @@ enum Proto {
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct ConnKey {
+    inode: u64,
+    process: ProcessIdentity,
+    root: ProcessIdentity,
     proto: Proto,
     local_ip: IpAddr,
     local_port: u16,
@@ -903,6 +906,7 @@ struct ConnInfo {
     comm: String,
     cmdline: String,
     log_cmdline: String,
+    ownership_json: String,
     provider: Provider,
     domain: Option<String>,
     domain_source: Option<String>,
@@ -993,11 +997,32 @@ struct Stats {
     per_pid: BTreeMap<u32, u64>,
     per_comm: BTreeMap<String, u64>,
     per_provider: BTreeMap<Provider, u64>,
+    active_per_provider: BTreeMap<Provider, u64>,
     per_provider_domains: BTreeMap<Provider, HashSet<String>>,
     per_provider_ips: BTreeMap<Provider, HashSet<IpAddr>>,
     duration_ms_total: u64,
     duration_ms_max: u64,
     duration_ms_samples: u64,
+}
+
+impl Stats {
+    fn observed_open(&mut self, provider: Provider) {
+        self.connects += 1;
+        self.active += 1;
+        *self.per_provider.entry(provider).or_default() += 1;
+        *self.active_per_provider.entry(provider).or_default() += 1;
+    }
+
+    fn observed_close(&mut self, provider: Provider) {
+        self.closes += 1;
+        self.active = self.active.saturating_sub(1);
+        if let Some(count) = self.active_per_provider.get_mut(&provider) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                self.active_per_provider.remove(&provider);
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -1429,6 +1454,7 @@ struct SqliteEvent {
     duration_ms: Option<u64>,
     alert: bool,
     retry_count: Option<usize>,
+    ownership_json: Option<String>,
 }
 
 enum SqliteMsg {
@@ -1604,8 +1630,33 @@ struct DnsCacheEntry {
     stored_at: SystemTime,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
+struct ProcessIdentity {
+    pid: u32,
+    start_time: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ProcStat {
+    identity: ProcessIdentity,
+    ppid: u32,
+    comm: String,
+}
+
+#[derive(Default)]
+struct ProcessSnapshot {
+    stat: HashMap<u32, ProcStat>,
+    meta: HashMap<u32, PidMeta>,
+}
+
+struct AncestryEntry {
+    chain: Vec<(u32, String)>,
+    identities: Vec<ProcessIdentity>,
+    stored_at: Instant,
+}
+
 struct AncestryCache {
-    cache: HashMap<u32, (Vec<(u32, String)>, Instant)>,
+    cache: HashMap<u32, AncestryEntry>,
     ttl: Duration,
 }
 
@@ -1617,28 +1668,46 @@ impl AncestryCache {
         }
     }
 
-    fn get_or_compute(&mut self, pid: u32) -> Vec<(u32, String)> {
+    fn get_or_compute(&mut self, pid: u32, snapshot: &ProcessSnapshot) -> Vec<(u32, String)> {
         let now = Instant::now();
-        if let Some((chain, stored_at)) = self.cache.get(&pid) {
-            let expired = now.duration_since(*stored_at) >= self.ttl;
-            let cached_comm = chain.last().map(|(_, comm)| comm.as_str());
-            let current_comm = read_comm(pid);
-            let comm_matches = match (cached_comm, current_comm.as_deref()) {
-                (Some(cached), Some(current)) => cached == current,
-                _ => false,
-            };
-            if !expired && comm_matches {
-                return chain.clone();
+        let identities = ancestry_identities(pid, snapshot);
+        let chain: Vec<_> = identities
+            .iter()
+            .filter_map(|id| {
+                snapshot
+                    .stat
+                    .get(&id.pid)
+                    .map(|stat| (id.pid, stat.comm.clone()))
+            })
+            .collect();
+        if let Some(entry) = self.cache.get(&pid) {
+            let expired = now.duration_since(entry.stored_at) >= self.ttl;
+            if !expired && entry.identities == identities && entry.chain == chain {
+                return entry.chain.clone();
             }
         }
-
-        let chain = read_ancestry(pid);
-        self.cache.insert(pid, (chain.clone(), now));
+        self.cache.insert(
+            pid,
+            AncestryEntry {
+                chain: chain.clone(),
+                identities,
+                stored_at: now,
+            },
+        );
         chain
+    }
+
+    fn retain_live(&mut self, snapshot: &ProcessSnapshot) {
+        let now = Instant::now();
+        self.cache.retain(|pid, entry| {
+            now.duration_since(entry.stored_at) < self.ttl
+                && snapshot.stat.get(pid).map(|stat| stat.identity)
+                    == entry.identities.last().copied()
+        });
     }
 }
 
-fn read_ancestry(pid: u32) -> Vec<(u32, String)> {
+fn ancestry_identities(pid: u32, snapshot: &ProcessSnapshot) -> Vec<ProcessIdentity> {
     let mut chain = Vec::new();
     let mut current = pid;
     let mut seen: HashSet<u32> = HashSet::new();
@@ -1647,19 +1716,12 @@ fn read_ancestry(pid: u32) -> Vec<(u32, String)> {
         if !seen.insert(current) {
             break;
         }
-        let comm = read_comm(current).unwrap_or_else(|| "unknown".to_string());
-        chain.push((current, comm));
-        let Some(ppid) = read_ppid(current) else {
+        let Some(stat) = snapshot.stat.get(&current) else {
             break;
         };
+        chain.push(stat.identity);
+        let ppid = stat.ppid;
         if ppid == 0 {
-            break;
-        }
-        if ppid == 1 {
-            if seen.insert(ppid) {
-                let comm = read_comm(ppid).unwrap_or_else(|| "unknown".to_string());
-                chain.push((ppid, comm));
-            }
             break;
         }
         current = ppid;
@@ -1702,6 +1764,12 @@ fn truncate_ancestry_list(list: &[String]) -> Vec<String> {
 fn ancestry_chain_to_path(chain: &[(u32, String)]) -> String {
     let mut out = Vec::with_capacity(chain.len());
     for (pid, comm) in chain {
+        let comm = comm
+            .replace('%', "%25")
+            .replace(',', "%2c")
+            .replace(':', "%3a")
+            .replace('\n', "%0a")
+            .replace('\r', "%0d");
         out.push(format!("{}:{}", comm, pid));
     }
     out.join(",")
@@ -1907,14 +1975,14 @@ fn main() {
             handle.drain_into(cache);
         }
 
-        let roots = find_root_pids(&args.patterns, &args.exclude_patterns, &args.pids);
-        let targets = if args.no_descendants {
-            roots.iter().copied().collect::<HashSet<_>>()
-        } else {
-            collect_descendants(&roots)
-        };
-        let inode_to_pid = map_inodes(&targets);
-        let pid_meta = build_pid_meta_map(&targets, &provider_matcher);
+        let snapshot = collect_process_snapshot(&provider_matcher);
+        ancestry_cache.retain_live(&snapshot);
+        let excluded = excluded_processes(&args.exclude_patterns, &snapshot);
+        let roots = find_root_pids(&args.patterns, &excluded, &args.pids, &snapshot);
+        let monitored_roots = monitored_roots(&roots, args.no_descendants, &snapshot, &excluded);
+        let targets: HashSet<_> = monitored_roots.keys().copied().collect();
+        let inode_owners = map_inodes(&targets, &snapshot);
+        let pid_meta = &snapshot.meta;
 
         let mut seen_keys: HashSet<ConnKey> = HashSet::new();
         let entries = gather_net_entries(args.include_udp);
@@ -1928,15 +1996,22 @@ fn main() {
                 continue;
             }
 
-            let pid = match inode_to_pid.get(&entry.inode) {
-                Some(pid) => *pid,
+            let owners = match inode_owners.get(&entry.inode) {
+                Some(owners) if !owners.is_empty() => owners,
                 None => continue,
+                _ => continue,
             };
+            // Lowest PID is the deterministic primary owner of an inherited/shared fd.
+            let identity = owners[0];
+            let pid = identity.pid;
             if !targets.contains(&pid) {
                 continue;
             }
 
             let key = ConnKey {
+                inode: entry.inode,
+                process: identity,
+                root: monitored_roots[&pid],
                 proto,
                 local_ip: entry.local_ip,
                 local_port: entry.local_port,
@@ -1969,7 +2044,7 @@ fn main() {
                     provider: Provider::Unknown,
                 });
                 let (ancestry, ancestry_path) = if args.show_ancestry {
-                    let chain = ancestry_cache.get_or_compute(pid);
+                    let chain = ancestry_cache.get_or_compute(pid, &snapshot);
                     (
                         Some(format_ancestry_list(&chain)),
                         Some(ancestry_chain_to_path(&chain)),
@@ -1980,12 +2055,15 @@ fn main() {
 
                 // Durable sinks get the masked cmdline; display keeps the original.
                 let log_cmdline = redact_argv(&meta.argv, args.redact_cmdline);
+                let ownership_json =
+                    format_ownership_json(entry.inode, identity, monitored_roots[&pid], owners);
 
                 let info = ConnInfo {
                     pid,
                     comm: meta.comm.clone(),
                     cmdline: meta.cmdline.clone(),
                     log_cmdline: log_cmdline.clone(),
+                    ownership_json: ownership_json.clone(),
                     provider: meta.provider,
                     domain: domain.clone(),
                     domain_source: domain_source.map(str::to_string),
@@ -2013,6 +2091,7 @@ fn main() {
                         domain_source,
                         ancestry.as_deref(),
                         None,
+                        Some(&ownership_json),
                         domain_label,
                         args.json,
                         style,
@@ -2021,14 +2100,11 @@ fn main() {
                     );
                 }
 
-                stats.connects += 1;
-                stats.active = stats.active.saturating_add(1);
-                stats.peak_active = stats.peak_active.max(stats.active);
+                stats.observed_open(meta.provider);
                 *stats.per_ip.entry(entry.remote_ip).or_insert(0) += 1;
                 *stats.per_port.entry(entry.remote_port).or_insert(0) += 1;
                 *stats.per_pid.entry(pid).or_insert(0) += 1;
                 *stats.per_comm.entry(meta.comm.clone()).or_insert(0) += 1;
-                *stats.per_provider.entry(meta.provider).or_insert(0) += 1;
                 stats
                     .per_provider_domains
                     .entry(meta.provider)
@@ -2058,21 +2134,8 @@ fn main() {
                     None => false,
                 };
 
-                // Threshold alerts have no natural per-connection row; synthesize
-                // a queryable alert=1 row for each emitted breach.
-                let threshold_rows = check_threshold_alerts(
-                    &args.alert,
-                    &mut alert_state,
-                    &stats,
-                    &run_ctx.run_id,
-                    &ts,
-                    args.json,
-                    style,
-                    log_writer.as_ref(),
-                );
-
                 if stats.sqlite_enabled {
-                    stats.sqlite_outcome.observed += 1 + threshold_rows.len() as u64;
+                    stats.sqlite_outcome.observed += 1;
                 }
 
                 if let Some(writer) = sqlite_writer.as_ref() {
@@ -2091,13 +2154,18 @@ fn main() {
                         duration_ms: None,
                         alert: conn_alert_emitted,
                         retry_count: None,
+                        ownership_json: Some(ownership_json),
                     });
-                    for row in threshold_rows {
-                        writer.enqueue(row);
-                    }
                 }
             } else if let Some(info) = active.get_mut(&key) {
                 info.last_seen = now;
+                info.ownership_json =
+                    format_ownership_json(entry.inode, identity, monitored_roots[&pid], owners);
+                if args.show_ancestry {
+                    let chain = ancestry_cache.get_or_compute(pid, &snapshot);
+                    info.ancestry = Some(format_ancestry_list(&chain));
+                    info.ancestry_path = Some(ancestry_chain_to_path(&chain));
+                }
             }
         }
 
@@ -2165,6 +2233,7 @@ fn main() {
                         info.domain_source.as_deref(),
                         info.ancestry.as_deref(),
                         duration_ms,
+                        Some(&info.ownership_json),
                         domain_label,
                         args.json,
                         style,
@@ -2172,8 +2241,7 @@ fn main() {
                         log_writer.as_ref(),
                     );
                 }
-                stats.closes += 1;
-                stats.active = stats.active.saturating_sub(1);
+                stats.observed_close(info.provider);
 
                 // Single decision point for duration alerts: consults AlertState
                 // cooldowns so suppressed alerts never flag the row.
@@ -2214,8 +2282,31 @@ fn main() {
                         duration_ms,
                         alert: close_alert_emitted,
                         retry_count,
+                        ownership_json: Some(info.ownership_json.clone()),
                     });
                 }
+            }
+        }
+
+        // Reconcile opens and closes before observing a concurrent threshold or peak.
+        // Ongoing breaches repeat only when their configured cooldown permits it.
+        stats.peak_active = stats.peak_active.max(stats.active);
+        let threshold_rows = check_threshold_alerts(
+            &args.alert,
+            &mut alert_state,
+            &stats,
+            &run_ctx.run_id,
+            &now_rfc3339(),
+            args.json,
+            style,
+            log_writer.as_ref(),
+        );
+        if stats.sqlite_enabled {
+            stats.sqlite_outcome.observed += threshold_rows.len() as u64;
+        }
+        if let Some(writer) = sqlite_writer.as_ref() {
+            for row in threshold_rows {
+                writer.enqueue(row);
             }
         }
 
@@ -4571,7 +4662,7 @@ fn check_threshold_alerts(
 
     // Check max per provider threshold
     if let Some(threshold) = alert_config.max_per_provider {
-        for (provider, count) in &stats.per_provider {
+        for (provider, count) in &stats.active_per_provider {
             if *count >= threshold {
                 let sig = AlertSignature::MaxPerProvider {
                     provider: *provider,
@@ -4608,6 +4699,9 @@ fn synthesized_alert_event(ts: &str, run_id: &str, provider: Provider) -> Sqlite
         run_id: run_id.to_string(),
         event: "alert".to_string(),
         key: ConnKey {
+            inode: 0,
+            process: ProcessIdentity::default(),
+            root: ProcessIdentity::default(),
             proto: Proto::Tcp,
             local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             local_port: 0,
@@ -4624,6 +4718,7 @@ fn synthesized_alert_event(ts: &str, run_id: &str, provider: Provider) -> Sqlite
         duration_ms: None,
         alert: true,
         retry_count: None,
+        ownership_json: None,
     }
 }
 
@@ -4706,6 +4801,7 @@ fn emit_event(
     domain_source: Option<&str>,
     ancestry: Option<&[String]>,
     duration_ms: Option<u64>,
+    ownership_json: Option<&str>,
     domain_mode: &str,
     json_mode: bool,
     style: OutputStyle,
@@ -4740,6 +4836,7 @@ fn emit_event(
             domain_mode,
             ancestry,
             duration_ms,
+            ownership_json,
         );
         println!("{}", line);
     }
@@ -4796,6 +4893,7 @@ fn emit_event(
                 domain_mode,
                 ancestry,
                 duration_ms,
+                ownership_json,
             ),
             _ => strip_ansi(&line_plain),
         };
@@ -4929,6 +5027,7 @@ fn format_json_event(
     domain_mode: &str,
     ancestry: Option<&[String]>,
     duration_ms: Option<u64>,
+    ownership_json: Option<&str>,
 ) -> String {
     let mut out = String::new();
     out.push('{');
@@ -4938,6 +5037,9 @@ fn format_json_event(
     push_json_num(&mut out, "pid", pid as i64, false);
     push_json_str(&mut out, "comm", comm, false);
     push_json_str(&mut out, "cmdline", cmdline, false);
+    if let Some(ownership) = ownership_json {
+        push_json_str(&mut out, "ownership_json", ownership, false);
+    }
     push_json_str(&mut out, "provider", provider, false);
     push_json_str(&mut out, "proto", proto, false);
     push_json_str(&mut out, "local", local, false);
@@ -5235,6 +5337,12 @@ fn format_json_summary(
     push_json_map_u32(&mut out, "per_pid", &stats.per_pid, false);
     push_json_map_str(&mut out, "per_comm", &stats.per_comm, false);
     push_json_map_provider(&mut out, "per_provider", &stats.per_provider, false);
+    push_json_map_provider(
+        &mut out,
+        "active_per_provider",
+        &stats.active_per_provider,
+        false,
+    );
     push_json_str(&mut out, "domain_mode", domain_mode, false);
     out.push('}');
     out.push('}');
@@ -5983,16 +6091,16 @@ struct PidMeta {
 
 fn find_root_pids(
     patterns: &[String],
-    exclude_patterns: &[String],
+    excluded: &HashSet<u32>,
     explicit_pids: &[u32],
+    snapshot: &ProcessSnapshot,
 ) -> Vec<u32> {
     let lowered: Vec<String> = patterns.iter().map(|p| p.to_lowercase()).collect();
-    let excluded: Vec<String> = exclude_patterns.iter().map(|p| p.to_lowercase()).collect();
     let mut roots = Vec::new();
     let mut seen: HashSet<u32> = HashSet::new();
 
     for pid in explicit_pids {
-        if seen.insert(*pid) {
+        if snapshot.stat.contains_key(pid) && !excluded.contains(pid) && seen.insert(*pid) {
             roots.push(*pid);
         }
     }
@@ -6001,36 +6109,40 @@ fn find_root_pids(
         return roots;
     }
 
-    for pid in list_pids() {
-        let comm = read_comm(pid).unwrap_or_default();
-        let cmd = read_argv(pid).unwrap_or_default().join(" ");
-        let comm_l = comm.to_lowercase();
-        let cmd_l = cmd.to_lowercase();
-        if !excluded.is_empty()
-            && excluded
-                .iter()
-                .any(|p| comm_l.contains(p) || cmd_l.contains(p))
-        {
-            continue;
-        }
-        if lowered
-            .iter()
-            .any(|p| comm_l.contains(p) || cmd_l.contains(p))
-        {
-            if seen.insert(pid) {
-                roots.push(pid);
-            }
+    for (&pid, meta) in &snapshot.meta {
+        if !excluded.contains(&pid) && matches_process(meta, &lowered) && seen.insert(pid) {
+            roots.push(pid);
         }
     }
+    roots.sort_unstable();
     roots
 }
 
-fn collect_descendants(roots: &[u32]) -> HashSet<u32> {
+fn matches_process(meta: &PidMeta, patterns: &[String]) -> bool {
+    let comm = meta.comm.to_lowercase();
+    let cmdline = meta.cmdline.to_lowercase();
+    patterns
+        .iter()
+        .any(|pattern| comm.contains(pattern) || cmdline.contains(pattern))
+}
+
+fn excluded_processes(patterns: &[String], snapshot: &ProcessSnapshot) -> HashSet<u32> {
+    if patterns.is_empty() {
+        return HashSet::new();
+    }
+    let lowered: Vec<_> = patterns.iter().map(|p| p.to_lowercase()).collect();
+    let roots: Vec<_> = snapshot
+        .meta
+        .iter()
+        .filter_map(|(&pid, meta)| matches_process(meta, &lowered).then_some(pid))
+        .collect();
+    collect_descendants(&roots, snapshot)
+}
+
+fn collect_descendants(roots: &[u32], snapshot: &ProcessSnapshot) -> HashSet<u32> {
     let mut parent_map: HashMap<u32, Vec<u32>> = HashMap::new();
-    for pid in list_pids() {
-        if let Some(ppid) = read_ppid(pid) {
-            parent_map.entry(ppid).or_default().push(pid);
-        }
+    for (&pid, stat) in &snapshot.stat {
+        parent_map.entry(stat.ppid).or_default().push(pid);
     }
 
     let mut set: HashSet<u32> = HashSet::new();
@@ -6048,33 +6160,90 @@ fn collect_descendants(roots: &[u32]) -> HashSet<u32> {
     set
 }
 
-fn map_inodes(targets: &HashSet<u32>) -> HashMap<u64, u32> {
-    let mut map = HashMap::new();
+fn monitored_roots(
+    roots: &[u32],
+    no_descendants: bool,
+    snapshot: &ProcessSnapshot,
+    excluded: &HashSet<u32>,
+) -> HashMap<u32, ProcessIdentity> {
+    let root_set: HashSet<_> = roots.iter().copied().collect();
+    let candidates = if no_descendants {
+        root_set.clone()
+    } else {
+        collect_descendants(roots, snapshot)
+    };
+    let mut result = HashMap::new();
+    for pid in candidates {
+        if excluded.contains(&pid) {
+            continue;
+        }
+        let mut current = pid;
+        let mut seen = HashSet::new();
+        while seen.insert(current) {
+            let Some(stat) = snapshot.stat.get(&current) else {
+                break;
+            };
+            if root_set.contains(&current) {
+                result.insert(pid, stat.identity);
+                break;
+            }
+            current = stat.ppid;
+        }
+    }
+    result
+}
+
+fn map_inodes(
+    targets: &HashSet<u32>,
+    snapshot: &ProcessSnapshot,
+) -> HashMap<u64, Vec<ProcessIdentity>> {
+    let mut map: HashMap<u64, Vec<ProcessIdentity>> = HashMap::new();
     for pid in targets {
+        let Some(stat) = snapshot.stat.get(pid) else {
+            continue;
+        };
         let fd_dir = format!("/proc/{}/fd", pid);
         if let Ok(entries) = fs::read_dir(fd_dir) {
             for entry in entries.flatten() {
                 if let Ok(link) = fs::read_link(entry.path()) {
                     let link_str = link.to_string_lossy();
                     if let Some(inode) = parse_socket_inode(&link_str) {
-                        map.insert(inode, *pid);
+                        map.entry(inode).or_default().push(stat.identity);
                     }
                 }
             }
         }
     }
+    canonicalize_inode_owners(&mut map);
     map
 }
 
-fn build_pid_meta_map(targets: &HashSet<u32>, matcher: &ProviderMatcher) -> HashMap<u32, PidMeta> {
-    let mut map = HashMap::new();
-    for pid in targets {
-        let comm = read_comm(*pid).unwrap_or_else(|| "unknown".to_string());
-        let argv = read_argv(*pid).unwrap_or_default();
+fn canonicalize_inode_owners(map: &mut HashMap<u64, Vec<ProcessIdentity>>) {
+    for owners in map.values_mut() {
+        owners.sort_unstable();
+        owners.dedup();
+    }
+}
+
+fn collect_process_snapshot(matcher: &ProviderMatcher) -> ProcessSnapshot {
+    let mut snapshot = ProcessSnapshot::default();
+    for pid in list_pids() {
+        let Some(before) = read_proc_stat(pid) else {
+            continue;
+        };
+        let argv = read_argv(pid).unwrap_or_default();
+        let Some(after) = read_proc_stat(pid) else {
+            continue;
+        };
+        if before != after {
+            continue;
+        }
+        let comm = after.comm.clone();
         let cmdline = argv.join(" ");
         let provider = provider_from_text(&comm, &cmdline, matcher);
-        map.insert(
-            *pid,
+        snapshot.stat.insert(pid, after);
+        snapshot.meta.insert(
+            pid,
             PidMeta {
                 comm,
                 cmdline,
@@ -6083,7 +6252,7 @@ fn build_pid_meta_map(targets: &HashSet<u32>, matcher: &ProviderMatcher) -> Hash
             },
         );
     }
-    map
+    snapshot
 }
 
 fn provider_from_text(comm: &str, cmdline: &str, matcher: &ProviderMatcher) -> Provider {
@@ -6100,14 +6269,11 @@ fn provider_from_text(comm: &str, cmdline: &str, matcher: &ProviderMatcher) -> P
 }
 
 fn parse_socket_inode(link: &str) -> Option<u64> {
-    if let Some(start) = link.find("socket:[") {
-        let rest = &link[start + 8..];
-        if let Some(end) = rest.find(']') {
-            let inode_str = &rest[..end];
-            return inode_str.parse::<u64>().ok();
-        }
+    let inode = link.strip_prefix("socket:[")?.strip_suffix(']')?;
+    if !inode.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
     }
-    None
+    inode.parse().ok()
 }
 
 fn list_pids() -> Vec<u32> {
@@ -6122,11 +6288,6 @@ fn list_pids() -> Vec<u32> {
         }
     }
     pids
-}
-
-fn read_comm(pid: u32) -> Option<String> {
-    let path = format!("/proc/{}/comm", pid);
-    fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
 fn decode_argv(data: &[u8]) -> Vec<String> {
@@ -6150,15 +6311,59 @@ fn read_argv(pid: u32) -> Option<Vec<String>> {
     None
 }
 
-fn read_ppid(pid: u32) -> Option<u32> {
+fn read_proc_stat(pid: u32) -> Option<ProcStat> {
     let path = format!("/proc/{}/stat", pid);
-    let content = fs::read_to_string(path).ok()?;
-    let parts: Vec<&str> = content.split_whitespace().collect();
-    if parts.len() > 3 {
-        parts[3].parse::<u32>().ok()
-    } else {
-        None
+    let content = fs::read(path).ok()?;
+    let stat = parse_proc_stat(&String::from_utf8_lossy(&content))?;
+    (stat.identity.pid == pid).then_some(stat)
+}
+
+fn parse_proc_stat(content: &str) -> Option<ProcStat> {
+    let (pid, rest) = content.split_once(' ')?;
+    let pid = pid.parse::<u32>().ok()?;
+    let rest = rest.strip_prefix('(')?;
+    let end = rest.rfind(')')?;
+    let comm = rest[..end].to_string();
+    if !rest[end + 1..].starts_with(' ') {
+        return None;
     }
+    let fields: Vec<_> = rest[end + 1..].split_ascii_whitespace().collect();
+    if fields.first()?.len() != 1 || !fields[0].as_bytes()[0].is_ascii_alphabetic() {
+        return None;
+    }
+    let ppid = fields.get(1)?.parse().ok()?;
+    let start_time = fields.get(19)?.parse().ok()?;
+    Some(ProcStat {
+        identity: ProcessIdentity { pid, start_time },
+        ppid,
+        comm,
+    })
+}
+
+fn format_ownership_json(
+    inode: u64,
+    process: ProcessIdentity,
+    root: ProcessIdentity,
+    owners: &[ProcessIdentity],
+) -> String {
+    let owners: Vec<_> = owners
+        .iter()
+        .map(|owner| {
+            format!(
+                "{{\"pid\":{},\"start_time\":\"{}\"}}",
+                owner.pid, owner.start_time
+            )
+        })
+        .collect();
+    format!(
+        "{{\"inode\":\"{}\",\"pid\":{},\"start_time\":\"{}\",\"root_pid\":{},\"root_start_time\":\"{}\",\"owners\":[{}]}}",
+        inode,
+        process.pid,
+        process.start_time,
+        root.pid,
+        root.start_time,
+        owners.join(",")
+    )
 }
 
 fn gather_net_entries(include_udp: bool) -> Vec<(Proto, NetEntry)> {
@@ -6281,6 +6486,7 @@ const EXPORT_FIELDS: &[&str] = &[
     "duration_ms",
     "alert",
     "retry_count",
+    "ownership_json",
 ];
 
 const PROVIDER_LABELS: &[&str] = &["anthropic", "openai", "google", "unknown"];
@@ -6518,6 +6724,7 @@ fn run_export(args: ExportArgs) -> Result<(), String> {
     let _ = ensure_column(&mut conn, "events", "retry_count", "INTEGER");
     let _ = ensure_column(&mut conn, "events", "alert", "INTEGER");
     let _ = ensure_column(&mut conn, "events", "ancestry_path", "TEXT");
+    let _ = ensure_column(&mut conn, "events", "ownership_json", "TEXT");
 
     let has_events = table_exists(&conn, "events")?;
     if !has_events {
@@ -8407,6 +8614,12 @@ fn query_ancestry_roots(
                 .split_once(':')
                 .map(|(comm, _)| comm.to_string())
                 .unwrap_or(root_seg);
+            let root = root
+                .replace("%2c", ",")
+                .replace("%3a", ":")
+                .replace("%0a", "\n")
+                .replace("%0d", "\r")
+                .replace("%25", "%");
             Ok(AncestryRootStats { root, connects })
         })
         .map_err(|e| format!("Failed to query ancestry roots: {}", e))?;
@@ -8631,6 +8844,7 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "events", "remote_is_private", "INTEGER")?;
     ensure_column(conn, "events", "ip_version", "INTEGER")?;
     ensure_column(conn, "events", "retry_count", "INTEGER")?;
+    ensure_column(conn, "events", "ownership_json", "TEXT")?;
     ensure_column(conn, "sessions", "session_name", "TEXT")?;
 
     // Phase 3: indexes and views (safe now that all columns exist).
@@ -8758,8 +8972,8 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
     };
     let (is_private, ip_version) = ip_flags(event.key.remote_ip);
     conn.execute(
-        "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, domain_source, ancestry_path, remote_is_private, ip_version, duration_ms, alert, retry_count)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20)",
+        "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, domain_source, ancestry_path, remote_is_private, ip_version, duration_ms, alert, retry_count, ownership_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         params![
             &event.ts,
             &event.run_id,
@@ -8781,6 +8995,7 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
             event.duration_ms.map(|v| v as i64),
             if event.alert { 1 } else { 0 },
             event.retry_count.map(|v| v as i64),
+            event.ownership_json.as_deref(),
         ],
     )?;
     Ok(())
@@ -8949,6 +9164,7 @@ mod tests {
                     Provider::Anthropic,
                     Some("quote\"\\\t.example"),
                     Some("dns"),
+                    None,
                     None,
                     None,
                     "ptr",
@@ -9302,6 +9518,15 @@ mod tests {
             run_id: "test-run".to_string(),
             event: event.to_string(),
             key: ConnKey {
+                inode: 0,
+                process: ProcessIdentity {
+                    pid: 1234,
+                    start_time: 1,
+                },
+                root: ProcessIdentity {
+                    pid: 1234,
+                    start_time: 1,
+                },
                 proto: Proto::Tcp,
                 local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
                 local_port: 12345,
@@ -9318,6 +9543,7 @@ mod tests {
             duration_ms: if event == "close" { Some(1000) } else { None },
             alert: false,
             retry_count: None,
+            ownership_json: None,
         }
     }
 
@@ -9967,6 +10193,15 @@ mod tests {
             suppressed_count: 0,
         };
         let key = ConnKey {
+            inode: 0,
+            process: ProcessIdentity {
+                pid: 4242,
+                start_time: 1,
+            },
+            root: ProcessIdentity {
+                pid: 4242,
+                start_time: 1,
+            },
             proto: Proto::Tcp,
             local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             local_port: 40000,
@@ -9978,6 +10213,7 @@ mod tests {
             comm: "claude".to_string(),
             cmdline: "claude".to_string(),
             log_cmdline: "claude".to_string(),
+            ownership_json: String::new(),
             provider: Provider::Anthropic,
             domain: Some("evil.malicious.com".to_string()),
             domain_source: Some("dns".to_string()),
@@ -10066,6 +10302,7 @@ mod tests {
             per_pid: BTreeMap::new(),
             per_comm: BTreeMap::new(),
             per_provider: BTreeMap::new(),
+            active_per_provider: BTreeMap::new(),
             per_provider_domains: BTreeMap::new(),
             per_provider_ips: BTreeMap::new(),
             duration_ms_total: 0,
@@ -10118,6 +10355,110 @@ mod tests {
             )
             .expect("synthetic alert query failed");
         assert_eq!(n, 1);
+    }
+
+    #[test]
+    fn provider_threshold_uses_concurrent_counts_and_exact_boundary() {
+        let mut stats = Stats::default();
+        for _ in 0..10 {
+            stats.observed_open(Provider::Anthropic);
+            stats.observed_close(Provider::Anthropic);
+        }
+        assert_eq!(stats.per_provider[&Provider::Anthropic], 10);
+        assert_eq!(stats.active, 0);
+        let config = AlertConfig {
+            max_per_provider: Some(2),
+            ..AlertConfig::default()
+        };
+        let mut state = AlertState {
+            last_alert: HashMap::new(),
+            alert_count: 0,
+            suppressed_count: 0,
+        };
+        let style = OutputStyle {
+            color: false,
+            theme: Theme::Mono,
+        };
+        let check = |stats: &Stats, state: &mut AlertState| {
+            check_threshold_alerts(
+                &config,
+                state,
+                stats,
+                "run",
+                "2026-01-20T12:00:00Z",
+                true,
+                style,
+                None,
+            )
+        };
+        assert!(check(&stats, &mut state).is_empty());
+        stats.observed_open(Provider::Anthropic);
+        assert!(check(&stats, &mut state).is_empty());
+        stats.observed_open(Provider::Anthropic);
+        assert_eq!(check(&stats, &mut state).len(), 1);
+        assert!(check(&stats, &mut state).is_empty());
+        assert_eq!(state.suppressed_count, 1);
+        stats.observed_close(Provider::Anthropic);
+        assert!(check(&stats, &mut state).is_empty());
+        stats.observed_open(Provider::Google);
+        assert!(check(&stats, &mut state).is_empty());
+        assert_eq!(stats.active_per_provider[&Provider::Anthropic], 1);
+        assert_eq!(stats.active_per_provider[&Provider::Google], 1);
+    }
+
+    #[test]
+    fn simultaneous_thresholds_repeat_after_cooldown_and_respect_no_alerts() {
+        let mut stats = Stats::default();
+        stats.observed_open(Provider::OpenAI);
+        stats.observed_open(Provider::OpenAI);
+        let config = AlertConfig {
+            max_connections: Some(2),
+            max_per_provider: Some(2),
+            cooldown_ms: 1000,
+            ..AlertConfig::default()
+        };
+        let mut state = AlertState {
+            last_alert: HashMap::new(),
+            alert_count: 0,
+            suppressed_count: 0,
+        };
+        let style = OutputStyle {
+            color: false,
+            theme: Theme::Mono,
+        };
+        assert_eq!(
+            check_threshold_alerts(&config, &mut state, &stats, "run", "ts", true, style, None)
+                .len(),
+            2
+        );
+        assert!(
+            check_threshold_alerts(&config, &mut state, &stats, "run", "ts", true, style, None)
+                .is_empty()
+        );
+        for timestamp in state.last_alert.values_mut() {
+            *timestamp = SystemTime::now() - Duration::from_secs(2);
+        }
+        assert_eq!(
+            check_threshold_alerts(&config, &mut state, &stats, "run", "ts", true, style, None)
+                .len(),
+            2
+        );
+        let disabled = AlertConfig {
+            no_alerts: true,
+            ..config
+        };
+        assert!(
+            check_threshold_alerts(
+                &disabled, &mut state, &stats, "run", "ts", true, style, None
+            )
+            .is_empty()
+        );
+        stats.observed_open(Provider::OpenAI);
+        stats.observed_close(Provider::OpenAI);
+        assert_eq!(
+            stats.active, 2,
+            "a same-poll replacement must be evaluated only after closes"
+        );
     }
 
     #[test]
@@ -10629,6 +10970,238 @@ mod tests {
     }
 
     #[test]
+    fn proc_stat_parses_complete_comm_and_kernel_identity() {
+        let tail = "R 42 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 987";
+        for comm in ["normal", "odd name)", " ) nested (comm)\n"] {
+            let stat = parse_proc_stat(&format!("123 ({comm}) {tail}")).unwrap();
+            assert_eq!(stat.comm, comm);
+            assert_eq!(stat.ppid, 42);
+            assert_eq!(
+                stat.identity,
+                ProcessIdentity {
+                    pid: 123,
+                    start_time: 987
+                }
+            );
+        }
+        let max = parse_proc_stat(
+            "4294967295 () S 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 18446744073709551615",
+        )
+        .unwrap();
+        assert_eq!(max.identity.pid, u32::MAX);
+        assert_eq!(max.identity.start_time, u64::MAX);
+        for malformed in [
+            "",
+            "123",
+            "123 (incomplete",
+            "-1 (name) R 0",
+            "1 (name)R 0",
+            "1 (name) ?? 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1",
+            "1 (name) R bad 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 1",
+        ] {
+            assert!(
+                parse_proc_stat(malformed).is_none(),
+                "malformed stat accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn socket_inode_requires_the_kernel_link_shape() {
+        assert_eq!(parse_socket_inode("socket:[42]"), Some(42));
+        assert_eq!(
+            parse_socket_inode("socket:[18446744073709551615]"),
+            Some(u64::MAX)
+        );
+        for link in [
+            "/tmp/socket:[42]",
+            "socket:[42]suffix",
+            "socket:[]",
+            "socket:[+42]",
+            "socket:[x]",
+            "socket:[18446744073709551616]",
+        ] {
+            assert_eq!(
+                parse_socket_inode(link),
+                None,
+                "non-socket descriptor accepted"
+            );
+        }
+    }
+
+    fn topology_fixture(rows: &[(u32, u32, u64, &str)]) -> ProcessSnapshot {
+        let mut snapshot = ProcessSnapshot::default();
+        for &(pid, ppid, start_time, comm) in rows {
+            snapshot.stat.insert(
+                pid,
+                ProcStat {
+                    identity: ProcessIdentity { pid, start_time },
+                    ppid,
+                    comm: comm.to_string(),
+                },
+            );
+            snapshot.meta.insert(
+                pid,
+                PidMeta {
+                    comm: comm.to_string(),
+                    cmdline: comm.to_string(),
+                    argv: vec![comm.to_string()],
+                    provider: Provider::Unknown,
+                },
+            );
+        }
+        snapshot
+    }
+
+    #[test]
+    fn exclusions_prune_subtrees_including_explicit_and_nested_roots() {
+        let snapshot = topology_fixture(&[
+            (1, 0, 1, "init"),
+            (2, 1, 2, "claude"),
+            (3, 2, 3, "skip-this"),
+            (4, 3, 4, "claude"),
+            (5, 2, 5, "worker"),
+        ]);
+        let excluded = excluded_processes(&["SKIP".to_string()], &snapshot);
+        assert_eq!(excluded, HashSet::from([3, 4]));
+        let roots = find_root_pids(&["claude".to_string()], &excluded, &[4], &snapshot);
+        assert_eq!(roots, [2]);
+        let monitored = monitored_roots(&roots, false, &snapshot, &excluded);
+        assert_eq!(
+            monitored.keys().copied().collect::<HashSet<_>>(),
+            HashSet::from([2, 5])
+        );
+        assert_eq!(monitored[&5], snapshot.stat[&2].identity);
+        assert_eq!(
+            monitored_roots(&roots, true, &snapshot, &excluded)
+                .keys()
+                .copied()
+                .collect::<Vec<_>>(),
+            [2]
+        );
+    }
+
+    #[test]
+    fn nested_roots_choose_the_nearest_and_ignore_unrelated_processes() {
+        let snapshot = topology_fixture(&[
+            (1, 0, 1, "init"),
+            (2, 1, 2, "root"),
+            (3, 2, 3, "nested"),
+            (4, 3, 4, "worker"),
+            (5, 1, 5, "unrelated"),
+        ]);
+        let monitored = monitored_roots(&[3, 2], false, &snapshot, &HashSet::new());
+        assert_eq!(monitored[&2], snapshot.stat[&2].identity);
+        assert_eq!(monitored[&3], snapshot.stat[&3].identity);
+        assert_eq!(monitored[&4], snapshot.stat[&3].identity);
+        assert!(!monitored.contains_key(&5));
+    }
+
+    #[test]
+    fn ancestry_cache_invalidates_identical_comm_pid_reuse_and_reparenting() {
+        let original = topology_fixture(&[
+            (1, 0, 1, "init"),
+            (2, 1, 2, "old-parent"),
+            (3, 2, 3, "same-name"),
+        ]);
+        let mut cache = AncestryCache::new(Duration::from_secs(30));
+        assert_eq!(
+            cache.get_or_compute(3, &original),
+            [
+                (1, "init".to_string()),
+                (2, "old-parent".to_string()),
+                (3, "same-name".to_string())
+            ]
+        );
+        let reused = topology_fixture(&[
+            (1, 0, 1, "init"),
+            (4, 1, 4, "new-parent"),
+            (3, 4, 30, "same-name"),
+        ]);
+        let chain = cache.get_or_compute(3, &reused);
+        assert_eq!(chain[1], (4, "new-parent".to_string()));
+        assert_eq!(cache.cache[&3].identities.last().unwrap().start_time, 30);
+        let reparented = topology_fixture(&[(1, 0, 1, "init"), (3, 1, 30, "same-name")]);
+        assert_eq!(cache.get_or_compute(3, &reparented).len(), 2);
+        cache.retain_live(&ProcessSnapshot::default());
+        assert!(cache.cache.is_empty());
+    }
+
+    #[test]
+    fn shared_inode_owners_are_sorted_deduplicated_and_identity_bound() {
+        let mut owners = HashMap::from([(
+            99,
+            vec![
+                ProcessIdentity {
+                    pid: 5,
+                    start_time: 50,
+                },
+                ProcessIdentity {
+                    pid: 2,
+                    start_time: 20,
+                },
+                ProcessIdentity {
+                    pid: 2,
+                    start_time: 20,
+                },
+            ],
+        )]);
+        canonicalize_inode_owners(&mut owners);
+        assert_eq!(
+            owners[&99],
+            [
+                ProcessIdentity {
+                    pid: 2,
+                    start_time: 20
+                },
+                ProcessIdentity {
+                    pid: 5,
+                    start_time: 50
+                }
+            ]
+        );
+        let json = format_ownership_json(
+            99,
+            owners[&99][0],
+            ProcessIdentity {
+                pid: 1,
+                start_time: 10,
+            },
+            &owners[&99],
+        );
+        assert_eq!(
+            json,
+            "{\"inode\":\"99\",\"pid\":2,\"start_time\":\"20\",\"root_pid\":1,\"root_start_time\":\"10\",\"owners\":[{\"pid\":2,\"start_time\":\"20\"},{\"pid\":5,\"start_time\":\"50\"}]}"
+        );
+        let first = ConnKey {
+            inode: 99,
+            process: owners[&99][0],
+            root: ProcessIdentity {
+                pid: 1,
+                start_time: 10,
+            },
+            proto: Proto::Tcp,
+            local_ip: "127.0.0.1".parse().unwrap(),
+            local_port: 123,
+            remote_ip: "127.0.0.1".parse().unwrap(),
+            remote_port: 456,
+        };
+        let reused = ConnKey {
+            process: ProcessIdentity {
+                pid: 2,
+                start_time: 21,
+            },
+            ..first.clone()
+        };
+        let replaced_socket = ConnKey {
+            inode: 100,
+            ..first.clone()
+        };
+        assert_ne!(first, reused);
+        assert_ne!(first, replaced_socket);
+    }
+
+    #[test]
     fn format_ancestry_special_chars_in_comm() {
         // Process names with special characters
         let chain = vec![(1, "init".to_string()), (1234, "my-proc_v2".to_string())];
@@ -10641,6 +11214,30 @@ mod tests {
         let chain = vec![(1, "init".to_string()), (1234, "my-proc_v2".to_string())];
         let result = ancestry_chain_to_path(&chain);
         assert_eq!(result, "init:1,my-proc_v2:1234");
+    }
+
+    #[test]
+    fn ancestry_reserved_delimiters_roundtrip_into_report_roots() {
+        let name = "root%2c,part:role\n雪";
+        let path = ancestry_chain_to_path(&[(1, name.to_string()), (2, "child".to_string())]);
+        assert_eq!(path, "root%252c%2cpart%3arole%0a雪:1,child:2");
+        let mut conn = setup_test_db();
+        let mut event = create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Anthropic);
+        event.ancestry_path = Some(path);
+        write_sqlite_batch(&mut conn, &[event]).unwrap();
+        let roots = query_ancestry_roots(
+            &conn,
+            &ReportFilter {
+                run_id: None,
+                since: None,
+                until: None,
+            },
+            10,
+            true,
+        )
+        .unwrap();
+        assert_eq!(roots[0].root, name);
+        assert_eq!(roots[0].connects, 1);
     }
 
     // =========================================================================

@@ -415,12 +415,14 @@ rano --alert-domain "*.suspicious.com" \
 |------|-------------|
 | `--alert-domain <pattern>` | Glob pattern for domains to watch (repeatable) |
 | `--alert-max-connections <N>` | Alert when total active connections reach N (fires at >= N) |
-| `--alert-max-per-provider <N>` | Alert when any provider reaches N connections (fires at >= N) |
+| `--alert-max-per-provider <N>` | Alert when any provider reaches N concurrently observed connections (fires at >= N) |
 | `--alert-duration-ms <N>` | Alert on connections lasting longer than N ms |
 | `--alert-unknown-domain` | Alert on connections to unresolved IPs |
 | `--alert-bell` | Ring terminal bell on alert |
 | `--alert-cooldown-ms <N>` | Suppress duplicate alerts within N ms (default: 10000) |
 | `--no-alerts` | Disable all alerting |
+
+Global and provider thresholds are evaluated once after each poll has reconciled new and closed sockets. A replacement in the same poll does not create a transient breach. Ongoing breaches and re-crossings can alert again after the configured cooldown; `per_provider` retains lifetime totals, while `active_per_provider` in the final JSON summary reports current counts. Peak activity is sampled at the same poll boundary.
 
 ### Alert Output Format
 
@@ -740,7 +742,9 @@ rano export --format jsonl | jq 'select(.ancestry_path | contains("tmux"))'
 
 ### Performance
 
-Ancestry is cached with a fixed 30-second TTL plus staleness detection; the cache is invalidated if a process's comm name changes, keeping long-running sessions accurate. Ancestry capture is active when `--show-ancestry` is passed (it is off by default to save syscalls); without it the stored `ancestry_path` is empty. Display truncates chains deeper than five levels to `... → grandparent → leaf`.
+Each poll uses a process snapshot with kernel start times. Ancestry is cached for at most 30 seconds and reused only while every process identity and comm in the chain is unchanged; PID reuse and reparenting invalidate it. Ancestry capture is active when `--show-ancestry` is passed; without it the stored `ancestry_path` is null. Display truncates chains deeper than five levels to `... → grandparent → leaf`, while JSON and SQLite retain the full chain. Reserved path characters (`%`, comma, colon and line breaks) in comm names use percent escapes so process names remain unambiguous.
+
+Exclusions prune the matching process and its descendants, including explicitly selected PIDs and nested pattern matches. The nearest selected ancestor defines each monitored root. For a socket shared by multiple monitored processes, the lowest PID is the primary owner. `ownership_json` in JSON events, SQLite and exports contains the socket inode, owner/root PID and kernel start time, and all observed monitored holders; decode this field as JSON to inspect shared ownership. PID reuse, inode replacement or a change of monitored root starts a new observation episode rather than reusing stale metadata. These records describe sampled ownership; they do not prove which holder initiated a shared socket.
 
 ---
 

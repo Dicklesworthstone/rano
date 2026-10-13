@@ -19,7 +19,7 @@ TEST_SQLITE="/tmp/rano-e2e-ancestry-$$.sqlite"
 
 # Cleanup on exit
 cleanup() {
-    rm -f "${TEST_SQLITE}"
+    e2e_info "Retained ancestry database: ${TEST_SQLITE}"
 }
 trap cleanup EXIT
 
@@ -169,6 +169,131 @@ e2e_run "export special chars" "${RANO}" export --format csv --sqlite "${TEST_SQ
 e2e_assert_last_status 0
 e2e_assert_last_contains "my-app_v2:5000"
 e2e_info "PASS: Special characters in process names handled"
+
+e2e_section "Live process topology, exclusions and shared descriptors"
+python3 - "${RANO}" "${E2E_OUTPUT_DIR}" <<'PY' || e2e_fail "live topology matrix failed; inspect retained captures"
+import base64
+import csv
+import io
+import json
+import os
+import signal
+import sqlite3
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+binary = str(Path(sys.argv[1]).resolve())
+root = Path(tempfile.mkdtemp(prefix='topology-', dir=sys.argv[2]))
+print(f'  retained fixtures={root}')
+leaf_code = '''import base64,ctypes,json,os,socket,sys
+ctypes.CDLL(None).prctl(15,base64.b64decode(sys.argv[1]),0,0,0)
+s=socket.socket();s.bind(('127.0.0.1',0));s.listen()
+c=socket.socket();c.connect(s.getsockname());a,_=s.accept()
+print(json.dumps({'leaf':os.getpid()}),flush=True)
+sys.stdin.read(1)
+'''
+middle_code = '''import base64,ctypes,json,os,subprocess,sys
+ctypes.CDLL(None).prctl(15,base64.b64decode(sys.argv[1]),0,0,0)
+p=subprocess.Popen([sys.executable,'-u','-c',base64.b64decode(sys.argv[2]).decode(),sys.argv[3]],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+ready=json.loads(p.stdout.readline());ready['middle']=os.getpid()
+print(json.dumps(ready),flush=True)
+try: sys.stdin.read(1)
+finally: p.terminate();p.wait()
+'''
+parent_code = '''import base64,ctypes,json,os,signal,socket,subprocess,sys
+ctypes.CDLL(None).prctl(15,b'root-holder',0,0,0)
+mode=sys.argv[1]
+if mode=='shared':
+ s=socket.socket();s.bind(('127.0.0.1',0));s.listen()
+ c=socket.socket();c.connect(s.getsockname());a,_=s.accept()
+ r,w=os.pipe();child=os.fork()
+ if child==0:
+  os.close(r);ctypes.CDLL(None).prctl(15,b'shared-child',0,0,0)
+  os.write(w,b'x');os.close(w);signal.pause();sys.exit(0)
+ os.close(w);os.read(r,1);os.close(r)
+ ready={'root':os.getpid(),'child':child}
+ print(json.dumps(ready),flush=True)
+ try: sys.stdin.read(1)
+ finally: os.kill(child,signal.SIGTERM);os.waitpid(child,0)
+else:
+ code=base64.b64decode(sys.argv[2]).decode()
+ args=[sys.executable,'-u','-c',code]+sys.argv[3:-1]
+ p=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+ ready=json.loads(p.stdout.readline());ready['root']=os.getpid()
+ print(json.dumps(ready),flush=True)
+ try: sys.stdin.read(1)
+ finally:
+  p.stdin.write('x');p.stdin.flush();p.wait(timeout=5)
+'''
+
+def encoded(value): return base64.b64encode(value.encode()).decode()
+def launch(mode, comm):
+    if mode == 'excluded':
+        arguments = [encoded(middle_code), encoded('skip-subtree'), encoded(leaf_code), encoded(comm)]
+    else:
+        arguments = [encoded(leaf_code), encoded(comm)]
+    # The marker is a real final argv argument. Helper source contains no provider names.
+    holder = subprocess.Popen([sys.executable, '-u', '-c', parent_code, mode, *arguments, 'claude'],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    return holder, json.loads(holder.stdout.readline())
+
+def proc_identity(pid):
+    raw = Path(f'/proc/{pid}/stat').read_text()
+    fields = raw.rsplit(') ', 1)[1].split()
+    return {'pid': pid, 'start_time': fields[19]}, int(fields[1])
+
+def inspect(holder, ready, label, flags, expected, owner_ids):
+    case = root / label; case.mkdir()
+    command = [binary, '--no-config', '--pid', str(holder.pid), '--once', '--json', '--no-banner',
+        '--no-dns', '--show-ancestry', '--sqlite', str(case / 'events.sqlite'), *flags]
+    result = subprocess.run(command, capture_output=True, text=True, timeout=20)
+    (case / 'stdout.jsonl').write_text(result.stdout); (case / 'stderr').write_text(result.stderr)
+    assert result.returncode == 0, f'{label}: monitor failed'
+    events = [r for r in map(json.loads, result.stdout.splitlines()) if r.get('event') == 'connect']
+    assert len(events) == expected, f'{label}: expected {expected} connects, got {len(events)}'
+    with sqlite3.connect(case / 'events.sqlite') as conn:
+        durable = conn.execute('SELECT pid, ancestry_path, ownership_json FROM events').fetchall()
+    assert len(durable) == expected, f'{label}: missing durable rows'
+    for event in events:
+        ownership = json.loads(event['ownership_json'])
+        primary = min(owner_ids)
+        identity, ppid = proc_identity(primary)
+        root_identity, _ = proc_identity(holder.pid)
+        assert event['pid'] == primary and ownership['pid'] == primary, f'{label}: nondeterministic owner'
+        assert ownership['start_time'] == identity['start_time'], f'{label}: stale owner identity'
+        assert ownership['root_pid'] == holder.pid and ownership['root_start_time'] == root_identity['start_time'], f'{label}: wrong monitored root'
+        expected_owners = [proc_identity(pid)[0] for pid in sorted(owner_ids)]
+        assert ownership['owners'] == expected_owners, f'{label}: shared holders lost'
+        assert f'root-holder({holder.pid})' in event['ancestry'], f'{label}: missing root ancestry'
+        assert any(f'({ppid})' in name for name in event['ancestry']), f'{label}: missing immediate parent'
+        assert any(json.loads(stored) == ownership for _, _, stored in durable), f'{label}: ownership not persisted'
+    export = subprocess.run([binary, 'export', '--sqlite', str(case / 'events.sqlite'), '--format', 'csv'], capture_output=True, text=True, timeout=20)
+    (case / 'export.csv').write_text(export.stdout); (case / 'export.stderr').write_text(export.stderr)
+    assert export.returncode == 0, f'{label}: export failed'
+    rows = list(csv.DictReader(io.StringIO(export.stdout)))
+    assert len(rows) == expected, f'{label}: export dropped rows'
+    for row in rows:
+        assert row['ancestry_path'] and json.loads(row['ownership_json'])['root_pid'] == holder.pid, f'{label}: export lost provenance'
+    return [event['pid'] for event in events]
+
+for mode, comm in [('leaf', 'odd name)'), ('excluded', 'socket-child'), ('shared', 'unused')]:
+    holder, ready = launch(mode, comm)
+    try:
+        owners = [holder.pid, ready['child']] if mode == 'shared' else [ready['leaf']]
+        inspect(holder, ready, f'{mode}-positive', [], 2, owners)
+        if mode == 'leaf':
+            inspect(holder, ready, 'no-descendants', ['--no-descendants'], 0, [])
+        if mode == 'excluded':
+            inspect(holder, ready, 'excluded-subtree', ['--exclude-pattern', 'skip-subtree'], 0, [])
+            inspect(holder, ready, 'explicit-excluded', ['--pid', str(ready['leaf']), '--exclude-pattern', 'skip-subtree'], 0, [])
+        if mode == 'shared':
+            for poll in range(3): inspect(holder, ready, f'shared-repeat-{poll}', [], 2, owners)
+        print(f'  PASS {mode}: real sockets, ancestry, ownership, identities, SQLite and export')
+    finally:
+        holder.stdin.write('x'); holder.stdin.flush(); holder.wait(timeout=5)
+PY
 
 # Summary
 e2e_section "Summary"

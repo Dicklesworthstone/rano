@@ -6,7 +6,7 @@
 # - Domain watch alerts trigger on matching patterns
 # - Max-connections alert fires at threshold
 # - Cooldown prevents duplicate alerts
-# - Alerts appear on stderr, not stdout
+# - JSON alerts join stdout; pretty alerts use stderr
 # - SQLite stores alert=true for alert-triggering events
 #
 # Prerequisites:
@@ -21,7 +21,7 @@ TEST_LOG="/tmp/rano-e2e-alerts-$$.log"
 
 # Cleanup on exit
 cleanup() {
-    rm -f "${TEST_SQLITE}" "${TEST_LOG}" "${TEST_LOG}.stderr"
+    e2e_info "Retained alert fixtures: ${TEST_SQLITE}, ${TEST_LOG}"
 }
 trap cleanup EXIT
 
@@ -143,6 +143,98 @@ e2e_run "check column type" sqlite3 "${TEST_SQLITE}" "PRAGMA table_info(events);
 
 e2e_assert_last_contains "alert"
 e2e_info "PASS: Alert column present in SQLite schema"
+
+e2e_section "Live alert triggers, cooldowns and concurrent negative control"
+python3 - "${RANO}" "${E2E_OUTPUT_DIR}" <<'PY' || e2e_fail "live alert matrix failed; inspect retained captures"
+import json
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import tempfile
+import time
+from pathlib import Path
+
+binary = str(Path(sys.argv[1]).resolve())
+root = Path(tempfile.mkdtemp(prefix='alerts-', dir=sys.argv[2]))
+print(f'  retained fixtures={root}')
+holder_code = '''import json,socket,sys
+s=socket.socket();s.bind(('127.0.0.1',0));s.listen()
+print(json.dumps({'ready':True}),flush=True)
+for _ in range(3):
+ sys.stdin.read(1);c=socket.socket();c.connect(s.getsockname());a,_=s.accept()
+ sys.stdin.read(1);c.close();a.close()
+sys.stdin.read(1)
+'''
+
+def records(path):
+    return [json.loads(line) for line in path.read_text().splitlines(keepends=True) if line.endswith('\n')]
+def until(predicate, monitor, description):
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if predicate(): return
+        assert monitor.poll() is None, f'monitor exited before {description}'
+        time.sleep(0.02)
+    raise AssertionError(f'no {description}; captures retained')
+
+cases = [
+    ('sequential', ['--no-dns', '--alert-max-connections', '3', '--alert-max-per-provider', '3'], {}),
+    ('threshold', ['--no-dns', '--alert-max-connections', '2', '--alert-max-per-provider', '2'], {'max_connections':1, 'max_per_provider':1}),
+    ('unknown', ['--no-dns', '--alert-unknown-domain'], {'unknown_domain':1}),
+    ('domain', ['--domain-mode', 'ptr', '--alert-domain', '*'], {'domain_match':1}),
+    ('duration', ['--no-dns', '--alert-duration-ms', '1'], {'long_duration':6}),
+    ('disabled', ['--no-dns', '--alert-max-connections', '1', '--alert-max-per-provider', '1', '--alert-unknown-domain', '--alert-duration-ms', '1', '--no-alerts'], {}),
+]
+for name, flags, expected in cases:
+    case = root / name; case.mkdir()
+    holder = subprocess.Popen([sys.executable, '-u', '-c', holder_code, 'claude'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    json.loads(holder.stdout.readline())
+    monitor = None
+    try:
+        command = [binary, '--no-config', '--pid', str(holder.pid), '--no-descendants', '--interval-ms', '20',
+            '--json', '--no-banner', '--stats-interval-ms', '0', '--sqlite', str(case / 'events.sqlite'),
+            '--log-format', 'json', '--log-file', str(case / 'file.jsonl'), '--alert-cooldown-ms', '100000', *flags]
+        with (case / 'stdout.jsonl').open('w') as stdout, (case / 'stderr').open('w') as stderr:
+            monitor = subprocess.Popen(command, stdout=stdout, stderr=stderr)
+            for cycle in range(3):
+                holder.stdin.write('o');holder.stdin.flush()
+                until(lambda: sum(row.get('event')=='connect' for row in records(case/'stdout.jsonl'))==2*(cycle+1), monitor, 'confirmed connects')
+                time.sleep(0.05)
+                holder.stdin.write('c');holder.stdin.flush()
+                until(lambda: sum(row.get('event')=='close' for row in records(case/'stdout.jsonl'))==2*(cycle+1), monitor, 'confirmed closes')
+            monitor.send_signal(signal.SIGINT);assert monitor.wait(timeout=20)==0, 'monitor failed'
+        output = records(case/'stdout.jsonl')
+        alerts = [row for row in output if row.get('type')=='alert']
+        actual = {}
+        for alert in alerts: actual[alert['kind']] = actual.get(alert['kind'],0)+1
+        assert actual == expected, f'{name}: unexpected alert kinds/counts {actual}'
+        summary = next(row['summary'] for row in reversed(output) if 'summary' in row)
+        assert summary['connects']==6 and summary['closes']==6 and summary['active']==0, 'workload did not complete'
+        assert summary['per_provider']['anthropic']==6, 'lifetime totals changed'
+        assert summary['peak_active']==2, 'per-row transient inflated sampled peak'
+        if name == 'threshold':
+            assert all(alert['actual']==2 for alert in alerts), 'threshold used lifetime count'
+            assert summary['alerts_suppressed']>0, 'cooldown suppression not exercised'
+        if name == 'domain': assert all(alert['domain'] for alert in alerts), 'empty domain trigger'
+        file_alerts = [row for row in records(case/'file.jsonl') if row.get('type')=='alert']
+        assert file_alerts == alerts, 'file alerts disagree with stdout'
+        with sqlite3.connect(case/'events.sqlite') as conn:
+            flagged = conn.execute('SELECT event, count(*) FROM events WHERE alert=1 GROUP BY event').fetchall()
+            total = conn.execute('SELECT count(*) FROM events').fetchone()[0]
+        flags_by_event = dict(flagged)
+        expected_flag = 'alert' if name=='threshold' else 'close' if name=='duration' else 'connect'
+        assert flags_by_event == ({expected_flag:len(alerts)} if alerts else {}), f'{name}: cooldown-aware flags disagree'
+        assert summary['sqlite']['observed']==total and summary['sqlite']['persisted']==total and summary['sqlite_dropped']==0, 'alert rows did not reconcile'
+        export = subprocess.run([binary,'export','--sqlite',str(case/'events.sqlite'),'--format','jsonl'],capture_output=True,text=True,timeout=20)
+        (case/'export.jsonl').write_text(export.stdout);(case/'export.stderr').write_text(export.stderr)
+        assert export.returncode==0 and len([row for row in map(json.loads,export.stdout.splitlines()) if row.get('alert')==1])==len(alerts), 'export lost flagged rows'
+        print(f'  PASS {name}: six opens/closes, kinds={actual}, cooldown/durable/file/export semantics')
+    finally:
+        if monitor is not None and monitor.poll() is None:
+            monitor.send_signal(signal.SIGINT);monitor.wait(timeout=20)
+        holder.terminate();holder.wait(timeout=5)
+PY
 
 # Summary
 e2e_section "Summary"
