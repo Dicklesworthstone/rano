@@ -19,7 +19,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError, SyncSender, TrySendError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -207,12 +207,11 @@ impl PresetLoader {
                 continue;
             }
             if value.is_empty() {
-                eprintln!(
-                    "warning: preset line {}: missing value for '{}', skipping",
+                return Err(format!(
+                    "preset line {}: missing value for '{}'",
                     idx + 1,
                     key
-                );
-                continue;
+                ));
             }
             result.insert(key.to_string(), value.to_string());
         }
@@ -400,7 +399,8 @@ fn apply_preset_values(
                 args.retry_window_ms = n;
             }
             _ => {
-                eprintln!("warning: unknown preset key '{}'", key);
+                args.warnings
+                    .push(format!("warning: unknown preset key '{}'", key));
             }
         }
     }
@@ -427,6 +427,7 @@ fn print_presets_list(loader: &PresetLoader) {
 
 #[derive(Clone, Debug)]
 struct MonitorArgs {
+    warnings: Vec<String>,
     patterns: Vec<String>,
     exclude_patterns: Vec<String>,
     pids: Vec<u32>,
@@ -684,6 +685,7 @@ fn suppressed_banner_note_lines(notes: &[String], json_mode: bool) -> Vec<String
 impl Default for MonitorArgs {
     fn default() -> Self {
         Self {
+            warnings: Vec::new(),
             patterns: Vec::new(),
             exclude_patterns: Vec::new(),
             pids: Vec::new(),
@@ -900,6 +902,7 @@ struct ConnInfo {
     pid: u32,
     comm: String,
     cmdline: String,
+    log_cmdline: String,
     provider: Provider,
     domain: Option<String>,
     domain_source: Option<String>,
@@ -981,6 +984,9 @@ struct Stats {
     active: u64,
     peak_active: u64,
     sqlite_dropped: u64,
+    sqlite_enabled: bool,
+    sqlite_outcome: SqliteOutcome,
+    log_failed: bool,
     per_ip: BTreeMap<IpAddr, u64>,
     per_port: BTreeMap<u16, u64>,
     per_domain: BTreeMap<String, u64>,
@@ -1018,15 +1024,36 @@ impl RunContext {
         let run_id = format!("{}-{}", std::process::id(), millis);
         let host = hostname();
         let user = env::var("USER").unwrap_or_else(|_| "unknown".to_string());
-        let args_snapshot = env::args().collect::<Vec<_>>().join(" ");
-        let patterns = args.patterns.join(", ");
+        let argv: Vec<_> = env::args().collect();
+        let args_snapshot = redact_argv(&argv, args.redact_cmdline);
+        let patterns = match args.redact_cmdline {
+            RedactMode::Off => args.patterns.join(", "),
+            RedactMode::Secrets => args
+                .patterns
+                .iter()
+                .map(|p| mask_token(p))
+                .collect::<Vec<_>>()
+                .join(", "),
+            RedactMode::All => format!("<redacted:{} patterns>", args.patterns.len()),
+        };
         // Generate session name or use override
         let session_name = args.session_name.clone().unwrap_or_else(|| {
-            generate_session_name(
-                &args.patterns,
-                primary_provider.unwrap_or(Provider::Unknown),
-            )
+            let patterns: Vec<_> = args
+                .patterns
+                .iter()
+                .map(|pattern| match args.redact_cmdline {
+                    RedactMode::Off => pattern.clone(),
+                    RedactMode::Secrets => mask_token(pattern),
+                    RedactMode::All => REDACTED_PLACEHOLDER.to_string(),
+                })
+                .collect();
+            generate_session_name(&patterns, primary_provider.unwrap_or(Provider::Unknown))
         });
+        let session_name = match args.redact_cmdline {
+            RedactMode::Off => session_name,
+            RedactMode::Secrets => mask_token(&session_name),
+            RedactMode::All => REDACTED_PLACEHOLDER.to_string(),
+        };
         Self {
             run_id,
             start_ts,
@@ -1205,13 +1232,59 @@ impl OutputStyle {
 
 struct LogWriter {
     file: Mutex<std::fs::File>,
+    format: LogFormat,
+    failed: AtomicBool,
 }
 
 impl LogWriter {
     fn write_line(&self, line: &str) {
-        if let Ok(mut file) = self.file.lock() {
-            let _ = writeln!(file, "{}", line);
+        let result = self
+            .file
+            .lock()
+            .map_err(|_| "file log lock poisoned".to_string())
+            .and_then(|mut file| {
+                writeln!(file, "{}", line).map_err(|err| format!("file log write failed: {}", err))
+            });
+        if let Err(err) = result {
+            self.record_failure(&err);
         }
+    }
+
+    fn record_failure(&self, error: &str) {
+        if !self.failed.swap(true, Ordering::Relaxed) {
+            eprintln!("error: {}", error);
+        }
+    }
+
+    fn flush(&self) {
+        let result = self
+            .file
+            .lock()
+            .map_err(|_| "file log lock poisoned".to_string())
+            .and_then(|mut file| {
+                file.flush()
+                    .map_err(|err| format!("file log flush failed: {}", err))
+            });
+        if let Err(err) = result {
+            self.record_failure(&err);
+        }
+    }
+
+    fn write_record(&self, json: &str, pretty: &str) {
+        match self.format {
+            LogFormat::Json => self.write_line(json),
+            _ => self.write_line(&strip_ansi(pretty)),
+        }
+    }
+
+    fn warning(&self, message: &str) {
+        self.write_record(
+            &format!(
+                "{{\"type\":\"warning\",\"message\":\"{}\"}}",
+                escape_json(message)
+            ),
+            message,
+        );
     }
 }
 
@@ -1310,23 +1383,21 @@ fn mask_token(token: &str) -> String {
     token.to_string()
 }
 
-/// Redact a command line for durable storage according to `mode`.
-fn redact_cmdline_str(cmdline: &str, mode: RedactMode) -> String {
+/// Preserve argument boundaries until masking is complete, then format for storage.
+fn redact_argv<S: AsRef<str>>(argv: &[S], mode: RedactMode) -> String {
     match mode {
-        RedactMode::Off => return cmdline.to_string(),
+        RedactMode::Off => return argv.iter().map(AsRef::as_ref).collect::<Vec<_>>().join(" "),
         RedactMode::All => {
-            let argc = cmdline.split_whitespace().count();
-            return format!("<redacted:{argc} args>");
+            return format!("<redacted:{} args>", argv.len());
         }
         RedactMode::Secrets => {}
     }
 
-    let tokens: Vec<&str> = cmdline.split_whitespace().collect();
-    let mut out: Vec<String> = Vec::with_capacity(tokens.len());
+    let mut out: Vec<String> = Vec::with_capacity(argv.len());
     let mut i = 0;
-    while i < tokens.len() {
-        let token = tokens[i];
-        if is_secret_flag(token) && i + 1 < tokens.len() {
+    while i < argv.len() {
+        let token = argv[i].as_ref();
+        if is_secret_flag(token) && i + 1 < argv.len() {
             out.push(token.to_string());
             out.push(REDACTED_PLACEHOLDER.to_string());
             i += 2;
@@ -1374,16 +1445,87 @@ struct DropState {
     dropped_since_warn: u64,
 }
 
+#[derive(Default)]
+struct SqliteOutcome {
+    observed: u64,
+    persisted: u64,
+    queue_lost: u64,
+    write_lost: u64,
+    failed: bool,
+    error: Option<String>,
+}
+
+#[derive(Default)]
+struct SqliteCounters {
+    observed: AtomicU64,
+    persisted: AtomicU64,
+    queue_lost: AtomicU64,
+    write_lost: AtomicU64,
+    failed: AtomicBool,
+    error: Mutex<Option<String>>,
+}
+
+impl SqliteCounters {
+    fn failure(&self, message: String, log_writer: Option<&Arc<LogWriter>>) {
+        let first = !self.failed.swap(true, Ordering::Relaxed);
+        {
+            let mut error = self
+                .error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match error.as_mut() {
+                Some(previous) if !previous.contains(&message) => {
+                    previous.push_str("; ");
+                    previous.push_str(&message);
+                }
+                None => *error = Some(message.clone()),
+                _ => {}
+            }
+        }
+        if first {
+            eprintln!("error: {}", message);
+            if let Some(writer) = log_writer {
+                writer.warning(&message);
+            }
+        }
+    }
+
+    fn outcome(&self) -> SqliteOutcome {
+        let observed = self.observed.load(Ordering::Relaxed);
+        let persisted = self.persisted.load(Ordering::Relaxed);
+        let queue_lost = self.queue_lost.load(Ordering::Relaxed);
+        // A panicked/disconnected writer may leave accepted events in its queue.
+        let write_lost = self.write_lost.load(Ordering::Relaxed).max(
+            observed
+                .saturating_sub(persisted)
+                .saturating_sub(queue_lost),
+        );
+        SqliteOutcome {
+            observed,
+            persisted,
+            queue_lost,
+            write_lost,
+            failed: self.failed.load(Ordering::Relaxed) || queue_lost > 0 || write_lost > 0,
+            error: self
+                .error
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone(),
+        }
+    }
+}
+
 struct SqliteWriter {
     sender: SyncSender<SqliteMsg>,
     handle: Option<std::thread::JoinHandle<()>>,
-    dropped_total: Arc<std::sync::atomic::AtomicU64>,
+    counters: Arc<SqliteCounters>,
     drop_state: Mutex<DropState>,
     log_writer: Option<Arc<LogWriter>>,
 }
 
 impl SqliteWriter {
     fn enqueue(&self, event: SqliteEvent) {
+        self.counters.observed.fetch_add(1, Ordering::Relaxed);
         match self.sender.try_send(SqliteMsg::Event(event)) {
             Ok(_) => {}
             Err(TrySendError::Full(_)) => {
@@ -1391,24 +1533,47 @@ impl SqliteWriter {
             }
             Err(TrySendError::Disconnected(_)) => {
                 self.record_drop(1);
+                self.counters.failure(
+                    "sqlite writer disconnected while enqueueing an event".to_string(),
+                    self.log_writer.as_ref(),
+                );
             }
         }
     }
 
-    fn shutdown(mut self, run_id: String, connects: u64, closes: u64) -> u64 {
-        let _ = self.sender.send(SqliteMsg::Shutdown {
-            run_id,
-            connects,
-            closes,
-        });
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+    fn shutdown(mut self, run_id: String, connects: u64, closes: u64) -> SqliteOutcome {
+        if self
+            .sender
+            .send(SqliteMsg::Shutdown {
+                run_id,
+                connects,
+                closes,
+            })
+            .is_err()
+        {
+            self.counters.failure(
+                "sqlite writer disconnected before shutdown".to_string(),
+                self.log_writer.as_ref(),
+            );
         }
-        self.dropped_total.load(Ordering::Relaxed)
+        if let Some(handle) = self.handle.take() {
+            if let Err(payload) = handle.join() {
+                let detail = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic payload");
+                self.counters.failure(
+                    format!("sqlite writer thread panicked: {}", detail),
+                    self.log_writer.as_ref(),
+                );
+            }
+        }
+        self.counters.outcome()
     }
 
     fn record_drop(&self, count: u64) {
-        let total = self.dropped_total.fetch_add(count, Ordering::Relaxed) + count;
+        let total = self.counters.queue_lost.fetch_add(count, Ordering::Relaxed) + count;
         let mut state = match self.drop_state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -1426,7 +1591,7 @@ impl SqliteWriter {
             );
             eprintln!("{}", msg);
             if let Some(writer) = self.log_writer.as_ref() {
-                writer.write_line(&msg);
+                writer.warning(&msg);
             }
             state.last_warn = now;
             state.dropped_since_warn = 0;
@@ -1673,14 +1838,44 @@ fn main() {
     let mut retry_tracker = RetryTracker::new(args.retry_threshold, args.retry_window_ms);
 
     let resolved_log_format = log_format_for_output(args.json, args.log_format);
-    let log_writer = open_log_writer(&args, &domain_label, resolved_log_format);
+    let log_writer = match open_log_writer(&args, &domain_label, resolved_log_format) {
+        Ok(writer) => writer,
+        Err(err) => {
+            eprintln!("error: {}", err);
+            if args.json {
+                println!(
+                    "{{\"type\":\"error\",\"message\":\"{}\"}}",
+                    escape_json(&err)
+                );
+            }
+            std::process::exit(1);
+        }
+    };
+    for warning in &args.warnings {
+        eprintln!("{}", warning);
+        if let Some(writer) = &log_writer {
+            writer.warning(warning);
+        }
+    }
 
     let run_ctx = RunContext::new(&args, domain_label, None);
 
+    stats.sqlite_enabled = !args.no_sqlite;
     let sqlite_writer = if args.no_sqlite {
         None
     } else {
-        start_sqlite_writer(&args, run_ctx.clone(), log_writer.clone())
+        match start_sqlite_writer(&args, run_ctx.clone(), log_writer.clone()) {
+            Ok(writer) => Some(writer),
+            Err(err) => {
+                eprintln!("error: {}", err);
+                if let Some(writer) = &log_writer {
+                    writer.warning(&err);
+                }
+                stats.sqlite_outcome.failed = true;
+                stats.sqlite_outcome.error = Some(err);
+                None
+            }
+        }
     };
 
     if !args.no_banner {
@@ -1691,6 +1886,11 @@ fn main() {
         // pure event stream.
         for line in suppressed_banner_note_lines(&domain_notes, args.json) {
             eprintln!("{}", line);
+        }
+        if let Some(writer) = &log_writer {
+            for note in &domain_notes {
+                writer.warning(&format!("warning: {}", note));
+            }
         }
     }
 
@@ -1765,6 +1965,7 @@ fn main() {
                 let meta = pid_meta.get(&pid).cloned().unwrap_or_else(|| PidMeta {
                     comm: "unknown".to_string(),
                     cmdline: "".to_string(),
+                    argv: Vec::new(),
                     provider: Provider::Unknown,
                 });
                 let (ancestry, ancestry_path) = if args.show_ancestry {
@@ -1778,15 +1979,13 @@ fn main() {
                 };
 
                 // Durable sinks get the masked cmdline; display keeps the original.
-                let log_cmdline = match args.redact_cmdline {
-                    RedactMode::Off => None,
-                    mode => Some(redact_cmdline_str(&meta.cmdline, mode)),
-                };
+                let log_cmdline = redact_argv(&meta.argv, args.redact_cmdline);
 
                 let info = ConnInfo {
                     pid,
                     comm: meta.comm.clone(),
                     cmdline: meta.cmdline.clone(),
+                    log_cmdline: log_cmdline.clone(),
                     provider: meta.provider,
                     domain: domain.clone(),
                     domain_source: domain_source.map(str::to_string),
@@ -1808,7 +2007,7 @@ fn main() {
                         pid,
                         &meta.comm,
                         &meta.cmdline,
-                        log_cmdline.as_deref(),
+                        Some(&log_cmdline),
                         meta.provider,
                         domain.as_deref(),
                         domain_source,
@@ -1854,6 +2053,7 @@ fn main() {
                         conn_info,
                         args.json,
                         style,
+                        log_writer.as_ref(),
                     ),
                     None => false,
                 };
@@ -1868,7 +2068,12 @@ fn main() {
                     &ts,
                     args.json,
                     style,
+                    log_writer.as_ref(),
                 );
+
+                if stats.sqlite_enabled {
+                    stats.sqlite_outcome.observed += 1 + threshold_rows.len() as u64;
+                }
 
                 if let Some(writer) = sqlite_writer.as_ref() {
                     writer.enqueue(SqliteEvent {
@@ -1876,7 +2081,7 @@ fn main() {
                         run_id: run_ctx.run_id.clone(),
                         event: "connect".to_string(),
                         key: key.clone(),
-                        cmdline: log_cmdline.clone().unwrap_or_else(|| meta.cmdline.clone()),
+                        cmdline: log_cmdline.clone(),
                         pid: Some(pid),
                         comm: meta.comm.clone(),
                         provider: meta.provider,
@@ -1923,38 +2128,27 @@ fn main() {
                             "\u{26A0} Retry pattern: {} connections to {}:{} in {}s",
                             warning.count, domain_str, key.remote_port, warning.window_seconds
                         );
+                        let json = format_json_retry_warning(warning);
                         if args.json {
                             // JSON retry warnings join alert/event objects on stdout so
                             // machine consumers read one stream; stderr stays human-only.
-                            println!(
-                                r#"{{"type":"retry_warning","count":{},"endpoint":"{}:{}","window_seconds":{}}}"#,
-                                warning.count,
-                                warning.endpoint.0,
-                                warning.endpoint.1,
-                                warning.window_seconds
-                            );
+                            println!("{}", json);
                         } else {
                             let styled_msg = if style.color {
                                 format!("\x1b[33m{}\x1b[0m", msg)
                             } else {
-                                msg
+                                msg.clone()
                             };
                             eprintln!("{}", styled_msg);
                         }
                         if let Some(ref writer) = log_writer {
-                            writer.write_line(&format!(
-                                "\u{26A0} Retry pattern: {} connections to {}:{} in {}s",
-                                warning.count, domain_str, key.remote_port, warning.window_seconds
-                            ));
+                            writer.write_record(&json, &msg);
                         }
                     }
                 }
 
                 // Durable sinks get the masked cmdline; display keeps the original.
-                let close_log_cmdline = match args.redact_cmdline {
-                    RedactMode::Off => None,
-                    mode => Some(redact_cmdline_str(&info.cmdline, mode)),
-                };
+                let close_log_cmdline = &info.log_cmdline;
 
                 if !args.summary_only {
                     emit_event(
@@ -1965,7 +2159,7 @@ fn main() {
                         info.pid,
                         &info.comm,
                         &info.cmdline,
-                        close_log_cmdline.as_deref(),
+                        Some(close_log_cmdline),
                         info.provider,
                         info.domain.as_deref(),
                         info.domain_source.as_deref(),
@@ -1997,9 +2191,13 @@ fn main() {
                         ms,
                         args.json,
                         style,
+                        log_writer.as_ref(),
                     );
                 }
 
+                if stats.sqlite_enabled {
+                    stats.sqlite_outcome.observed += 1;
+                }
                 if let Some(writer) = sqlite_writer.as_ref() {
                     writer.enqueue(SqliteEvent {
                         ts: ts.clone(),
@@ -2008,9 +2206,7 @@ fn main() {
                         key: key.clone(),
                         pid: Some(info.pid),
                         comm: info.comm.clone(),
-                        cmdline: close_log_cmdline
-                            .clone()
-                            .unwrap_or_else(|| info.cmdline.clone()),
+                        cmdline: close_log_cmdline.clone(),
                         provider: info.provider,
                         domain: info.domain.clone(),
                         domain_source: info.domain_source.clone(),
@@ -2056,8 +2252,12 @@ fn main() {
     }
 
     if let Some(writer) = sqlite_writer {
-        stats.sqlite_dropped =
+        stats.sqlite_outcome =
             writer.shutdown(run_ctx.run_id.clone(), stats.connects, stats.closes);
+        stats.sqlite_dropped = stats.sqlite_outcome.queue_lost + stats.sqlite_outcome.write_lost;
+    } else if stats.sqlite_enabled {
+        stats.sqlite_outcome.write_lost = stats.sqlite_outcome.observed;
+        stats.sqlite_dropped = stats.sqlite_outcome.write_lost;
     }
 
     if let Some(handle) = pcap_handle.take() {
@@ -2065,7 +2265,7 @@ fn main() {
     }
 
     summary(
-        &stats,
+        &mut stats,
         args.json,
         args.stats_top,
         style,
@@ -2074,6 +2274,9 @@ fn main() {
         alert_state.alert_count,
         alert_state.suppressed_count,
     );
+    if stats.sqlite_outcome.failed || stats.log_failed {
+        std::process::exit(1);
+    }
 }
 
 fn parse_cli() -> Result<Cli, String> {
@@ -2510,7 +2713,8 @@ fn parse_update_args(argv: &[String]) -> Result<UpdateCommand, String> {
             print_update_help();
             std::process::exit(0);
         }
-        if arg == "-V" || arg == "--version" {
+        // --version selects an installer release here; only -V displays rano's version.
+        if arg == "-V" {
             print_version();
             std::process::exit(0);
         }
@@ -3287,11 +3491,11 @@ fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> 
                 args.retry_window_ms = n;
             }
             _ => {
-                eprintln!(
+                args.warnings.push(format!(
                     "warning: unknown config key '{}' in {}",
                     key,
                     path.display()
-                );
+                ));
             }
         }
     }
@@ -3948,7 +4152,7 @@ fn banner(
             );
         }
         if let Some(writer) = log_writer.as_ref() {
-            writer.write_line(&strip_ansi(&warning));
+            writer.warning(&warning);
         }
     }
 }
@@ -4049,15 +4253,19 @@ fn emit_alert(
     bell: bool,
     json_mode: bool,
     style: OutputStyle,
+    log_writer: Option<&Arc<LogWriter>>,
 ) {
     let ts = now_rfc3339();
+    let json = format_json_alert(&ts, kind, severity, conn_key, conn_info);
+    let line = format_pretty_alert(&ts, kind, severity, conn_key, conn_info, style);
 
     if json_mode {
-        let json = format_json_alert(&ts, kind, severity, conn_key, conn_info);
         println!("{}", json);
     } else {
-        let line = format_pretty_alert(&ts, kind, severity, conn_key, conn_info, style);
         eprintln!("{}", line);
+    }
+    if let Some(writer) = log_writer {
+        writer.write_record(&json, &line);
     }
 
     if bell {
@@ -4073,7 +4281,7 @@ fn format_json_alert(
     conn_info: Option<&ConnInfo>,
 ) -> String {
     let mut parts = vec![
-        format!("\"ts\":\"{}\"", ts),
+        format!("\"ts\":\"{}\"", escape_json(ts)),
         "\"type\":\"alert\"".to_string(),
     ];
 
@@ -4268,6 +4476,7 @@ fn check_connection_alerts(
     info: &ConnInfo,
     json_mode: bool,
     style: OutputStyle,
+    log_writer: Option<&Arc<LogWriter>>,
 ) -> bool {
     let trigger =
         match connection_alert_trigger(alert_config, info.domain.as_deref(), key.remote_ip) {
@@ -4290,6 +4499,7 @@ fn check_connection_alerts(
                     alert_config.bell,
                     json_mode,
                     style,
+                    log_writer,
                 );
                 true
             } else {
@@ -4307,6 +4517,7 @@ fn check_connection_alerts(
                     alert_config.bell,
                     json_mode,
                     style,
+                    log_writer,
                 );
                 true
             } else {
@@ -4327,6 +4538,7 @@ fn check_threshold_alerts(
     ts: &str,
     json_mode: bool,
     style: OutputStyle,
+    log_writer: Option<&Arc<LogWriter>>,
 ) -> Vec<SqliteEvent> {
     if !alert_config.is_enabled() {
         return Vec::new();
@@ -4350,6 +4562,7 @@ fn check_threshold_alerts(
                     alert_config.bell,
                     json_mode,
                     style,
+                    log_writer,
                 );
                 rows.push(synthesized_alert_event(ts, run_id, Provider::Unknown));
             }
@@ -4376,6 +4589,7 @@ fn check_threshold_alerts(
                         alert_config.bell,
                         json_mode,
                         style,
+                        log_writer,
                     );
                     rows.push(synthesized_alert_event(ts, run_id, *provider));
                 }
@@ -4437,6 +4651,7 @@ fn check_duration_alert(
     duration_ms: u64,
     json_mode: bool,
     style: OutputStyle,
+    log_writer: Option<&Arc<LogWriter>>,
 ) -> bool {
     if !would_trigger_duration_alert(alert_config, Some(duration_ms)) {
         return false;
@@ -4462,11 +4677,19 @@ fn check_duration_alert(
             alert_config.bell,
             json_mode,
             style,
+            log_writer,
         );
         true
     } else {
         false
     }
+}
+
+fn format_json_retry_warning(warning: &RetryWarning) -> String {
+    format!(
+        r#"{{"type":"retry_warning","count":{},"endpoint":"{}:{}","window_seconds":{}}}"#,
+        warning.count, warning.endpoint.0, warning.endpoint.1, warning.window_seconds
+    )
 }
 
 fn emit_event(
@@ -4519,30 +4742,6 @@ fn emit_event(
             duration_ms,
         );
         println!("{}", line);
-        if let Some(writer) = log_writer {
-            if cmdline_for_log == cmdline {
-                writer.write_line(&line);
-            } else {
-                writer.write_line(&format_json_event(
-                    ts,
-                    run_id,
-                    event,
-                    pid,
-                    comm,
-                    cmdline_for_log,
-                    provider.label(),
-                    proto,
-                    &local,
-                    &remote,
-                    dom,
-                    domain_source,
-                    domain_mode,
-                    ancestry,
-                    duration_ms,
-                ));
-            }
-        }
-        return;
     }
 
     let line_plain = format_pretty_event(
@@ -4575,7 +4774,9 @@ fn emit_event(
         Some(style),
     );
 
-    println!("{}", line_colored);
+    if !json_mode {
+        println!("{}", line_colored);
+    }
 
     if let Some(writer) = log_writer {
         let output = match log_format {
@@ -4757,7 +4958,7 @@ fn format_json_event(
 }
 
 fn summary(
-    stats: &Stats,
+    stats: &mut Stats,
     json_mode: bool,
     stats_top: usize,
     style: OutputStyle,
@@ -4766,12 +4967,31 @@ fn summary(
     alert_count: u64,
     suppressed_count: u64,
 ) {
+    if let Some(writer) = log_writer {
+        writer.flush();
+        stats.log_failed = writer.failed.load(Ordering::Relaxed);
+        writer.write_record(
+            &format_json_summary(stats, domain_mode, alert_count, suppressed_count),
+            &format!(
+                "summary connects={} closes={} active={} peak_active={} sqlite_dropped={} alerts={} suppressed={} sqlite_observed={} sqlite_persisted={} sqlite_queue_lost={} sqlite_write_lost={} sqlite_failed={} log_failed={}",
+                stats.connects,
+                stats.closes,
+                stats.active,
+                stats.peak_active,
+                stats.sqlite_dropped,
+                alert_count,
+                suppressed_count,
+                stats.sqlite_outcome.observed, stats.sqlite_outcome.persisted,
+                stats.sqlite_outcome.queue_lost, stats.sqlite_outcome.write_lost,
+                stats.sqlite_outcome.failed, stats.log_failed
+            ),
+        );
+        writer.flush();
+        stats.log_failed = writer.failed.load(Ordering::Relaxed);
+    }
     if json_mode {
         let line = format_json_summary(stats, domain_mode, alert_count, suppressed_count);
         println!("{}", line);
-        if let Some(writer) = log_writer {
-            writer.write_line(&line);
-        }
         return;
     }
 
@@ -4849,6 +5069,19 @@ fn summary(
                 style.color
             )
         );
+    }
+    if stats.sqlite_enabled {
+        println!(
+            "  sqlite observed={} persisted={} queue_lost={} write_lost={} failed={}",
+            stats.sqlite_outcome.observed,
+            stats.sqlite_outcome.persisted,
+            stats.sqlite_outcome.queue_lost,
+            stats.sqlite_outcome.write_lost,
+            stats.sqlite_outcome.failed
+        );
+    }
+    if stats.log_failed {
+        println!("  file log failed");
     }
 
     if alert_count > 0 || suppressed_count > 0 {
@@ -4947,20 +5180,6 @@ fn summary(
             println!("    {} {}", count, comm);
         }
     }
-
-    if let Some(writer) = log_writer {
-        let line = format!(
-            "summary connects={} closes={} active={} peak_active={} sqlite_dropped={} alerts={} suppressed={}",
-            stats.connects,
-            stats.closes,
-            stats.active,
-            stats.peak_active,
-            stats.sqlite_dropped,
-            alert_count,
-            suppressed_count
-        );
-        writer.write_line(&line);
-    }
 }
 
 fn format_json_summary(
@@ -4982,6 +5201,15 @@ fn format_json_summary(
         stats.sqlite_dropped as i64,
         false,
     );
+    out.push_str(",\"sqlite\":{");
+    out.push_str(&format!("\"enabled\":{},\"observed\":{},\"persisted\":{},\"queue_lost\":{},\"write_lost\":{},\"failed\":{}",
+        stats.sqlite_enabled, stats.sqlite_outcome.observed, stats.sqlite_outcome.persisted,
+        stats.sqlite_outcome.queue_lost, stats.sqlite_outcome.write_lost, stats.sqlite_outcome.failed));
+    if let Some(error) = &stats.sqlite_outcome.error {
+        push_json_str(&mut out, "error", error, false);
+    }
+    out.push('}');
+    out.push_str(&format!(",\"log_failed\":{}", stats.log_failed));
     push_json_num(&mut out, "alerts", alert_count as i64, false);
     push_json_num(
         &mut out,
@@ -5207,11 +5435,12 @@ fn open_log_writer(
     args: &MonitorArgs,
     domain_label: &str,
     resolved_format: LogFormat,
-) -> Option<Arc<LogWriter>> {
+) -> Result<Option<Arc<LogWriter>>, String> {
     let path = if let Some(file) = &args.log_file {
         Some(file.clone())
     } else if let Some(dir) = &args.log_dir {
-        let _ = fs::create_dir_all(dir);
+        fs::create_dir_all(dir)
+            .map_err(|err| format!("cannot create log directory {}: {}", dir.display(), err))?;
         let ts = now_rfc3339().replace(':', "");
         let ext = match resolved_format {
             LogFormat::Json => "jsonl",
@@ -5223,35 +5452,47 @@ fn open_log_writer(
         None
     };
 
-    let path = path?;
+    let Some(path) = path else {
+        return Ok(None);
+    };
 
     let file = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&path)
-        .ok()?;
+        .map_err(|err| format!("cannot open requested log {}: {}", path.display(), err))?;
 
-    Some(Arc::new(LogWriter {
+    Ok(Some(Arc::new(LogWriter {
         file: Mutex::new(file),
-    }))
+        format: resolved_format,
+        failed: AtomicBool::new(false),
+    })))
 }
 
 fn start_sqlite_writer(
     args: &MonitorArgs,
     run_ctx: RunContext,
     log_writer: Option<Arc<LogWriter>>,
-) -> Option<SqliteWriter> {
+) -> Result<SqliteWriter, String> {
     let queue_max = args.db_queue_max;
     let batch_size = args.db_batch_size;
     let flush_ms = args.db_flush_ms;
     let (sender, receiver) = mpsc::sync_channel(queue_max);
     let (ready_tx, ready_rx) = mpsc::sync_channel(1);
-    let dropped_total = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let counters = Arc::new(SqliteCounters::default());
+    let counters_clone = counters.clone();
     let log_clone = log_writer.clone();
     let path = args.sqlite_path.to_string();
     let handle = std::thread::spawn(move || {
         sqlite_writer_loop(
-            path, run_ctx, receiver, ready_tx, log_clone, batch_size, flush_ms,
+            path,
+            run_ctx,
+            receiver,
+            ready_tx,
+            log_clone,
+            batch_size,
+            flush_ms,
+            counters_clone,
         );
     });
 
@@ -5261,22 +5502,20 @@ fn start_sqlite_writer(
     };
 
     if let Err(err) = start_result {
-        let msg = format!("warning: sqlite disabled ({})", err);
-        eprintln!("{}", msg);
-        if let Some(writer) = log_writer.as_ref() {
-            writer.write_line(&msg);
+        if handle.join().is_err() {
+            return Err(format!("{}; sqlite writer thread panicked", err));
         }
-        return None;
+        return Err(err);
     }
 
     let last_warn = SystemTime::now()
         .checked_sub(Duration::from_secs(SQLITE_DROP_WARN_INTERVAL_SECS))
         .unwrap_or_else(SystemTime::now);
 
-    Some(SqliteWriter {
+    Ok(SqliteWriter {
         sender,
         handle: Some(handle),
-        dropped_total,
+        counters,
         drop_state: Mutex::new(DropState {
             last_warn,
             dropped_since_warn: 0,
@@ -5293,6 +5532,7 @@ fn sqlite_writer_loop(
     log_writer: Option<Arc<LogWriter>>,
     batch_size: usize,
     flush_ms: u64,
+    counters: Arc<SqliteCounters>,
 ) {
     let mut conn = match Connection::open(&sqlite_path) {
         Ok(conn) => conn,
@@ -5309,6 +5549,11 @@ fn sqlite_writer_loop(
 
     if let Err(err) = insert_session(&mut conn, &run_ctx) {
         let _ = ready_tx.send(Err(format!("sqlite session insert failed: {}", err)));
+        return;
+    }
+
+    if let Err(err) = conn.busy_timeout(Duration::from_millis(250)) {
+        let _ = ready_tx.send(Err(format!("sqlite retry policy setup failed: {}", err)));
         return;
     }
 
@@ -5343,13 +5588,7 @@ fn sqlite_writer_loop(
                 .map(|d| d >= flush_interval)
                 .unwrap_or(true)
         {
-            if let Err(err) = write_sqlite_batch(&mut conn, &batch) {
-                let msg = format!("warning: sqlite batch write failed: {}", err);
-                eprintln!("{}", msg);
-                if let Some(writer) = log_writer.as_ref() {
-                    writer.write_line(&msg);
-                }
-            }
+            flush_sqlite_batch(&mut conn, &batch, &counters, log_writer.as_ref());
             batch.clear();
             last_flush = now;
         }
@@ -5368,20 +5607,56 @@ fn sqlite_writer_loop(
         }
     }
 
-    if let Err(err) = write_sqlite_batch(&mut conn, &batch) {
-        let msg = format!("warning: sqlite batch write failed: {}", err);
-        eprintln!("{}", msg);
-        if let Some(writer) = log_writer.as_ref() {
-            writer.write_line(&msg);
-        }
-    }
+    flush_sqlite_batch(&mut conn, &batch, &counters, log_writer.as_ref());
 
     if let Some((run_id, connects, closes)) = shutdown {
         if let Err(err) = finalize_session(&mut conn, &run_id, connects, closes) {
-            let msg = format!("warning: sqlite finalize failed: {}", err);
-            eprintln!("{}", msg);
-            if let Some(writer) = log_writer.as_ref() {
-                writer.write_line(&msg);
+            counters.failure(
+                format!("sqlite finalize failed: {}", err),
+                log_writer.as_ref(),
+            );
+        }
+    }
+}
+
+fn flush_sqlite_batch(
+    conn: &mut Connection,
+    batch: &[SqliteEvent],
+    counters: &SqliteCounters,
+    log_writer: Option<&Arc<LogWriter>>,
+) {
+    if batch.is_empty() {
+        return;
+    }
+    for attempt in 0..3 {
+        match write_sqlite_batch(conn, batch) {
+            Ok(()) => {
+                counters
+                    .persisted
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                return;
+            }
+            Err(err) => {
+                let retriable = matches!(
+                    err.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                );
+                if retriable && attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(25 * (attempt + 1)));
+                    continue;
+                }
+                counters
+                    .write_lost
+                    .fetch_add(batch.len() as u64, Ordering::Relaxed);
+                counters.failure(
+                    format!(
+                        "sqlite batch write failed after {} attempt(s): {}",
+                        attempt + 1,
+                        err
+                    ),
+                    log_writer,
+                );
+                return;
             }
         }
     }
@@ -5702,6 +5977,7 @@ fn reverse_dns(ip: IpAddr) -> Option<String> {
 struct PidMeta {
     comm: String,
     cmdline: String,
+    argv: Vec<String>,
     provider: Provider,
 }
 
@@ -5727,7 +6003,7 @@ fn find_root_pids(
 
     for pid in list_pids() {
         let comm = read_comm(pid).unwrap_or_default();
-        let cmd = read_cmdline(pid).unwrap_or_default();
+        let cmd = read_argv(pid).unwrap_or_default().join(" ");
         let comm_l = comm.to_lowercase();
         let cmd_l = cmd.to_lowercase();
         if !excluded.is_empty()
@@ -5794,13 +6070,15 @@ fn build_pid_meta_map(targets: &HashSet<u32>, matcher: &ProviderMatcher) -> Hash
     let mut map = HashMap::new();
     for pid in targets {
         let comm = read_comm(*pid).unwrap_or_else(|| "unknown".to_string());
-        let cmdline = read_cmdline(*pid).unwrap_or_default();
+        let argv = read_argv(*pid).unwrap_or_default();
+        let cmdline = argv.join(" ");
         let provider = provider_from_text(&comm, &cmdline, matcher);
         map.insert(
             *pid,
             PidMeta {
                 comm,
                 cmdline,
+                argv,
                 provider,
             },
         );
@@ -5851,18 +6129,22 @@ fn read_comm(pid: u32) -> Option<String> {
     fs::read_to_string(path).ok().map(|s| s.trim().to_string())
 }
 
-fn read_cmdline(pid: u32) -> Option<String> {
+fn decode_argv(data: &[u8]) -> Vec<String> {
+    if data.is_empty() {
+        return Vec::new();
+    }
+    let data = data.strip_suffix(&[0]).unwrap_or(data);
+    data.split(|b| *b == 0)
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect()
+}
+
+fn read_argv(pid: u32) -> Option<Vec<String>> {
     let path = format!("/proc/{}/cmdline", pid);
     let mut data = Vec::new();
     if let Ok(mut file) = fs::File::open(path) {
         if file.read_to_end(&mut data).is_ok() {
-            let cmd = data
-                .split(|b| *b == 0)
-                .filter(|s| !s.is_empty())
-                .map(|s| String::from_utf8_lossy(s).to_string())
-                .collect::<Vec<_>>()
-                .join(" ");
-            return Some(cmd);
+            return Some(decode_argv(&data));
         }
     }
     None
@@ -6077,16 +6359,10 @@ fn run_config_show(json: bool) -> i32 {
         let entries: Vec<String> = sources
             .iter()
             .map(|(path, contents)| {
-                let escaped_path = path.replace('\\', "\\\\").replace('"', "\\\"");
-                let escaped_contents = contents
-                    .replace('\\', "\\\\")
-                    .replace('"', "\\\"")
-                    .replace('\n', "\\n")
-                    .replace('\r', "\\r")
-                    .replace('\t', "\\t");
                 format!(
                     "{{\"path\": \"{}\", \"contents\": \"{}\"}}",
-                    escaped_path, escaped_contents
+                    escape_json(path),
+                    escape_json(contents)
                 )
             })
             .collect();
@@ -7395,6 +7671,20 @@ fn output_report_json(
     has_sessions: bool,
     has_ancestry: bool,
 ) -> Result<(), String> {
+    print!(
+        "{}",
+        format_report_json(conn, filter, top, has_sessions, has_ancestry)?
+    );
+    Ok(())
+}
+
+fn format_report_json(
+    conn: &Connection,
+    filter: &ReportFilter,
+    top: usize,
+    has_sessions: bool,
+    has_ancestry: bool,
+) -> Result<String, String> {
     let mut out = String::from("{\n");
 
     // Meta section
@@ -7404,13 +7694,13 @@ fn output_report_json(
         system_time_to_rfc3339(SystemTime::now())
     ));
     if let Some(ref run_id) = filter.run_id {
-        out.push_str(&format!("    \"run_id\": \"{}\",\n", run_id));
+        out.push_str(&format!("    \"run_id\": \"{}\",\n", escape_json(run_id)));
     }
     if let Some(ref since) = filter.since {
-        out.push_str(&format!("    \"since\": \"{}\",\n", since));
+        out.push_str(&format!("    \"since\": \"{}\",\n", escape_json(since)));
     }
     if let Some(ref until) = filter.until {
-        out.push_str(&format!("    \"until\": \"{}\",\n", until));
+        out.push_str(&format!("    \"until\": \"{}\",\n", escape_json(until)));
     }
     out.push_str("    \"version\": \"1.0\"\n");
     out.push_str("  },\n");
@@ -7421,19 +7711,28 @@ fn output_report_json(
         && let Some(session) = query_session(conn, run_id)?
     {
         out.push_str("  \"session\": {\n");
-        out.push_str(&format!("    \"run_id\": \"{}\",\n", session.run_id));
-        out.push_str(&format!("    \"start_ts\": \"{}\",\n", session.start_ts));
+        out.push_str(&format!(
+            "    \"run_id\": \"{}\",\n",
+            escape_json(&session.run_id)
+        ));
+        out.push_str(&format!(
+            "    \"start_ts\": \"{}\",\n",
+            escape_json(&session.start_ts)
+        ));
         if let Some(end) = &session.end_ts {
-            out.push_str(&format!("    \"end_ts\": \"{}\",\n", end));
+            out.push_str(&format!("    \"end_ts\": \"{}\",\n", escape_json(end)));
         }
         if let Some(host) = &session.host {
-            out.push_str(&format!("    \"host\": \"{}\",\n", host));
+            out.push_str(&format!("    \"host\": \"{}\",\n", escape_json(host)));
         }
         if let Some(user) = &session.user {
-            out.push_str(&format!("    \"user\": \"{}\",\n", user));
+            out.push_str(&format!("    \"user\": \"{}\",\n", escape_json(user)));
         }
         if let Some(patterns) = &session.patterns {
-            out.push_str(&format!("    \"patterns\": \"{}\",\n", patterns));
+            out.push_str(&format!(
+                "    \"patterns\": \"{}\",\n",
+                escape_json(patterns)
+            ));
         }
         out.push_str(&format!(
             "    \"connects\": {},\n",
@@ -7467,7 +7766,10 @@ fn output_report_json(
     for (i, p) in providers.iter().enumerate() {
         out.push_str(&format!(
             "    {{\"provider\": \"{}\", \"events\": {}, \"connects\": {}, \"closes\": {}}}",
-            p.provider, p.events, p.connects, p.closes
+            escape_json(&p.provider),
+            p.events,
+            p.connects,
+            p.closes
         ));
         if i < providers.len() - 1 {
             out.push(',');
@@ -7482,11 +7784,11 @@ fn output_report_json(
     for (i, d) in domains.iter().enumerate() {
         out.push_str(&format!(
             "    {{\"domain\": \"{}\", \"events\": {}, \"provider\": \"{}\", \"source\": {}}}",
-            d.domain,
+            escape_json(&d.domain),
             d.events,
-            d.provider,
+            escape_json(&d.provider),
             match d.source.as_deref() {
-                Some(s) => format!("\"{s}\""),
+                Some(s) => format!("\"{}\"", escape_json(s)),
                 None => "null".to_string(),
             }
         ));
@@ -7504,7 +7806,9 @@ fn output_report_json(
         let domain_str = ip.domain.as_deref().unwrap_or("unknown");
         out.push_str(&format!(
             "    {{\"ip\": \"{}\", \"events\": {}, \"domain\": \"{}\"}}",
-            ip.ip, ip.events, domain_str
+            escape_json(&ip.ip),
+            ip.events,
+            escape_json(domain_str)
         ));
         if i < ips.len() - 1 {
             out.push(',');
@@ -7533,8 +7837,7 @@ fn output_report_json(
     }
 
     out.push_str("}\n");
-    print!("{}", out);
-    Ok(())
+    Ok(out)
 }
 
 fn output_report_pretty(
@@ -8619,6 +8922,155 @@ mod tests {
     use tempfile::NamedTempFile;
 
     #[test]
+    fn file_records_honor_format_independently_of_stdout() {
+        let style = OutputStyle {
+            color: false,
+            theme: Theme::Mono,
+        };
+        let event = create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Anthropic);
+        for json_stdout in [false, true] {
+            for requested in [LogFormat::Auto, LogFormat::Pretty, LogFormat::Json] {
+                let file = NamedTempFile::new().unwrap();
+                let format = log_format_for_output(json_stdout, requested);
+                let writer = Arc::new(LogWriter {
+                    file: Mutex::new(file.reopen().unwrap()),
+                    format,
+                    failed: AtomicBool::new(false),
+                });
+                emit_event(
+                    &event.ts,
+                    "connect",
+                    "run\"\\\n雪",
+                    &event.key,
+                    1234,
+                    "claude",
+                    "--token secret",
+                    Some("--token [REDACTED]"),
+                    Provider::Anthropic,
+                    Some("quote\"\\\t.example"),
+                    Some("dns"),
+                    None,
+                    None,
+                    "ptr",
+                    json_stdout,
+                    style,
+                    format,
+                    Some(&writer),
+                );
+                emit_alert(
+                    &AlertKind::MaxConnections {
+                        current: 2,
+                        threshold: 1,
+                    },
+                    AlertSeverity::Warning,
+                    None,
+                    None,
+                    false,
+                    json_stdout,
+                    style,
+                    Some(&writer),
+                );
+                writer.warning("warning: quote\"\\\n\0雪");
+                let mut stats = Stats {
+                    connects: 2,
+                    active: 2,
+                    ..Stats::default()
+                };
+                summary(
+                    &mut stats,
+                    json_stdout,
+                    5,
+                    style,
+                    "ptr",
+                    Some(&writer),
+                    1,
+                    0,
+                );
+                let text = fs::read_to_string(file.path()).unwrap();
+                if format == LogFormat::Json {
+                    let lines: Vec<_> = text.lines().collect();
+                    assert_eq!(
+                        lines.len(),
+                        4,
+                        "stdout={json_stdout}, requested={requested:?}"
+                    );
+                    assert!(lines[0].contains("[REDACTED]"));
+                    assert!(!text.contains("--token secret"));
+                    assert!(lines[1].contains("\"type\":\"alert\""));
+                    assert!(lines[2].contains("\\u0000"));
+                    assert!(lines[3].contains("\"summary\""));
+                    assert!(
+                        lines
+                            .iter()
+                            .all(|line| line.starts_with('{') && line.ends_with('}'))
+                    );
+                } else {
+                    assert!(text.starts_with("2026-01-20T12:00:00Z"));
+                    assert!(text.contains("[ALERT]"));
+                    assert!(text.contains("summary connects=2"));
+                    assert!(!text.contains("\"type\":\"alert\""));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn report_escapes_all_database_metadata_and_filter_strings() {
+        let hostile = "quote\"\\\n\r\t\0雪";
+        let mut conn = setup_test_db();
+        let mut ctx = RunContext::new(&MonitorArgs::default(), "ptr", None);
+        ctx.run_id = hostile.to_string();
+        ctx.start_ts = hostile.to_string();
+        ctx.host = hostile.to_string();
+        ctx.user = hostile.to_string();
+        ctx.patterns = hostile.to_string();
+        insert_session(&mut conn, &ctx).unwrap();
+        let mut event = create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Anthropic);
+        event.run_id = ctx.run_id.clone();
+        event.domain = Some(hostile.to_string());
+        event.domain_source = Some(hostile.to_string());
+        write_sqlite_batch(&mut conn, &[event]).unwrap();
+        conn.execute("UPDATE events SET provider=?1, remote_ip=?1", [hostile])
+            .unwrap();
+        conn.execute("UPDATE sessions SET end_ts=?1", [hostile])
+            .unwrap();
+        let filter = ReportFilter {
+            run_id: Some(hostile.to_string()),
+            since: None,
+            until: None,
+        };
+        let output = format_report_json(&conn, &filter, 10, true, true).unwrap();
+        let escaped = escape_json(hostile);
+        for field in [
+            "run_id", "start_ts", "end_ts", "host", "user", "patterns", "provider", "domain", "ip",
+        ] {
+            assert!(
+                output.contains(&format!("\"{field}\": \"{escaped}\"")),
+                "{field}: {output}"
+            );
+        }
+        assert!(!output.contains(hostile));
+        // Unknown source labels are normalized to null by the provenance query.
+        assert!(output.contains("\"source\": null"));
+        conn.execute("UPDATE events SET domain_source='sni'", [])
+            .unwrap();
+        assert!(
+            format_report_json(&conn, &filter, 10, true, true)
+                .unwrap()
+                .contains("\"source\": \"sni\"")
+        );
+    }
+
+    #[test]
+    fn json_escaping_covers_control_characters_and_preserves_unicode() {
+        for byte in 0u8..=31 {
+            assert!(!escape_json(&char::from(byte).to_string()).contains(char::from(byte)));
+        }
+        assert_eq!(escape_json("雪/\"\\"), "雪/\\\"\\\\");
+        assert_eq!(escape_json("\u{7f}\u{85}"), "\\u007f\\u0085");
+    }
+
+    #[test]
     fn normalize_patterns_lowercases_and_dedupes() {
         let patterns = vec![
             " Claude ".to_string(),
@@ -8873,6 +9325,204 @@ mod tests {
         let mut conn = Connection::open_in_memory().expect("failed to open in-memory db");
         init_sqlite(&mut conn).expect("failed to init schema");
         conn
+    }
+
+    #[test]
+    fn sqlite_failed_transaction_counts_the_entire_rolled_back_batch() {
+        let mut conn = setup_test_db();
+        conn.execute_batch("CREATE TRIGGER fail_close BEFORE INSERT ON events WHEN NEW.event='close' BEGIN SELECT RAISE(ABORT, 'forced constraint failure'); END;").unwrap();
+        let batch = [
+            create_test_event("2026-01-20T12:00:00Z", "connect", Provider::Anthropic),
+            create_test_event("2026-01-20T12:00:01Z", "close", Provider::Anthropic),
+        ];
+        let counters = SqliteCounters::default();
+        counters.observed.store(2, Ordering::Relaxed);
+        flush_sqlite_batch(&mut conn, &batch, &counters, None);
+        let outcome = counters.outcome();
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM events", [], |row| row
+                .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            (
+                outcome.observed,
+                outcome.persisted,
+                outcome.queue_lost,
+                outcome.write_lost
+            ),
+            (2, 0, 0, 2)
+        );
+        assert!(outcome.failed);
+        assert!(
+            outcome
+                .error
+                .unwrap()
+                .contains("after 1 attempt(s): forced constraint failure")
+        );
+    }
+
+    #[test]
+    fn sqlite_contention_has_bounded_retry_and_exact_exhaustion_accounting() {
+        let (_file, path) = NamedTempFile::new().unwrap().keep().unwrap();
+        let mut conn = Connection::open(&path).unwrap();
+        init_sqlite(&mut conn).unwrap();
+        conn.busy_timeout(Duration::from_millis(20)).unwrap();
+        let blocker = Connection::open(&path).unwrap();
+        blocker.execute_batch("BEGIN IMMEDIATE").unwrap();
+        let counters = SqliteCounters::default();
+        counters.observed.store(1, Ordering::Relaxed);
+        let batch = [create_test_event(
+            "2026-01-20T12:00:00Z",
+            "connect",
+            Provider::Anthropic,
+        )];
+        let start = Instant::now();
+        flush_sqlite_batch(&mut conn, &batch, &counters, None);
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(counters.outcome().write_lost, 1);
+        assert!(
+            counters
+                .outcome()
+                .error
+                .unwrap()
+                .contains("after 3 attempt(s)")
+        );
+        blocker.execute_batch("ROLLBACK").unwrap();
+        let recovered = SqliteCounters::default();
+        recovered.observed.store(1, Ordering::Relaxed);
+        flush_sqlite_batch(&mut conn, &batch, &recovered, None);
+        assert_eq!(recovered.outcome().persisted, 1);
+        assert!(!recovered.outcome().failed);
+    }
+
+    #[test]
+    fn sqlite_startup_and_finalization_errors_reach_the_caller() {
+        let args = MonitorArgs {
+            sqlite_path: "/dev/null/unavailable.sqlite".to_string(),
+            ..MonitorArgs::default()
+        };
+        let ctx = RunContext::new(&args, "ptr", None);
+        assert!(
+            start_sqlite_writer(&args, ctx, None)
+                .err()
+                .unwrap()
+                .contains("sqlite open failed")
+        );
+        let (_file, path) = NamedTempFile::new().unwrap().keep().unwrap();
+        let args = MonitorArgs {
+            sqlite_path: path.to_string_lossy().into_owned(),
+            ..MonitorArgs::default()
+        };
+        let ctx = RunContext::new(&args, "ptr", None);
+        let writer =
+            start_sqlite_writer(&args, ctx.clone(), None).unwrap_or_else(|err| panic!("{err}"));
+        let conn = Connection::open(path).unwrap();
+        conn.execute_batch("CREATE TRIGGER fail_finalize BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'forced finalization failure'); END;").unwrap();
+        writer.enqueue(create_test_event(
+            "2026-01-20T12:00:00Z",
+            "connect",
+            Provider::Anthropic,
+        ));
+        let outcome = writer.shutdown(ctx.run_id, 1, 0);
+        assert_eq!(
+            (outcome.observed, outcome.persisted, outcome.write_lost),
+            (1, 1, 0)
+        );
+        assert!(outcome.failed);
+        assert!(
+            outcome
+                .error
+                .unwrap()
+                .contains("forced finalization failure")
+        );
+    }
+
+    #[test]
+    fn sqlite_queue_saturation_and_disconnection_reconcile_all_observations() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let writer = SqliteWriter {
+            sender,
+            handle: None,
+            counters: Arc::new(SqliteCounters::default()),
+            drop_state: Mutex::new(DropState {
+                last_warn: SystemTime::now(),
+                dropped_since_warn: 0,
+            }),
+            log_writer: None,
+        };
+        writer.enqueue(create_test_event(
+            "2026-01-20T12:00:00Z",
+            "connect",
+            Provider::Anthropic,
+        ));
+        writer.enqueue(create_test_event(
+            "2026-01-20T12:00:01Z",
+            "close",
+            Provider::Anthropic,
+        ));
+        assert_eq!(writer.counters.queue_lost.load(Ordering::Relaxed), 1);
+        drop(receiver);
+        let outcome = writer.shutdown("test-run".to_string(), 1, 1);
+        assert_eq!(
+            (
+                outcome.observed,
+                outcome.persisted,
+                outcome.queue_lost,
+                outcome.write_lost
+            ),
+            (2, 0, 1, 1)
+        );
+        assert!(outcome.failed);
+    }
+
+    #[test]
+    fn requested_file_sink_errors_are_observable() {
+        let args = MonitorArgs {
+            log_file: Some(PathBuf::from("/dev/null/unavailable.log")),
+            ..MonitorArgs::default()
+        };
+        assert!(open_log_writer(&args, "ptr", LogFormat::Json).is_err());
+        let writer = LogWriter {
+            file: Mutex::new(OpenOptions::new().write(true).open("/dev/full").unwrap()),
+            format: LogFormat::Json,
+            failed: AtomicBool::new(false),
+        };
+        writer.warning("controlled write failure");
+        writer.flush();
+        assert!(writer.failed.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn sqlite_writer_panic_is_not_a_zero_loss_success() {
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let handle = std::thread::spawn(move || {
+            let _ = receiver.recv().unwrap();
+            panic!("forced writer failure");
+        });
+        let writer = SqliteWriter {
+            sender,
+            handle: Some(handle),
+            counters: Arc::new(SqliteCounters::default()),
+            drop_state: Mutex::new(DropState {
+                last_warn: SystemTime::now(),
+                dropped_since_warn: 0,
+            }),
+            log_writer: None,
+        };
+        writer.enqueue(create_test_event(
+            "2026-01-20T12:00:00Z",
+            "connect",
+            Provider::Anthropic,
+        ));
+        let outcome = writer.shutdown("test-run".to_string(), 1, 0);
+        assert_eq!(
+            (outcome.observed, outcome.persisted, outcome.write_lost),
+            (1, 0, 1)
+        );
+        assert!(outcome.failed);
+        assert!(outcome.error.unwrap().contains("forced writer failure"));
     }
 
     #[test]
@@ -9327,6 +9977,7 @@ mod tests {
             pid: 4242,
             comm: "claude".to_string(),
             cmdline: "claude".to_string(),
+            log_cmdline: "claude".to_string(),
             provider: Provider::Anthropic,
             domain: Some("evil.malicious.com".to_string()),
             domain_source: Some("dns".to_string()),
@@ -9347,7 +9998,8 @@ mod tests {
             &key,
             &mk_info(),
             false,
-            style
+            style,
+            None
         ));
         assert_eq!(state.alert_count, 1);
         assert_eq!(state.suppressed_count, 0);
@@ -9359,7 +10011,8 @@ mod tests {
             &key,
             &mk_info(),
             false,
-            style
+            style,
+            None
         ));
         assert_eq!(state.alert_count, 1);
         assert_eq!(state.suppressed_count, 1);
@@ -9404,6 +10057,9 @@ mod tests {
             active: 5,
             peak_active: 5,
             sqlite_dropped: 0,
+            sqlite_enabled: false,
+            sqlite_outcome: SqliteOutcome::default(),
+            log_failed: false,
             per_ip: BTreeMap::new(),
             per_port: BTreeMap::new(),
             per_domain: BTreeMap::new(),
@@ -9430,6 +10086,7 @@ mod tests {
             "2026-01-20T12:00:00Z",
             false,
             style,
+            None,
         );
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].event, "alert");
@@ -9446,6 +10103,7 @@ mod tests {
             "2026-01-20T12:00:01Z",
             false,
             style,
+            None,
         );
         assert!(rows2.is_empty());
         assert_eq!(state.suppressed_count, 1);
@@ -11329,22 +11987,91 @@ mod tests {
             ("codex serve --port 8080", "codex serve --port 8080"),
         ];
         for (input, expected) in cases {
-            assert_eq!(&redact_cmdline_str(input, RedactMode::Secrets), expected);
+            let argv: Vec<_> = input.split_whitespace().collect();
+            assert_eq!(&redact_argv(&argv, RedactMode::Secrets), expected);
         }
     }
 
     #[test]
     fn redact_all_replaces_whole_cmdline() {
         assert_eq!(
-            redact_cmdline_str("claude --model opus", RedactMode::All),
+            redact_argv(&["claude", "--model", "opus"], RedactMode::All),
             "<redacted:3 args>"
         );
     }
 
     #[test]
+    fn argv_boundaries_preserve_empty_and_non_utf8_arguments() {
+        let argv = decode_argv(b"claude\0\0--password\0FAKE WORDS\nCREDENTIAL\xff\0");
+        assert_eq!(argv.len(), 4);
+        assert_eq!(argv[1], "");
+        assert!(argv[3].ends_with('\u{fffd}'));
+        assert_eq!(
+            redact_argv(&argv, RedactMode::Secrets),
+            "claude  --password <redacted>"
+        );
+        assert_eq!(redact_argv(&argv, RedactMode::All), "<redacted:4 args>");
+        assert_eq!(redact_argv(&argv, RedactMode::Off), argv.join(" "));
+        assert!(decode_argv(b"").is_empty());
+        assert_eq!(decode_argv(b"\0"), [""]);
+        assert_eq!(decode_argv(b"claude\0\0"), ["claude", ""]);
+    }
+
+    #[test]
+    fn secrets_mask_complete_values_without_changing_benign_arguments() {
+        let argv = [
+            "claude",
+            "--password",
+            "FAKE WORDS\n雪 CREDENTIAL",
+            "--model",
+            "two words",
+            "API_KEY=FAKE WORDS VALUE",
+            "--token=FAKE WORDS VALUE",
+            "",
+        ];
+        assert_eq!(
+            redact_argv(&argv, RedactMode::Secrets),
+            "claude --password <redacted> --model two words API_KEY=<redacted> --token=<redacted> "
+        );
+        assert_eq!(redact_argv(&argv, RedactMode::All), "<redacted:8 args>");
+        assert_eq!(redact_argv::<&str>(&[], RedactMode::Secrets), "");
+        assert_eq!(
+            redact_argv(&["--password"], RedactMode::Secrets),
+            "--password"
+        );
+    }
+
+    #[test]
+    fn redacted_session_metadata_does_not_reintroduce_pattern_credentials() {
+        let fake = "sk-ant-api03-FAKE0123456789abcdef";
+        let args = MonitorArgs {
+            patterns: vec![fake.to_string()],
+            redact_cmdline: RedactMode::Secrets,
+            ..MonitorArgs::default()
+        };
+        let ctx = RunContext::new(&args, "ptr", None);
+        assert_eq!(ctx.patterns, REDACTED_PLACEHOLDER);
+        assert!(!ctx.session_name.contains(fake));
+        let all = RunContext::new(
+            &MonitorArgs {
+                redact_cmdline: RedactMode::All,
+                ..args
+            },
+            "ptr",
+            None,
+        );
+        assert_eq!(all.patterns, "<redacted:1 patterns>");
+        assert_eq!(all.session_name, REDACTED_PLACEHOLDER);
+        assert!(all.args_snapshot.starts_with("<redacted:"));
+    }
+
+    #[test]
     fn redact_off_is_identity() {
         let raw = "ANTHROPIC_API_KEY=sk-123 claude";
-        assert_eq!(redact_cmdline_str(raw, RedactMode::Off), raw);
+        assert_eq!(
+            redact_argv(&["ANTHROPIC_API_KEY=sk-123", "claude"], RedactMode::Off),
+            raw
+        );
     }
 
     #[test]
@@ -11357,7 +12084,10 @@ mod tests {
             "attribution must classify on the original argv"
         );
 
-        let masked = redact_cmdline_str(raw, RedactMode::Secrets);
+        let masked = redact_argv(
+            &raw.split_whitespace().collect::<Vec<_>>(),
+            RedactMode::Secrets,
+        );
         assert!(masked.contains("<redacted>"));
         assert!(masked.contains("claude"));
     }

@@ -532,6 +532,8 @@ AI CLI invocations routinely embed credentials in argv — `ANTHROPIC_API_KEY=sk
 
 `--redact-cmdline` masks cmdlines **in durable stores only** (SQLite rows, log files, exports). Live terminal display and provider attribution always see the original argv, so classification and on-screen output are unchanged.
 
+Masking preserves `/proc` argument boundaries, including empty arguments and values with spaces or newlines. A separate `--password` value is masked in full. Invalid UTF-8 is displayed with replacement characters. Session argument snapshots use the same masking; stored patterns and session names also mask recognized credential tokens, and `all` removes their values.
+
 | Mode | Behavior |
 |------|----------|
 | `off` *(default)* | Store cmdlines verbatim |
@@ -546,6 +548,8 @@ rano --pattern claude --redact-cmdline all        # maximum paranoia
 ```
 
 **Threat model**: redaction protects readers of rano's own artifacts (a shared observer.sqlite, an exported CSV attached to a ticket, log archives) from inheriting every secret that transited a monitored shell. It cannot protect against the monitored processes leaking their own secrets elsewhere.
+
+`secrets` uses named credential flags, assignments, known prefixes and token-shape heuristics. It cannot recognize arbitrary credentials embedded in scripts, free text, filenames or unrecognized flags; use `all` when the entire command line must be hidden. Live stdout remains unmasked, so capturing terminal output creates an unprotected artifact.
 
 The built-in `audit` preset enables `redact_cmdline=secrets`.
 
@@ -1012,7 +1016,7 @@ SQLite writes use an async batching system for better performance under high eve
 - **SSD storage**: Defaults work well
 - **HDD storage**: Increase `db_batch_size` to 500+
 
-If the queue fills, events are dropped with a warning. Monitor for "sqlite queue full" messages.
+If the queue fills, events are dropped with a warning. The final JSON summary reports `sqlite.observed`, `persisted`, `queue_lost`, and `write_lost`; after shutdown, observed events equal persisted events plus both loss counts. Synthesized alert rows are included. `sqlite_dropped` includes queue and failed-batch losses. Any loss, database startup/finalization failure, or requested file creation/write failure produces a nonzero exit status. Database degradation remains visible in the final summary even when monitoring continues.
 
 ### Provider Configuration (`rano.toml`)
 
@@ -1109,7 +1113,7 @@ rano --pid <pid>
 
 ### "SQLite file is locked"
 
-Transient SQLite contention between the monitor's writer and read-side commands (`status`, `report`, `export`) is retried automatically via `busy_timeout=5000` on every connection, so prompt-style status usage does not fail under load. If you still see "database is locked", another process holds an exclusive lock (e.g., a different tool) — stop it or use a separate database file:
+Read-side commands (`status`, `report`, `export`) use a five-second SQLite busy timeout. The monitor initializes with that timeout, then limits event writes to three attempts with a 250ms busy timeout and 25ms/50ms backoff. Permanent errors are not retried; exhausted transactions count the whole rolled-back batch as write loss, preserve the error, and make the final status nonzero. If another process holds a long write lock, use a separate database file or coordinate access:
 
 ```bash
 rano --sqlite /tmp/rano-$(date +%s).sqlite

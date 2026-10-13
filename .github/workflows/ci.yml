@@ -3,7 +3,7 @@ name: ci
 on:
   pull_request:
   push:
-    branches: [main, master]
+    branches: [main]
   workflow_dispatch:
 
 env:
@@ -70,7 +70,8 @@ jobs:
             "export-formats scripts/e2e/export-formats.sh" \
             "presets scripts/e2e/presets.sh" \
             "process-ancestry scripts/e2e/process-ancestry.sh" \
-            "sqlite-concurrency scripts/e2e/sqlite-concurrency.sh"
+            "sqlite-concurrency scripts/e2e/sqlite-concurrency.sh" \
+            "redact-cmdline scripts/e2e/redact-cmdline.sh"
           do
             name="${spec%% *}"
             script="${spec#* }"
@@ -149,3 +150,6 @@ jobs:
           sudo apt-get update && sudo apt-get install -y sqlite3
           scripts/e2e/run.sh pcap-attribution scripts/e2e/pcap-attribution.sh
           echo "✅ pcap attribution e2e passed"
+
+      - name: "[pcap] Run live privacy E2E"
+        run: scripts/e2e/run.sh redact-cmdline scripts/e2e/redact-cmdline.sh

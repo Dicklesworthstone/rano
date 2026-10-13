@@ -27,7 +27,7 @@ Verified positives include:
 - Normal JSON/pretty reports and CSV/JSONL exports work. Seeded report, export, diff and status regression suites passed; legacy-schema migrations and read/write contention have real implementation and test coverage.
 - Config loading, validation of many common errors, TOML provider overrides, preset loading and CLI-over-preset scalar precedence work in ordinary cases.
 - Retry detection, domain/provenance extraction, alert/cooldown machinery and stats rendering exist. The optional pcap build attributed a held local socket to `fixture.test` with source `dns` from the real offline fixture.
-- Default and pcap unit tests, compiler checks, configured strict Clippy and formatting passed at the audited source revision.
+- Compiler checks, configured strict Clippy and formatting passed at the audited source revision. The originally reported unit-suite passes were incomplete; see the correction below.
 
 These positives establish scoped behavior. They do not erase the counterexamples below.
 
@@ -93,8 +93,8 @@ Current exact-head nightly CI measured 38.100ms versus 103.266ms for 500/2000 so
 | `cargo fmt --check` | PASS locally; source was unchanged |
 | Exact-SHA RCH `cargo check --all-targets --all-features --locked` | PASS, vmi1149989 |
 | Exact-SHA RCH `cargo clippy --all-targets --all-features --locked -j1 -- -D warnings` | PASS under the repository's configured lint allowances |
-| Exact-SHA RCH default `cargo test --locked -j1` | PASS, 197 tests |
-| Exact-SHA RCH `cargo test --all-features --locked -j1` | PASS, 223 tests after resolving a worker link dependency |
+| Exact-SHA RCH default `cargo test --locked -j1` | INCOMPLETE: 197 tests announced, process exited before completion; initial PASS claim withdrawn |
+| Exact-SHA RCH `cargo test --all-features --locked -j1` | INCOMPLETE: 223 tests announced, process exited before completion; initial PASS claim withdrawn |
 | Exact-SHA RCH release pcap build | PASS; fresh retrieved binary and source receipt recorded |
 | 15 ordinary/privacy E2E suites on shipped v0.2.0 | 14 PASS, stats-views FAIL |
 | Same 15 E2E suites on fresh pcap-enabled main binary | 14 PASS, stats-views FAIL |
@@ -108,6 +108,8 @@ Current exact-head nightly CI measured 38.100ms versus 103.266ms for 500/2000 so
 | UBS on the two staged assessment files | NOT EVALUATED: exit 3, `no-supported-languages`; Markdown/JSONL contain no eligible code. JSONL parsing, exact historical-record preservation, dependency pairing and diff whitespace checks passed separately |
 
 Initial RCH attempts encountered admission/queue/pressure problems and missing `-lpcap` linkage. The worker already had the libpcap runtime but lacked the development linker name. A private directory symlink to the installed runtime and a forwarded `LIBRARY_PATH` supplied that name without system package changes; successful commands retained the exact source baseline. These environmental failures were not counted as unit-test failures. One ovh-a attempt failed before source-lock acquisition with a worker filesystem I/O error; `rch jobs recover rchw-e083ef57-f873-4014-b675-83bad95a60e9` also failed to persist cancellation. That ownership-recovery limitation remains recorded; no peer process/cache was cleared.
+
+Implementation follow-up on 2026-10-13 found that `test_parse_update_args_flags` calls `parse_update_args` with `--version <tag>`, whose pre-parser prints the program version and calls `exit(0)` instead of selecting the requested installer release. This prematurely terminates the test process. A later run announced 234 tests but recorded only 178 successful completions and no terminal test summary. The same faulty parser exists at the audit baseline, so announced counts and Cargo's zero exit are insufficient evidence of full-suite completion. This correction preserves the original acceptance criteria and requires completed-test counts plus a terminal summary on the repaired revision.
 
 The red E2E gates remain red even where a controlled focused probe passes. Stats rendering exists, and DNS fixture attribution works with a held target; this does not convert the required aggregate tests into a green qualification result.
 

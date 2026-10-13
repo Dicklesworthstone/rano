@@ -17,7 +17,7 @@ cleanup() {
   if [ -n "${SERVER_PID:-}" ] && kill -0 "${SERVER_PID}" 2>/dev/null; then
     kill "${SERVER_PID}" 2>/dev/null || true
   fi
-  rm -rf "${TMP_DIR}"
+  e2e_info "Retained batching fixtures: ${TMP_DIR}"
 }
 trap cleanup EXIT
 
@@ -327,6 +327,127 @@ HOME="${TMP_DIR}/home" XDG_CONFIG_HOME="${TMP_DIR}/xdg" \
 
 e2e_assert_last_status 0
 e2e_info "PASS: Tiny queue config accepted"
+
+e2e_section "Real persistence accounting and sink-failure matrix"
+python3 - "${RANO_BIN}" "${TMP_DIR}" <<'PY' || e2e_fail "persistence matrix failed; inspect retained captures"
+import json
+import signal
+import socket
+import sqlite3
+import subprocess
+import sys
+import threading
+import time
+from pathlib import Path
+
+binary = str(Path(sys.argv[1]).resolve())
+root = Path(sys.argv[2]) / 'fault-matrix'
+root.mkdir()
+holder_code = '''import json,socket,sys
+sys.stdin.read(1)
+clients=[socket.create_connection(('127.0.0.1',int(sys.argv[1]))) for _ in range(int(sys.argv[2]))]
+print(json.dumps({'ready':len(clients)}),flush=True)
+sys.stdin.read(1)
+for client in clients: client.close()
+sys.stdin.read(1)
+'''
+
+def records(path):
+    return [json.loads(line) for line in path.read_text().splitlines(keepends=True) if line.endswith('\n')]
+
+def until(predicate, monitor, description):
+    deadline = time.monotonic() + 20
+    while time.monotonic() < deadline:
+        if predicate(): return
+        assert monitor.poll() is None, f'monitor exited before {description}'
+        time.sleep(0.02)
+    raise AssertionError(f'no {description}; fixtures retained')
+
+for name in ['normal50', 'abort', 'finalize', 'unavailable_db', 'unavailable_file', 'full_file', 'queue_saturation']:
+    case = root / name
+    case.mkdir()
+    count = 50 if name in ['normal50', 'queue_saturation'] else 1
+    database = case / 'events.sqlite'
+    seed = subprocess.run([binary, '--no-config', '--pid', '4294967295', '--no-descendants',
+        '--once', '--no-banner', '--no-dns', '--json', '--sqlite', str(database)], capture_output=True, text=True)
+    (case / 'seed.stdout').write_text(seed.stdout)
+    (case / 'seed.stderr').write_text(seed.stderr)
+    assert seed.returncode == 0, 'database initialization failed'
+    conn = sqlite3.connect(database, timeout=1)
+    if name == 'abort':
+        conn.execute("CREATE TRIGGER force_abort BEFORE INSERT ON events BEGIN SELECT RAISE(ABORT, 'forced E2E batch failure'); END")
+    if name == 'finalize':
+        conn.execute("CREATE TRIGGER force_finalize BEFORE UPDATE ON sessions BEGIN SELECT RAISE(ABORT, 'forced E2E finalize failure'); END")
+    conn.commit()
+    server = socket.socket()
+    server.bind(('127.0.0.1', 0)); server.listen(128)
+    accepted = []
+    def accept_clients():
+        for _ in range(count):
+            accepted.append(server.accept()[0])
+    accept_thread = threading.Thread(target=accept_clients, daemon=True)
+    accept_thread.start()
+    holder = subprocess.Popen([sys.executable, '-u', '-c', holder_code,
+        str(server.getsockname()[1]), str(count)], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
+    monitor = None
+    try:
+        sqlite_path = '/dev/null/unavailable.sqlite' if name == 'unavailable_db' else str(database)
+        file_path = '/dev/full' if name == 'full_file' else str(case / ('missing_parent/file.jsonl' if name == 'unavailable_file' else 'file.jsonl'))
+        command = [binary, '--no-config', '--pid', str(holder.pid), '--no-descendants', '--interval-ms', '20',
+            '--json', '--no-banner', '--no-dns', '--stats-interval-ms', '0', '--sqlite', sqlite_path,
+            '--log-file', file_path, '--log-format', 'json', '--db-batch-size', '1' if name == 'queue_saturation' else '10',
+            '--db-flush-ms', '50', '--db-queue-max', '1' if name == 'queue_saturation' else '1000']
+        with (case / 'stdout.jsonl').open('w') as stdout, (case / 'stderr').open('w') as stderr:
+            monitor = subprocess.Popen(command, stdout=stdout, stderr=stderr)
+            if name == 'unavailable_file':
+                assert monitor.wait(timeout=20) != 0, 'requested file disappeared silently'
+                assert any(row.get('type') == 'error' for row in records(case / 'stdout.jsonl')), 'missing structured file error'
+                print(f'  PASS {name}: actionable nonzero startup failure')
+                continue
+            if name == 'queue_saturation':
+                until(lambda: conn.execute('SELECT count(*) FROM sessions').fetchone()[0] >= 2, monitor, 'writer readiness')
+                conn.execute('BEGIN IMMEDIATE')
+            holder.stdin.write('o'); holder.stdin.flush()
+            assert json.loads(holder.stdout.readline())['ready'] == count, 'workload did not progress'
+            until(lambda: sum(row.get('event') == 'connect' for row in records(case / 'stdout.jsonl')) == count, monitor, 'all connects')
+            holder.stdin.write('c'); holder.stdin.flush()
+            until(lambda: sum(row.get('event') == 'close' for row in records(case / 'stdout.jsonl')) == count, monitor, 'all closes')
+            monitor.send_signal(signal.SIGINT)
+            code = monitor.wait(timeout=20)
+        output = records(case / 'stdout.jsonl')
+        summary = next(row['summary'] for row in reversed(output) if 'summary' in row)
+        accounting = summary['sqlite']
+        persisted = conn.execute('SELECT count(*) FROM events').fetchone()[0]
+        assert accounting['observed'] == 2 * count, 'incorrect observed denominator'
+        assert accounting['persisted'] == persisted, 'invented durable rows'
+        assert accounting['observed'] == persisted + accounting['queue_lost'] + accounting['write_lost'], 'unaccounted loss'
+        assert summary['sqlite_dropped'] == accounting['queue_lost'] + accounting['write_lost'], 'misreported drop total'
+        if name == 'normal50':
+            assert code == 0 and persisted == 100 and summary['sqlite_dropped'] == 0, 'normal batching lost events'
+            assert not accounting['failed'] and not summary['log_failed'], 'normal sink reported failure'
+        else:
+            assert code != 0, 'failed sink reported success'
+        if name in ['abort', 'unavailable_db']:
+            assert persisted == 0 and accounting['write_lost'] == 2 and accounting['failed'], 'failed writes disappeared'
+        if name == 'finalize':
+            assert persisted == 2 and accounting['failed'] and 'forced E2E finalize failure' in accounting['error'], 'finalization error disappeared'
+        if name == 'queue_saturation':
+            assert accounting['queue_lost'] > 0 and accounting['failed'], 'queue loss not exercised'
+        if name == 'full_file':
+            assert persisted == 2 and summary['log_failed'], 'file write error disappeared'
+        if name != 'full_file':
+            file_output = records(case / 'file.jsonl')
+            assert any('summary' in row for row in file_output), 'file summary missing'
+        assert (case / 'stderr').read_text(), 'expected domain/sink diagnostics missing'
+        print(f'  PASS {name}: observed={2 * count} persisted={persisted} queue_lost={accounting["queue_lost"]} write_lost={accounting["write_lost"]} exit={code}')
+    finally:
+        if monitor is not None and monitor.poll() is None:
+            monitor.send_signal(signal.SIGINT); monitor.wait(timeout=20)
+        holder.terminate(); holder.wait(timeout=5)
+        conn.rollback(); conn.close()
+        server.close()
+        for connection in accepted: connection.close()
+PY
 
 # =============================================================================
 # Summary
