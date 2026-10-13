@@ -10,7 +10,7 @@
 
 </div>
 
-rano is a **network observer for AI CLI processes** that tracks outbound connections from Claude Code, Codex CLI, Gemini CLI, and their descendants—live in your terminal and durably in SQLite.
+rano is a **network observer for AI CLI processes** that tracks observed sockets owned by Claude Code, Codex CLI, Gemini CLI, and their descendants—live in your terminal and durably in SQLite.
 
 <div align="center">
 
@@ -28,7 +28,7 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install
 
 **The Problem**: AI CLI tools spawn subprocesses and open sockets you can’t easily attribute back to a provider or process in real time.
 
-**The Solution**: rano polls `/proc`, maps sockets to PIDs, and prints connection events with provider tags while logging a complete history to SQLite.
+**The Solution**: rano polls `/proc`, maps sockets to PIDs, and prints observation events with provider tags while logging the observed history to SQLite. Connections that open and close between polls can be missed.
 
 ### Why Use rano?
 
@@ -747,6 +747,10 @@ Each poll uses a process snapshot with kernel start times. Ancestry is cached fo
 Exclusions prune the matching process and its descendants, including explicitly selected PIDs and nested pattern matches. The nearest selected ancestor defines each monitored root. For a socket shared by multiple monitored processes, the lowest PID is the primary owner. `ownership_json` in JSON events, SQLite and exports contains the socket inode, owner/root PID and kernel start time, and all observed monitored holders; decode this field as JSON to inspect shared ownership. PID reuse, inode replacement or a change of monitored root starts a new observation episode rather than reusing stale metadata. These records describe sampled ownership; they do not prove which holder initiated a shared socket.
 
 Provider matching uses original comm/argv before redaction. A unique direct match wins even when the monitored ancestor belongs to another provider. An unmarked or ambiguous process inherits the nearest uniquely matched ancestor within the monitored tree; an unclassifiable root stays `unknown`. Nested roots and simultaneous providers are resolved per process. `ownership_json.provider_origin` identifies the supplying PID/start time and whether the match was `direct` or inherited from an `ancestor`; the owner and monitored root remain separate identities. Changes of provider or origin start a new observation episode.
+
+TCP endpoint episodes emit `connect`/`close`, but `/proc` does not establish whether the process initiated or accepted them: `ownership_json.direction` is `unknown`. `--include-listening` admits TCP listeners with a `listen` event. UDP is included by default; connected UDP has a known peer, while a bound/sendto socket emits `bind` with no observed remote endpoint (`remote="none"`, `remote_present=false`). The kernel's zero remote address/port remain in SQLite/export, alongside this explicit absence flag. A sendto destination is not recoverable from `/proc`; no hostname is inferred for local-only observations. `--no-udp` excludes both UDP kinds.
+
+`ownership_json.socket_kind` is `endpoint`, `listener` or `bound_udp`, and `kernel_state` preserves the sampled hexadecimal state. Summary `connects`, `closes`, `active`, provider counts and connection alerts concern endpoint episodes; `listens`/`binds` count local-only observations and `socket_active`/`socket_closes` include all kinds. Namespace or socket-table/read-permission failures produce visible diagnostics, increment `observation_errors`, and make the final exit unsuccessful. This backend observes the observer's network namespace and reports when a selected process is elsewhere. A successful empty poll proves only that no admissible sockets were observed in that poll.
 
 ---
 

@@ -17,6 +17,10 @@ cleanup() {
   if [ -n "${SERVER_PID:-}" ] && kill -0 "${SERVER_PID}" 2>/dev/null; then
     kill "${SERVER_PID}" 2>/dev/null || true
   fi
+  if [ -n "${CLIENT_PID:-}" ] && kill -0 "${CLIENT_PID}" 2>/dev/null; then
+    kill "${CLIENT_PID}" 2>/dev/null || true
+    wait "${CLIENT_PID}" 2>/dev/null || true
+  fi
   e2e_info "Retained batching fixtures: ${TMP_DIR}"
 }
 trap cleanup EXIT
@@ -53,10 +57,11 @@ e2e_info "db_queue_max=${QUEUE_MAX}"
 e2e_section "Starting test server"
 
 SERVER_PORT_FILE="${TMP_DIR}/server_port"
-python3 - "${CONNECTION_COUNT}" "${SERVER_PORT_FILE}" <<'PY' &
+python3 - "${CONNECTION_COUNT}" "${SERVER_PORT_FILE}" "${TMP_DIR}/close-clients" <<'PY' &
 import socket
 import sys
 import time
+from pathlib import Path
 
 max_conns = int(sys.argv[1])
 port_file = sys.argv[2]
@@ -84,8 +89,13 @@ try:
 except Exception:
     pass
 
-# Keep connections alive for a bit so rano can observe them
-time.sleep(2)
+# Keep the actual accepted sockets until the observer confirms the complete batch.
+release = Path(sys.argv[3])
+deadline = time.monotonic() + 30
+while not release.exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError('observer did not confirm the held batch before watchdog')
+    time.sleep(.02)
 
 # Clean up
 for conn in connections:
@@ -146,10 +156,11 @@ sleep 0.5
 e2e_section "Creating ${CONNECTION_COUNT} connections"
 
 CLIENT_LOG="${TMP_DIR}/client.log"
-python3 - "${SERVER_PORT}" "${CONNECTION_COUNT}" batchtest > "${CLIENT_LOG}" 2>&1 <<'PY' &
+python3 - "${SERVER_PORT}" "${CONNECTION_COUNT}" batchtest "${TMP_DIR}/close-clients" > "${CLIENT_LOG}" 2>&1 <<'PY' &
 import socket
 import sys
 import time
+from pathlib import Path
 
 port = int(sys.argv[1])
 count = int(sys.argv[2])
@@ -167,10 +178,16 @@ for i in range(count):
         errors += 1
         print(f"Connection {i} failed: {e}", file=sys.stderr)
 
-print(f"Created {len(connections)} connections, {errors} errors")
+print(f"Created {len(connections)} connections, {errors} errors", flush=True)
+if errors or len(connections) != count:
+    raise RuntimeError('fixture did not establish the declared batch')
 
-# Keep connections alive long enough for rano to observe
-time.sleep(2)
+release = Path(sys.argv[4])
+deadline = time.monotonic() + 30
+while not release.exists():
+    if time.monotonic() >= deadline:
+        raise RuntimeError('observer did not confirm the held batch before watchdog')
+    time.sleep(.02)
 
 # Close all connections
 for sock in connections:
@@ -185,14 +202,31 @@ CLIENT_PID=$!
 
 e2e_info "client_pid=${CLIENT_PID}"
 
-# Wait for client to finish
-wait "${CLIENT_PID}" 2>/dev/null || true
+# Release only after every held client socket has actually been observed.
+observed_connects=0
+for _ in $(seq 1 300); do
+  observed_connects=$(grep -c '"event":"connect"' "${LOG_FILE}" || true)
+  if [ "${observed_connects:-0}" -ge "${CONNECTION_COUNT}" ]; then break; fi
+  kill -0 "${CLIENT_PID}" 2>/dev/null || e2e_fail "client exited before full batch observation"
+  kill -0 "${RANO_PID}" 2>/dev/null || e2e_fail "monitor exited before full batch observation"
+  sleep .1
+done
+[ "${observed_connects:-0}" -eq "${CONNECTION_COUNT}" ] || e2e_fail "observer did not capture exactly ${CONNECTION_COUNT} held sockets"
+touch "${TMP_DIR}/close-clients"
+wait "${CLIENT_PID}" || e2e_fail "client failed to release its batch"
+unset CLIENT_PID
 
 e2e_section "Client results"
 cat "${CLIENT_LOG}"
 
-# Give rano a moment to process the closing connections
-sleep 1
+observed_closes=0
+for _ in $(seq 1 300); do
+  observed_closes=$(grep -c '"event":"close"' "${LOG_FILE}" || true)
+  if [ "${observed_closes:-0}" -ge "${CONNECTION_COUNT}" ]; then break; fi
+  kill -0 "${RANO_PID}" 2>/dev/null || e2e_fail "monitor exited before close observation"
+  sleep .1
+done
+[ "${observed_closes:-0}" -eq "${CONNECTION_COUNT}" ] || e2e_fail "observer did not capture exactly ${CONNECTION_COUNT} closes"
 
 # =============================================================================
 # Stop rano gracefully
@@ -200,7 +234,8 @@ sleep 1
 e2e_section "Stopping rano"
 
 kill -INT "${RANO_PID}" 2>/dev/null || true
-wait "${RANO_PID}" 2>/dev/null || true
+wait "${RANO_PID}" || e2e_fail "monitor reported unsuccessful persistence or observation"
+unset RANO_PID
 
 e2e_info "rano stopped"
 
@@ -210,8 +245,8 @@ e2e_info "rano stopped"
 e2e_section "Analyzing rano output"
 
 # Count connect/close events from JSON output
-json_connects=$(grep -c '"event":"connect"' "${LOG_FILE}" 2>/dev/null || echo "0")
-json_closes=$(grep -c '"event":"close"' "${LOG_FILE}" 2>/dev/null || echo "0")
+json_connects=$(grep -c '"event":"connect"' "${LOG_FILE}" || true)
+json_closes=$(grep -c '"event":"close"' "${LOG_FILE}" || true)
 
 e2e_info "json_connects=${json_connects}"
 e2e_info "json_closes=${json_closes}"
@@ -262,19 +297,12 @@ if [ "${sqlite_total}" -lt 1 ]; then
 fi
 e2e_info "PASS: Events recorded (${sqlite_total} total)"
 
-# SQLite connect count should match JSON connect count (within tolerance for timing)
-# Allow small difference due to timing between polling cycles
-diff_connects=$((json_connects - sqlite_connects))
-if [ "${diff_connects}" -lt 0 ]; then
-  diff_connects=$((0 - diff_connects))
-fi
-# Allow up to 10% difference due to timing
-max_diff=$((json_connects / 10 + 1))
-if [ "${diff_connects}" -gt "${max_diff}" ]; then
-  e2e_info "WARNING: Connect count mismatch (json=${json_connects}, sqlite=${sqlite_connects}, diff=${diff_connects})"
-else
-  e2e_info "PASS: Connect counts match within tolerance"
-fi
+# Durable publication must conserve the exact observed batch; poll timing cannot
+# explain disagreement between two sinks for the same already observed event.
+[ "${json_connects}" -eq "${CONNECTION_COUNT}" ] && [ "${sqlite_connects}" -eq "${CONNECTION_COUNT}" ] || e2e_fail "connect count mismatch"
+[ "${json_closes}" -eq "${CONNECTION_COUNT}" ] && [ "${sqlite_closes}" -eq "${CONNECTION_COUNT}" ] || e2e_fail "close count mismatch"
+[ "${sqlite_total}" -eq "$((CONNECTION_COUNT * 2))" ] || e2e_fail "extra or missing durable rows"
+e2e_info "PASS: Exact connect/close counts conserved across JSON and SQLite"
 
 # If we have connects, we should also have closes (connections were closed)
 if [ "${sqlite_connects}" -gt 0 ] && [ "${sqlite_closes}" -eq 0 ]; then
@@ -331,6 +359,7 @@ e2e_info "PASS: Tiny queue config accepted"
 e2e_section "Real persistence accounting and sink-failure matrix"
 python3 - "${RANO_BIN}" "${TMP_DIR}" <<'PY' || e2e_fail "persistence matrix failed; inspect retained captures"
 import json
+import os
 import signal
 import socket
 import sqlite3
@@ -368,7 +397,7 @@ for name in ['normal50', 'abort', 'finalize', 'unavailable_db', 'unavailable_fil
     case.mkdir()
     count = 50 if name in ['normal50', 'queue_saturation'] else 1
     database = case / 'events.sqlite'
-    seed = subprocess.run([binary, '--no-config', '--pid', '4294967295', '--no-descendants',
+    seed = subprocess.run([binary, '--no-config', '--pid', str(os.getpid()), '--no-descendants',
         '--once', '--no-banner', '--no-dns', '--json', '--sqlite', str(database)], capture_output=True, text=True)
     (case / 'seed.stdout').write_text(seed.stdout)
     (case / 'seed.stderr').write_text(seed.stderr)

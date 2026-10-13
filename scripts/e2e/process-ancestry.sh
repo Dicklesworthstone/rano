@@ -356,6 +356,102 @@ finally:
         holder.stdin.write('x');holder.stdin.flush();holder.wait(timeout=5)
 PY
 
+e2e_section "Real TCP/listener and connected/bound UDP socket semantics"
+python3 - "${RANO}" "${E2E_OUTPUT_DIR}" <<'PY' || e2e_fail "live socket semantics failed"
+import csv, io, json, os, pathlib, socket, sqlite3, subprocess, sys, tempfile
+binary=sys.argv[1]; root=pathlib.Path(tempfile.mkdtemp(prefix='socket-semantics-',dir=sys.argv[2]))
+print(f'  retained fixtures={root}',flush=True)
+code=r'''
+import json,os,socket,sys
+sockets=[]; rows=[]
+def keep(sock,kind):
+    sockets.append(sock)
+    rows.append({'inode':os.readlink('/proc/self/fd/'+str(sock.fileno()))[8:-1],
+        'kind':kind,'proto':'udp' if sock.type==socket.SOCK_DGRAM else 'tcp',
+        'local_port':sock.getsockname()[1], 'family':sock.family})
+for family,ip in [(socket.AF_INET,'127.0.0.1'),(socket.AF_INET6,'::1')]:
+    listener=socket.socket(family);listener.bind((ip,0));listener.listen()
+    client=socket.socket(family);client.connect(listener.getsockname());accepted,_=listener.accept()
+    keep(listener,'listener');keep(client,'endpoint');keep(accepted,'endpoint')
+    sink=socket.socket(family,socket.SOCK_DGRAM);sink.bind((ip,0))
+    connected=socket.socket(family,socket.SOCK_DGRAM);connected.connect(sink.getsockname())
+    sender=socket.socket(family,socket.SOCK_DGRAM);sender.sendto(b'actual datagram',sink.getsockname());sink.recvfrom(100)
+    keep(sink,'bound_udp');keep(connected,'endpoint');keep(sender,'bound_udp')
+print(json.dumps({'pid':os.getpid(),'sockets':rows}),flush=True)
+sys.stdin.read(1)
+'''
+parent=r'''
+import base64,subprocess,sys
+child=subprocess.Popen([sys.executable,'-u','-c',base64.b64decode(sys.argv[1]).decode()],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+print(child.stdout.readline(),end='',flush=True)
+sys.stdin.read(1);child.stdin.write('x');child.stdin.flush();child.wait(timeout=5)
+'''
+def launch(child=False):
+    if child:
+        import base64
+        args=[sys.executable,'-u','-c',parent,base64.b64encode(code.encode()).decode(),'claude']
+    else: args=[sys.executable,'-u','-c',code,'claude']
+    proc=subprocess.Popen(args,stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
+    return proc,json.loads(proc.stdout.readline())
+for label,flags,child in [
+    ('default',[],False),('listening',['--include-listening'],False),
+    ('no-udp',['--no-udp'],False),('tcp-all',['--include-listening','--no-udp'],False),
+    ('descendant',['--include-listening'],True),('no-descendant',['--include-listening','--no-descendants'],True)]:
+    proc,ready=launch(child)
+    try:
+        case=root/label;case.mkdir()
+        expected={row['inode']:row for row in ready['sockets'] if
+            (row['kind']!='listener' or '--include-listening' in flags) and
+            (row['proto']!='udp' or '--no-udp' not in flags)}
+        if child and '--no-descendants' in flags: expected={}
+        # Independent fd inventory remains available while all sockets are held.
+        kernel={os.readlink(path)[8:-1] for path in pathlib.Path(f"/proc/{ready['pid']}/fd").iterdir()
+            if os.readlink(path).startswith('socket:[')}
+        assert set(row['inode'] for row in ready['sockets'])==kernel, 'fixture fd inventory disagrees with kernel'
+        result=subprocess.run([binary,'--no-config','--pid',str(proc.pid),'--once','--json','--no-banner','--no-dns',
+            '--sqlite',str(case/'events.sqlite'),'--log-file',str(case/'events.jsonl'),'--log-format','json',*flags],capture_output=True,text=True,timeout=25)
+        (case/'stdout.jsonl').write_text(result.stdout);(case/'stderr').write_text(result.stderr)
+        assert result.returncode==0, f'{label}: monitor failed: {result.stderr}'
+        objects=list(map(json.loads,result.stdout.splitlines()));events=[row for row in objects if 'event' in row]
+        observed={json.loads(row['ownership_json'])['inode']:row for row in events}
+        assert len(events)==len(expected) and set(observed)==set(expected), f'{label}: missed or invented sockets: {len(events)} versus {len(expected)}'
+        for inode,event in observed.items():
+            fixture=expected[inode];metadata=json.loads(event['ownership_json'])
+            kind=fixture['kind'];assert metadata['socket_kind']==kind and metadata['direction']=='unknown', 'wrong state/direction'
+            assert event['event']=={'endpoint':'connect','listener':'listen','bound_udp':'bind'}[kind], 'false connect event'
+            assert event['pid']==ready['pid'] and event['proto']==fixture['proto'], 'wrong owner/protocol'
+            assert metadata['remote_present']==(kind=='endpoint'), 'missing remote evidence flag'
+            if kind!='endpoint': assert event['remote']=='none' and event['domain']=='unknown' and 'domain_source' not in event, 'fabricated destination/domain'
+            if kind=='listener': assert metadata['kernel_state']=='0A', 'listener state lost'
+        summary=next(row['summary'] for row in objects if 'summary' in row)
+        assert summary['socket_active']==len(expected) and summary['observation_errors']==0, 'observation health/count mismatch'
+        assert summary['connects']==sum(row['kind']=='endpoint' for row in expected.values()), 'local sockets inflated connection count'
+        assert summary['listens']==sum(row['kind']=='listener' for row in expected.values()) and summary['binds']==sum(row['kind']=='bound_udp' for row in expected.values()), 'local observation counters wrong'
+        with sqlite3.connect(case/'events.sqlite') as conn:
+            durable=list(conn.execute('SELECT event,proto,local_port,remote_port,domain,ownership_json FROM events'))
+        assert len(durable)==len(expected), 'durable socket rows lost'
+        for event,proto,local_port,remote_port,domain,metadata in durable:
+            metadata=json.loads(metadata);fixture=expected[metadata['inode']]
+            assert event==observed[metadata['inode']]['event'] and proto==fixture['proto'] and local_port==fixture['local_port'], 'durable semantics differ'
+            if fixture['kind']!='endpoint': assert remote_port==0 and domain is None and not metadata['remote_present'], 'durable local socket invented remote'
+        logged=[row for row in map(json.loads,(case/'events.jsonl').read_text().splitlines()) if 'event' in row]
+        assert logged==events, 'file event semantics differ'
+        exported=subprocess.run([binary,'export','--sqlite',str(case/'events.sqlite'),'--format','csv'],capture_output=True,text=True,timeout=15)
+        assert exported.returncode==0, 'export failed'
+        rows=list(csv.DictReader(io.StringIO(exported.stdout)))
+        assert len(rows)==len(expected) and {json.loads(row['ownership_json'])['inode'] for row in rows}==set(expected), 'export lost socket identity'
+        print(f'  PASS {label}: {len(expected)} held IPv4/IPv6 kernel sockets, stdout/file/SQLite/export',flush=True)
+    finally:
+        proc.stdin.write('x');proc.stdin.flush();proc.wait(timeout=5)
+case=root/'absent-pid';case.mkdir()
+result=subprocess.run([binary,'--no-config','--pid','4294967295','--once','--json','--no-banner','--no-dns','--no-sqlite'],capture_output=True,text=True,timeout=25)
+(case/'stdout.jsonl').write_text(result.stdout);(case/'stderr').write_text(result.stderr)
+diagnostics=[json.loads(line) for line in result.stderr.splitlines() if line.startswith('{')]
+assert result.returncode!=0 and any(row.get('type')=='observation_error' for row in diagnostics), 'unobservable requested target silently succeeded'
+assert next(row['summary'] for row in map(json.loads,result.stdout.splitlines()) if 'summary' in row)['observation_errors']>0, 'failure absent from summary'
+print('  PASS absent target: visible structured error, unhealthy summary and nonzero exit',flush=True)
+PY
+
 # Summary
 e2e_section "Summary"
 e2e_info "All E2E process ancestry tests passed"

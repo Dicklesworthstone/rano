@@ -27,6 +27,8 @@ jobs:
         run: scripts/bench.sh target/release/rano
 
       - name: Memory soak (10 min accelerated)
+        env:
+          SOAK_SOURCE_REVISION: ${{ github.sha }}
         run: |
           SOAK_SECS=600 \
           RANO=target/release/rano \

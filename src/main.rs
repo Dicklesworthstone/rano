@@ -15,7 +15,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, OpenOptions};
-use std::io::{BufRead, BufReader, BufWriter, Read, Write};
+use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
@@ -888,6 +888,31 @@ enum Proto {
     Udp,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum SocketKind {
+    Connection,
+    Listener,
+    BoundUdp,
+}
+
+impl SocketKind {
+    fn event(self) -> &'static str {
+        match self {
+            Self::Connection => "connect",
+            Self::Listener => "listen",
+            Self::BoundUdp => "bind",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Connection => "endpoint",
+            Self::Listener => "listener",
+            Self::BoundUdp => "bound_udp",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 struct ConnKey {
     inode: u64,
@@ -896,6 +921,7 @@ struct ConnKey {
     provider: Provider,
     provider_origin: Option<ProcessIdentity>,
     proto: Proto,
+    socket_kind: SocketKind,
     local_ip: IpAddr,
     local_port: u16,
     remote_ip: IpAddr,
@@ -926,6 +952,17 @@ struct NetEntry {
     remote_port: u16,
     inode: u64,
     state: String,
+}
+
+fn socket_kind(proto: Proto, entry: &NetEntry, args: &MonitorArgs) -> Option<SocketKind> {
+    match proto {
+        Proto::Tcp if entry.state == "0A" => args.include_listening.then_some(SocketKind::Listener),
+        Proto::Tcp if entry.remote_port != 0 => Some(SocketKind::Connection),
+        Proto::Tcp => None,
+        Proto::Udp if !args.include_udp => None,
+        Proto::Udp if entry.remote_port != 0 => Some(SocketKind::Connection),
+        Proto::Udp => Some(SocketKind::BoundUdp),
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -986,13 +1023,18 @@ struct ProvidersConfig {
 #[derive(Default)]
 struct Stats {
     connects: u64,
+    listens: u64,
+    binds: u64,
     closes: u64,
+    socket_active: u64,
+    socket_closes: u64,
     active: u64,
     peak_active: u64,
     sqlite_dropped: u64,
     sqlite_enabled: bool,
     sqlite_outcome: SqliteOutcome,
     log_failed: bool,
+    observation_errors: u64,
     per_ip: BTreeMap<IpAddr, u64>,
     per_port: BTreeMap<u16, u64>,
     per_domain: BTreeMap<String, u64>,
@@ -1008,14 +1050,26 @@ struct Stats {
 }
 
 impl Stats {
-    fn observed_open(&mut self, provider: Provider) {
-        self.connects += 1;
-        self.active += 1;
-        *self.per_provider.entry(provider).or_default() += 1;
-        *self.active_per_provider.entry(provider).or_default() += 1;
+    fn observed_open(&mut self, provider: Provider, kind: SocketKind) {
+        self.socket_active += 1;
+        match kind {
+            SocketKind::Connection => {
+                self.connects += 1;
+                self.active += 1;
+                *self.per_provider.entry(provider).or_default() += 1;
+                *self.active_per_provider.entry(provider).or_default() += 1;
+            }
+            SocketKind::Listener => self.listens += 1,
+            SocketKind::BoundUdp => self.binds += 1,
+        }
     }
 
-    fn observed_close(&mut self, provider: Provider) {
+    fn observed_close(&mut self, provider: Provider, kind: SocketKind) {
+        self.socket_closes += 1;
+        self.socket_active = self.socket_active.saturating_sub(1);
+        if kind != SocketKind::Connection {
+            return;
+        }
         self.closes += 1;
         self.active = self.active.saturating_sub(1);
         if let Some(count) = self.active_per_provider.get_mut(&provider) {
@@ -1967,6 +2021,8 @@ fn main() {
     let mut last_stats = SystemTime::now();
     let mut last_cycle = SystemTime::now();
     let mut stats_view_index: usize = 0;
+    let mut reported_observation_errors = HashSet::new();
+    let mut first_poll = true;
 
     loop {
         if !RUNNING.load(Ordering::SeqCst) {
@@ -1983,20 +2039,61 @@ fn main() {
         let roots = find_root_pids(&args.patterns, &excluded, &args.pids, &snapshot);
         let monitored_roots = monitored_roots(&roots, args.no_descendants, &snapshot, &excluded);
         let targets: HashSet<_> = monitored_roots.keys().copied().collect();
-        let inode_owners = map_inodes(&targets, &snapshot);
+        let InodeScan {
+            owners: inode_owners,
+            errors: inode_errors,
+        } = map_inodes(&targets, &snapshot);
+        let mut unobservable: HashSet<_> = inode_errors.iter().map(|(pid, _)| *pid).collect();
+        let mut observation_errors: Vec<_> =
+            inode_errors.into_iter().map(|(_, error)| error).collect();
+        for pid in &args.pids {
+            if !snapshot.stat.contains_key(pid)
+                && !excluded.contains(pid)
+                && (first_poll || Path::new(&format!("/proc/{}", pid)).exists())
+            {
+                unobservable.insert(*pid);
+                observation_errors.push(format!("cannot observe requested PID {}: process absent, unreadable or changed during poll", pid));
+            }
+        }
         let pid_meta = resolve_provider_meta(&monitored_roots, &snapshot);
 
-        let mut seen_keys: HashSet<ConnKey> = HashSet::new();
-        let entries = gather_net_entries(args.include_udp);
+        let mut seen_keys = preserve_unobservable_keys(active.keys(), &unobservable, &snapshot);
+        let mut table_failed = false;
+        let entries = match gather_net_entries(args.include_udp) {
+            Ok(entries) => entries,
+            Err(error) => {
+                table_failed = true;
+                observation_errors.push(error);
+                Vec::new()
+            }
+        };
+        for error in observation_errors {
+            stats.observation_errors += 1;
+            if reported_observation_errors.insert(error.clone()) {
+                if args.json {
+                    eprintln!(
+                        "{{\"type\":\"observation_error\",\"message\":\"{}\"}}",
+                        escape_json(&error)
+                    );
+                } else {
+                    eprintln!("warning: {}", error);
+                }
+                if let Some(writer) = &log_writer {
+                    writer.warning(&error);
+                }
+            }
+        }
+        first_poll = false;
+        if table_failed {
+            // Missing evidence cannot establish that an earlier socket closed.
+            break;
+        }
         let now = SystemTime::now();
 
         for (proto, entry) in entries {
-            if entry.remote_port == 0 {
+            let Some(kind) = socket_kind(proto, &entry, &args) else {
                 continue;
-            }
-            if !args.include_listening && entry.state == "0A" && proto == Proto::Tcp {
-                continue;
-            }
+            };
 
             let owners = match inode_owners.get(&entry.inode) {
                 Some(owners) if !owners.is_empty() => owners,
@@ -2020,6 +2117,7 @@ fn main() {
                 provider: meta.provider,
                 provider_origin: meta.provider_origin,
                 proto,
+                socket_kind: kind,
                 local_ip: entry.local_ip,
                 local_port: entry.local_port,
                 remote_ip: entry.remote_ip,
@@ -2029,7 +2127,9 @@ fn main() {
             seen_keys.insert(key.clone());
 
             if !active.contains_key(&key) {
-                let (domain, domain_source) = if let Some(cache) = domain_cache.as_mut() {
+                let (domain, domain_source) = if kind != SocketKind::Connection {
+                    (None, None)
+                } else if let Some(cache) = domain_cache.as_mut() {
                     match cache.lookup(entry.remote_ip, entry.remote_port) {
                         Some((host, source)) => (Some(host), Some(source.label())),
                         None if ptr_enabled => resolve_domain(entry.remote_ip, &mut dns_cache)
@@ -2056,12 +2156,14 @@ fn main() {
 
                 // Durable sinks get the masked cmdline; display keeps the original.
                 let log_cmdline = redact_argv(&meta.argv, args.redact_cmdline);
-                let ownership_json = format_ownership_json(
+                let ownership_json = format_socket_ownership_json(
                     entry.inode,
                     identity,
                     monitored_roots[&pid],
                     owners,
                     meta.provider_origin,
+                    kind,
+                    &entry.state,
                 );
 
                 let info = ConnInfo {
@@ -2085,7 +2187,7 @@ fn main() {
                 if !args.summary_only {
                     emit_event(
                         &ts,
-                        "connect",
+                        kind.event(),
                         &run_ctx.run_id,
                         &key,
                         pid,
@@ -2106,9 +2208,11 @@ fn main() {
                     );
                 }
 
-                stats.observed_open(meta.provider);
-                *stats.per_ip.entry(entry.remote_ip).or_insert(0) += 1;
-                *stats.per_port.entry(entry.remote_port).or_insert(0) += 1;
+                stats.observed_open(meta.provider, kind);
+                if kind == SocketKind::Connection {
+                    *stats.per_ip.entry(entry.remote_ip).or_insert(0) += 1;
+                    *stats.per_port.entry(entry.remote_port).or_insert(0) += 1;
+                }
                 *stats.per_pid.entry(pid).or_insert(0) += 1;
                 *stats.per_comm.entry(meta.comm.clone()).or_insert(0) += 1;
                 stats
@@ -2116,11 +2220,13 @@ fn main() {
                     .entry(meta.provider)
                     .or_default()
                     .extend(domain.iter().cloned());
-                stats
-                    .per_provider_ips
-                    .entry(meta.provider)
-                    .or_default()
-                    .insert(entry.remote_ip);
+                if kind == SocketKind::Connection {
+                    stats
+                        .per_provider_ips
+                        .entry(meta.provider)
+                        .or_default()
+                        .insert(entry.remote_ip);
+                }
                 if let Some(name) = domain.clone() {
                     *stats.per_domain.entry(name).or_insert(0) += 1;
                 }
@@ -2128,7 +2234,7 @@ fn main() {
                 // Single decision point for connection-level alerts: consults
                 // AlertState cooldowns so suppressed alerts never flag the row.
                 let conn_alert_emitted = match active.get(&key) {
-                    Some(conn_info) => check_connection_alerts(
+                    Some(conn_info) if kind == SocketKind::Connection => check_connection_alerts(
                         &args.alert,
                         &mut alert_state,
                         &key,
@@ -2137,7 +2243,7 @@ fn main() {
                         style,
                         log_writer.as_ref(),
                     ),
-                    None => false,
+                    _ => false,
                 };
 
                 if stats.sqlite_enabled {
@@ -2148,7 +2254,7 @@ fn main() {
                     writer.enqueue(SqliteEvent {
                         ts: ts.clone(),
                         run_id: run_ctx.run_id.clone(),
-                        event: "connect".to_string(),
+                        event: kind.event().to_string(),
                         key: key.clone(),
                         cmdline: log_cmdline.clone(),
                         pid: Some(pid),
@@ -2165,12 +2271,14 @@ fn main() {
                 }
             } else if let Some(info) = active.get_mut(&key) {
                 info.last_seen = now;
-                info.ownership_json = format_ownership_json(
+                info.ownership_json = format_socket_ownership_json(
                     entry.inode,
                     identity,
                     monitored_roots[&pid],
                     owners,
                     meta.provider_origin,
+                    kind,
+                    &entry.state,
                 );
                 if args.show_ancestry {
                     let chain = ancestry_cache.get_or_compute(pid, &snapshot);
@@ -2194,8 +2302,11 @@ fn main() {
 
                 let ts = now_rfc3339();
                 // Track retry pattern on close events
-                let retry_warning =
-                    retry_tracker.track_connection(key.remote_ip, key.remote_port, info.pid);
+                let retry_warning = (key.socket_kind == SocketKind::Connection)
+                    .then(|| {
+                        retry_tracker.track_connection(key.remote_ip, key.remote_port, info.pid)
+                    })
+                    .flatten();
                 let retry_count = retry_warning.as_ref().map(|w| w.count);
 
                 // Emit retry warning if detected
@@ -2252,12 +2363,13 @@ fn main() {
                         log_writer.as_ref(),
                     );
                 }
-                stats.observed_close(info.provider);
+                stats.observed_close(info.provider, key.socket_kind);
 
                 // Single decision point for duration alerts: consults AlertState
                 // cooldowns so suppressed alerts never flag the row.
                 let mut close_alert_emitted = false;
-                if let Some(ms) = duration_ms {
+                if let Some(ms) = duration_ms.filter(|_| key.socket_kind == SocketKind::Connection)
+                {
                     stats.duration_ms_samples += 1;
                     stats.duration_ms_total = stats.duration_ms_total.saturating_add(ms);
                     stats.duration_ms_max = stats.duration_ms_max.max(ms);
@@ -2376,7 +2488,7 @@ fn main() {
         alert_state.alert_count,
         alert_state.suppressed_count,
     );
-    if stats.sqlite_outcome.failed || stats.log_failed {
+    if stats.sqlite_outcome.failed || stats.log_failed || stats.observation_errors > 0 {
         std::process::exit(1);
     }
 }
@@ -4716,6 +4828,7 @@ fn synthesized_alert_event(ts: &str, run_id: &str, provider: Provider) -> Sqlite
             provider,
             provider_origin: None,
             proto: Proto::Tcp,
+            socket_kind: SocketKind::Connection,
             local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
             local_port: 0,
             remote_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
@@ -4829,7 +4942,11 @@ fn emit_event(
         Proto::Udp => "udp",
     };
     let local = format!("{}:{}", key.local_ip, key.local_port);
-    let remote = format!("{}:{}", key.remote_ip, key.remote_port);
+    let remote = if key.socket_kind == SocketKind::Connection {
+        format!("{}:{}", key.remote_ip, key.remote_port)
+    } else {
+        "none".to_string()
+    };
     let dom = domain.unwrap_or("unknown");
 
     if json_mode {
@@ -4934,6 +5051,8 @@ fn format_pretty_event(
 
     let event_label = match event {
         "connect" => "+ connect",
+        "listen" => "+ listen",
+        "bind" => "+ bind",
         "close" => "- close",
         _ => event,
     };
@@ -5012,7 +5131,7 @@ fn format_pretty_event(
     };
 
     format!(
-        "{} | {} | {} | {} | {} | {} -> {} | domain={}{}",
+        "{} | {} | {} | {} | {} | {} <-> {} | domain={}{}",
         ts_text,
         event_text,
         provider_text,
@@ -5088,7 +5207,7 @@ fn summary(
         writer.write_record(
             &format_json_summary(stats, domain_mode, alert_count, suppressed_count),
             &format!(
-                "summary connects={} closes={} active={} peak_active={} sqlite_dropped={} alerts={} suppressed={} sqlite_observed={} sqlite_persisted={} sqlite_queue_lost={} sqlite_write_lost={} sqlite_failed={} log_failed={}",
+                "summary connects={} closes={} active={} peak_active={} sqlite_dropped={} alerts={} suppressed={} sqlite_observed={} sqlite_persisted={} sqlite_queue_lost={} sqlite_write_lost={} sqlite_failed={} log_failed={} listens={} binds={} observation_errors={} socket_active={} socket_closes={}",
                 stats.connects,
                 stats.closes,
                 stats.active,
@@ -5098,7 +5217,7 @@ fn summary(
                 suppressed_count,
                 stats.sqlite_outcome.observed, stats.sqlite_outcome.persisted,
                 stats.sqlite_outcome.queue_lost, stats.sqlite_outcome.write_lost,
-                stats.sqlite_outcome.failed, stats.log_failed
+                stats.sqlite_outcome.failed, stats.log_failed, stats.listens, stats.binds, stats.observation_errors, stats.socket_active, stats.socket_closes
             ),
         );
         writer.flush();
@@ -5198,6 +5317,10 @@ fn summary(
     if stats.log_failed {
         println!("  file log failed");
     }
+    println!(
+        "  listens={} binds={} observation_errors={}",
+        stats.listens, stats.binds, stats.observation_errors
+    );
 
     if alert_count > 0 || suppressed_count > 0 {
         let alert_text = if suppressed_count > 0 {
@@ -5307,6 +5430,16 @@ fn format_json_summary(
     out.push('{');
     out.push_str("\"summary\":{");
     push_json_num(&mut out, "connects", stats.connects as i64, true);
+    push_json_num(&mut out, "listens", stats.listens as i64, false);
+    push_json_num(&mut out, "binds", stats.binds as i64, false);
+    push_json_num(&mut out, "socket_active", stats.socket_active as i64, false);
+    push_json_num(&mut out, "socket_closes", stats.socket_closes as i64, false);
+    push_json_num(
+        &mut out,
+        "observation_errors",
+        stats.observation_errors as i64,
+        false,
+    );
     push_json_num(&mut out, "closes", stats.closes as i64, false);
     push_json_num(&mut out, "active", stats.active as i64, false);
     push_json_num(&mut out, "peak_active", stats.peak_active as i64, false);
@@ -6207,29 +6340,106 @@ fn monitored_roots(
     result
 }
 
-fn map_inodes(
-    targets: &HashSet<u32>,
+fn preserve_unobservable_keys<'a>(
+    keys: impl Iterator<Item = &'a ConnKey>,
+    unobservable: &HashSet<u32>,
     snapshot: &ProcessSnapshot,
-) -> HashMap<u64, Vec<ProcessIdentity>> {
+) -> HashSet<ConnKey> {
+    keys.filter(|key| {
+        unobservable.contains(&key.process.pid)
+            && snapshot
+                .stat
+                .get(&key.process.pid)
+                .is_none_or(|stat| stat.identity == key.process)
+    })
+    .cloned()
+    .collect()
+}
+
+struct InodeScan {
+    owners: HashMap<u64, Vec<ProcessIdentity>>,
+    errors: Vec<(u32, String)>,
+}
+
+fn map_inodes(targets: &HashSet<u32>, snapshot: &ProcessSnapshot) -> InodeScan {
     let mut map: HashMap<u64, Vec<ProcessIdentity>> = HashMap::new();
+    let mut errors = Vec::new();
+    let own_namespace = fs::read_link("/proc/self/ns/net");
     for pid in targets {
         let Some(stat) = snapshot.stat.get(pid) else {
             continue;
         };
+        match (
+            own_namespace.as_ref(),
+            fs::read_link(format!("/proc/{}/ns/net", pid)),
+        ) {
+            (Ok(ours), Ok(theirs))
+                if ours.as_os_str().is_empty() || theirs.as_os_str().is_empty() =>
+            {
+                errors.push((
+                    *pid,
+                    format!(
+                        "cannot inspect network namespace for PID {}: inaccessible namespace link",
+                        pid
+                    ),
+                ));
+                continue;
+            }
+            (Ok(ours), Ok(theirs)) if *ours == theirs => {}
+            (_, Err(error)) if error.kind() == io::ErrorKind::NotFound => continue,
+            (Ok(_), Ok(_)) => {
+                errors.push((*pid, format!("PID {} is in another network namespace; this /proc backend cannot observe its endpoints", pid)));
+                continue;
+            }
+            (ours, theirs) => {
+                errors.push((
+                    *pid,
+                    format!(
+                        "cannot inspect network namespace for PID {}: {:?}, {:?}",
+                        pid,
+                        ours.err(),
+                        theirs.err()
+                    ),
+                ));
+                continue;
+            }
+        }
         let fd_dir = format!("/proc/{}/fd", pid);
-        if let Ok(entries) = fs::read_dir(fd_dir) {
-            for entry in entries.flatten() {
-                if let Ok(link) = fs::read_link(entry.path()) {
-                    let link_str = link.to_string_lossy();
-                    if let Some(inode) = parse_socket_inode(&link_str) {
+        let entries = match fs::read_dir(&fd_dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                errors.push((*pid, format!("cannot inspect {}: {}", fd_dir, error)));
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) => {
+                    errors.push((*pid, format!("cannot enumerate {}: {}", fd_dir, error)));
+                    continue;
+                }
+            };
+            match fs::read_link(entry.path()) {
+                Ok(link) => {
+                    if let Some(inode) = parse_socket_inode(&link.to_string_lossy()) {
                         map.entry(inode).or_default().push(stat.identity);
                     }
                 }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => errors.push((
+                    *pid,
+                    format!("cannot inspect {}: {}", entry.path().display(), error),
+                )),
             }
         }
     }
     canonicalize_inode_owners(&mut map);
-    map
+    InodeScan {
+        owners: map,
+        errors,
+    }
 }
 
 fn canonicalize_inode_owners(map: &mut HashMap<u64, Vec<ProcessIdentity>>) {
@@ -6439,71 +6649,78 @@ fn format_ownership_json(
     )
 }
 
-fn gather_net_entries(include_udp: bool) -> Vec<(Proto, NetEntry)> {
-    let mut entries = Vec::new();
-    entries.extend(read_net_file("/proc/net/tcp", Proto::Tcp, false));
-    entries.extend(read_net_file("/proc/net/tcp6", Proto::Tcp, true));
-    if include_udp {
-        entries.extend(read_net_file("/proc/net/udp", Proto::Udp, false));
-        entries.extend(read_net_file("/proc/net/udp6", Proto::Udp, true));
-    }
-    entries
+fn format_socket_ownership_json(
+    inode: u64,
+    process: ProcessIdentity,
+    root: ProcessIdentity,
+    owners: &[ProcessIdentity],
+    provider_origin: Option<ProcessIdentity>,
+    kind: SocketKind,
+    state: &str,
+) -> String {
+    let mut json = format_ownership_json(inode, process, root, owners, provider_origin);
+    json.pop();
+    json.push_str(&format!(",\"socket_kind\":\"{}\",\"kernel_state\":\"{}\",\"direction\":\"unknown\",\"remote_present\":{}}}",
+        kind.label(), escape_json(state), kind == SocketKind::Connection));
+    json
 }
 
-fn read_net_file(path: &str, proto: Proto, ipv6: bool) -> Vec<(Proto, NetEntry)> {
+fn gather_net_entries(include_udp: bool) -> Result<Vec<(Proto, NetEntry)>, String> {
+    let mut entries = Vec::new();
+    entries.extend(read_net_file("/proc/net/tcp", Proto::Tcp, false)?);
+    entries.extend(read_net_file("/proc/net/tcp6", Proto::Tcp, true)?);
+    if include_udp {
+        entries.extend(read_net_file("/proc/net/udp", Proto::Udp, false)?);
+        entries.extend(read_net_file("/proc/net/udp6", Proto::Udp, true)?);
+    }
+    Ok(entries)
+}
+
+fn read_net_file(path: &str, proto: Proto, ipv6: bool) -> Result<Vec<(Proto, NetEntry)>, String> {
     let mut result = Vec::new();
-    let file = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return result,
-    };
+    let file =
+        fs::File::open(path).map_err(|error| format!("cannot observe {}: {}", path, error))?;
     let reader = BufReader::new(file);
 
     for (idx, line_result) in reader.lines().enumerate() {
         if idx == 0 {
             continue;
         }
-        let line = match line_result {
-            Ok(l) => l,
-            Err(_) => continue,
-        };
-
-        let parts: Vec<&str> = line.split_whitespace().collect();
-        if parts.len() < 10 {
-            continue;
-        }
-        let local = parts[1];
-        let remote = parts[2];
-        let state = parts[3].to_string();
-        let inode = parts[9].parse::<u64>().unwrap_or(0);
-
-        let (local_ip, local_port) = match parse_addr_port(local, ipv6) {
-            Some(v) => v,
-            None => continue,
-        };
-        let (remote_ip, remote_port) = match parse_addr_port(remote, ipv6) {
-            Some(v) => v,
-            None => continue,
-        };
-
-        result.push((
-            proto,
-            NetEntry {
-                local_ip,
-                local_port,
-                remote_ip,
-                remote_port,
-                inode,
-                state,
-            },
-        ));
+        let line = line_result.map_err(|error| format!("cannot read {}: {}", path, error))?;
+        let entry = parse_net_entry(&line, ipv6)
+            .ok_or_else(|| format!("malformed socket row in {} at line {}", path, idx + 1))?;
+        result.push((proto, entry));
     }
-    result
+    Ok(result)
+}
+
+fn parse_net_entry(line: &str, ipv6: bool) -> Option<NetEntry> {
+    let parts: Vec<_> = line.split_ascii_whitespace().collect();
+    if parts.len() < 10
+        || parts[3].len() != 2
+        || !parts[3].bytes().all(|byte| byte.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    let (local_ip, local_port) = parse_addr_port(parts[1], ipv6)?;
+    let (remote_ip, remote_port) = parse_addr_port(parts[2], ipv6)?;
+    Some(NetEntry {
+        local_ip,
+        local_port,
+        remote_ip,
+        remote_port,
+        inode: parts[9].parse().ok()?,
+        state: parts[3].to_ascii_uppercase(),
+    })
 }
 
 fn parse_addr_port(s: &str, ipv6: bool) -> Option<(IpAddr, u16)> {
     let mut iter = s.split(':');
     let addr_hex = iter.next()?;
     let port_hex = iter.next()?;
+    if iter.next().is_some() || port_hex.len() != 4 {
+        return None;
+    }
     let port = u16::from_str_radix(port_hex, 16).ok()?;
     let ip = if ipv6 {
         IpAddr::V6(parse_ipv6(addr_hex)?)
@@ -6514,7 +6731,7 @@ fn parse_addr_port(s: &str, ipv6: bool) -> Option<(IpAddr, u16)> {
 }
 
 fn parse_ipv4(hex: &str) -> Option<Ipv4Addr> {
-    if hex.len() != 8 {
+    if hex.len() != 8 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let raw = u32::from_str_radix(hex, 16).ok()?;
@@ -6523,7 +6740,7 @@ fn parse_ipv4(hex: &str) -> Option<Ipv4Addr> {
 }
 
 fn parse_ipv6(hex: &str) -> Option<Ipv6Addr> {
-    if hex.len() != 32 {
+    if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
     let mut bytes = [0u8; 16];
@@ -7627,10 +7844,10 @@ fn get_status_data(conn: &Connection) -> Result<StatusData, String> {
         .unwrap_or(0);
     data.total = total;
 
-    // Get active connections (connects - closes for this session)
+    // Active sampled socket episodes include explicitly requested listeners/bound UDP.
     let connects: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM events WHERE run_id = ? AND event = 'connect'",
+            "SELECT COUNT(*) FROM events WHERE run_id = ? AND event IN ('connect', 'listen', 'bind')",
             [&run_id],
             |row| row.get(0),
         )
@@ -9044,6 +9261,8 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
         Proto::Udp => "udp",
     };
     let (is_private, ip_version) = ip_flags(event.key.remote_ip);
+    let domain = (event.key.socket_kind == SocketKind::Connection)
+        .then(|| event.domain.as_deref().unwrap_or("unknown"));
     conn.execute(
         "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, domain_source, ancestry_path, remote_is_private, ip_version, duration_ms, alert, retry_count, ownership_json)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
@@ -9060,7 +9279,7 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
             event.key.local_port as i64,
             event.key.remote_ip.to_string(),
             event.key.remote_port as i64,
-            event.domain.as_deref().unwrap_or("unknown"),
+            domain,
             event.domain_source.as_deref(),
             event.ancestry_path.as_deref(),
             if is_private { 1 } else { 0 },
@@ -9206,6 +9425,155 @@ fn push_json_map_provider(out: &mut String, key: &str, map: &BTreeMap<Provider, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn socket_admission_preserves_endpoints_and_requested_local_sockets() {
+        let mut args = MonitorArgs::default();
+        for ip in ["0.0.0.0", "::"] {
+            let mut entry = NetEntry {
+                local_ip: ip.parse().unwrap(),
+                local_port: 1234,
+                remote_ip: ip.parse().unwrap(),
+                remote_port: 0,
+                inode: 42,
+                state: "0A".to_string(),
+            };
+            assert_eq!(socket_kind(Proto::Tcp, &entry, &args), None);
+            args.include_listening = true;
+            assert_eq!(
+                socket_kind(Proto::Tcp, &entry, &args),
+                Some(SocketKind::Listener)
+            );
+            entry.state = "01".to_string();
+            assert_eq!(socket_kind(Proto::Tcp, &entry, &args), None);
+            assert_eq!(
+                socket_kind(Proto::Udp, &entry, &args),
+                Some(SocketKind::BoundUdp)
+            );
+            entry.remote_port = 443;
+            assert_eq!(
+                socket_kind(Proto::Tcp, &entry, &args),
+                Some(SocketKind::Connection)
+            );
+            assert_eq!(
+                socket_kind(Proto::Udp, &entry, &args),
+                Some(SocketKind::Connection)
+            );
+            args.include_udp = false;
+            assert_eq!(socket_kind(Proto::Udp, &entry, &args), None);
+            args.include_udp = true;
+            args.include_listening = false;
+        }
+    }
+
+    #[test]
+    fn socket_row_parser_checks_addresses_states_and_inode_without_panicking() {
+        let row = "0: 0100007F:3039 0200007F:01BB 01 0:0 0:0 0 1000 0 42";
+        let entry = parse_net_entry(row, false).unwrap();
+        assert_eq!(entry.local_ip, "127.0.0.1".parse::<IpAddr>().unwrap());
+        assert_eq!(entry.remote_port, 443);
+        assert_eq!(entry.inode, 42);
+        let row6 = "0: 00000000000000000000000001000000:3039 00000000000000000000000001000000:0000 0a 0:0 0:0 0 1000 0 43";
+        assert_eq!(parse_net_entry(row6, true).unwrap().state, "0A");
+        for row in [
+            "",
+            "bad row",
+            "0: BAD:1 0100007F:0000 0A 0:0 0:0 0 1000 0 42",
+            "0: 0100007F:3039 0200007F:01BB XX 0:0 0:0 0 1000 0 42",
+            "0: 0100007F:3039 0200007F:01BB 01 0:0 0:0 0 1000 0 bad",
+        ] {
+            assert!(parse_net_entry(row, false).is_none());
+        }
+        assert!(parse_addr_port("0100007F:01BB:extra", false).is_none());
+        assert!(parse_ipv6("éééééééééééééééé").is_none());
+        assert!(read_net_file("/proc/net/rano-nonexistent-table", Proto::Tcp, false).is_err());
+    }
+
+    #[test]
+    fn local_socket_observations_do_not_invent_connections_or_provider_breaches() {
+        let mut stats = Stats::default();
+        stats.observed_open(Provider::Anthropic, SocketKind::Listener);
+        stats.observed_open(Provider::Anthropic, SocketKind::BoundUdp);
+        assert_eq!(
+            (
+                stats.connects,
+                stats.active,
+                stats.listens,
+                stats.binds,
+                stats.socket_active
+            ),
+            (0, 0, 1, 1, 2)
+        );
+        assert!(stats.active_per_provider.is_empty());
+        stats.observed_close(Provider::Anthropic, SocketKind::Listener);
+        assert_eq!(
+            (stats.closes, stats.socket_closes, stats.socket_active),
+            (0, 1, 1)
+        );
+        let json = format_socket_ownership_json(
+            42,
+            ProcessIdentity::default(),
+            ProcessIdentity::default(),
+            &[],
+            None,
+            SocketKind::BoundUdp,
+            "07",
+        );
+        assert!(json.contains("\"socket_kind\":\"bound_udp\""));
+        assert!(json.contains("\"remote_present\":false"));
+        assert!(json.contains("\"direction\":\"unknown\""));
+    }
+
+    #[test]
+    fn durable_local_socket_has_no_hostname_and_endpoint_unknown_is_preserved() {
+        let mut conn = setup_test_db();
+        let mut bound = create_test_event("2026-10-13T20:00:00Z", "bind", Provider::Anthropic);
+        bound.key.socket_kind = SocketKind::BoundUdp;
+        bound.key.remote_port = 0;
+        bound.domain = Some("must-not-be-attributed.test".to_string());
+        log_sqlite_event(&mut conn, &bound).unwrap();
+        let domain: Option<String> = conn
+            .query_row("SELECT domain FROM events WHERE event='bind'", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(domain, None);
+        let mut endpoint =
+            create_test_event("2026-10-13T20:00:01Z", "connect", Provider::Anthropic);
+        endpoint.domain = None;
+        log_sqlite_event(&mut conn, &endpoint).unwrap();
+        let domain: String = conn
+            .query_row(
+                "SELECT domain FROM events WHERE event='connect'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(domain, "unknown");
+    }
+
+    #[test]
+    fn incomplete_owner_scan_preserves_existing_episode_but_pid_reuse_does_not() {
+        let event = create_test_event("2026-10-13T20:00:00Z", "connect", Provider::Anthropic);
+        let key = event.key;
+        let keys = [key.clone()];
+        let mut snapshot =
+            topology_fixture(&[(key.process.pid, 0, key.process.start_time, "helper")]);
+        let inaccessible = HashSet::from([key.process.pid]);
+        assert!(preserve_unobservable_keys(keys.iter(), &inaccessible, &snapshot).contains(&key));
+        assert!(preserve_unobservable_keys(keys.iter(), &HashSet::new(), &snapshot).is_empty());
+        snapshot
+            .stat
+            .get_mut(&key.process.pid)
+            .unwrap()
+            .identity
+            .start_time += 1;
+        assert!(preserve_unobservable_keys(keys.iter(), &inaccessible, &snapshot).is_empty());
+        assert!(
+            preserve_unobservable_keys(keys.iter(), &inaccessible, &ProcessSnapshot::default())
+                .contains(&key)
+        );
+    }
+
     use super::*;
     use tempfile::NamedTempFile;
 
@@ -9603,6 +9971,7 @@ mod tests {
                 provider,
                 provider_origin: None,
                 proto: Proto::Tcp,
+                socket_kind: SocketKind::Connection,
                 local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
                 local_port: 12345,
                 remote_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(8, 8, 8, 8)),
@@ -10280,6 +10649,7 @@ mod tests {
             provider: Provider::Anthropic,
             provider_origin: None,
             proto: Proto::Tcp,
+            socket_kind: SocketKind::Connection,
             local_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(127, 0, 0, 1)),
             local_port: 40000,
             remote_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::new(93, 184, 216, 34)),
@@ -10366,13 +10736,18 @@ mod tests {
         };
         let stats = Stats {
             connects: 0,
+            listens: 0,
+            binds: 0,
             closes: 0,
+            socket_active: 0,
+            socket_closes: 0,
             active: 5,
             peak_active: 5,
             sqlite_dropped: 0,
             sqlite_enabled: false,
             sqlite_outcome: SqliteOutcome::default(),
             log_failed: false,
+            observation_errors: 0,
             per_ip: BTreeMap::new(),
             per_port: BTreeMap::new(),
             per_domain: BTreeMap::new(),
@@ -10438,8 +10813,8 @@ mod tests {
     fn provider_threshold_uses_concurrent_counts_and_exact_boundary() {
         let mut stats = Stats::default();
         for _ in 0..10 {
-            stats.observed_open(Provider::Anthropic);
-            stats.observed_close(Provider::Anthropic);
+            stats.observed_open(Provider::Anthropic, SocketKind::Connection);
+            stats.observed_close(Provider::Anthropic, SocketKind::Connection);
         }
         assert_eq!(stats.per_provider[&Provider::Anthropic], 10);
         assert_eq!(stats.active, 0);
@@ -10469,15 +10844,15 @@ mod tests {
             )
         };
         assert!(check(&stats, &mut state).is_empty());
-        stats.observed_open(Provider::Anthropic);
+        stats.observed_open(Provider::Anthropic, SocketKind::Connection);
         assert!(check(&stats, &mut state).is_empty());
-        stats.observed_open(Provider::Anthropic);
+        stats.observed_open(Provider::Anthropic, SocketKind::Connection);
         assert_eq!(check(&stats, &mut state).len(), 1);
         assert!(check(&stats, &mut state).is_empty());
         assert_eq!(state.suppressed_count, 1);
-        stats.observed_close(Provider::Anthropic);
+        stats.observed_close(Provider::Anthropic, SocketKind::Connection);
         assert!(check(&stats, &mut state).is_empty());
-        stats.observed_open(Provider::Google);
+        stats.observed_open(Provider::Google, SocketKind::Connection);
         assert!(check(&stats, &mut state).is_empty());
         assert_eq!(stats.active_per_provider[&Provider::Anthropic], 1);
         assert_eq!(stats.active_per_provider[&Provider::Google], 1);
@@ -10486,8 +10861,8 @@ mod tests {
     #[test]
     fn simultaneous_thresholds_repeat_after_cooldown_and_respect_no_alerts() {
         let mut stats = Stats::default();
-        stats.observed_open(Provider::OpenAI);
-        stats.observed_open(Provider::OpenAI);
+        stats.observed_open(Provider::OpenAI, SocketKind::Connection);
+        stats.observed_open(Provider::OpenAI, SocketKind::Connection);
         let config = AlertConfig {
             max_connections: Some(2),
             max_per_provider: Some(2),
@@ -10530,8 +10905,8 @@ mod tests {
             )
             .is_empty()
         );
-        stats.observed_open(Provider::OpenAI);
-        stats.observed_close(Provider::OpenAI);
+        stats.observed_open(Provider::OpenAI, SocketKind::Connection);
+        stats.observed_close(Provider::OpenAI, SocketKind::Connection);
         assert_eq!(
             stats.active, 2,
             "a same-poll replacement must be evaluated only after closes"
@@ -11368,6 +11743,7 @@ mod tests {
             provider: Provider::Unknown,
             provider_origin: None,
             proto: Proto::Tcp,
+            socket_kind: SocketKind::Connection,
             local_ip: "127.0.0.1".parse().unwrap(),
             local_port: 123,
             remote_ip: "127.0.0.1".parse().unwrap(),
