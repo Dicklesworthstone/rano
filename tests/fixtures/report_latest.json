@@ -1,20 +1,35 @@
 {
+  "hourly_activity": [
+    {
+      "hour": "2026-01-18T11:00:00Z",
+      "providers": {
+        "anthropic": 2,
+        "openai": 3
+      }
+    }
+  ],
   "meta": {
     "generated_at": "PLACEHOLDER",
+    "metric_scope": "selected_sessions",
     "run_id": "run-2",
-    "version": "1.0"
+    "session_metadata_scope": "full_session",
+    "version": "2.0"
   },
   "providers": [
     {
       "closes": 1,
       "connects": 2,
+      "domains": 1,
       "events": 3,
+      "ips": 1,
       "provider": "openai"
     },
     {
       "closes": 1,
       "connects": 1,
+      "domains": 1,
       "events": 2,
+      "ips": 1,
       "provider": "anthropic"
     }
   ],
@@ -30,8 +45,15 @@
   },
   "summary": {
     "active": 1,
+    "avg_duration_ms": 850,
     "closes": 2,
     "connects": 3,
+    "duration_samples": 2,
+    "max_duration_ms": 1100,
+    "peak_active": 2,
+    "peak_basis": "max_per_session_stored_episode_balance",
+    "peak_order": "utc_then_event_id_or_rowid",
+    "peak_unavailable_reason": null,
     "total_events": 5
   },
   "top_domains": [
@@ -59,5 +81,6 @@
       "events": 2,
       "ip": "2.2.2.2"
     }
-  ]
+  ],
+  "unbucketed_events": 0
 }

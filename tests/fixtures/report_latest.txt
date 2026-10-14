@@ -14,12 +14,18 @@ Session
 Summary
   Events:  5 total (3 connects, 2 closes)
   Observed connect-close balance: 1 (filtered history)
+  Metrics: selected sessions (session metadata covers the full session)
+  Observed event peak: 2 (maximum per-session stored balance; UTC/event ID order)
+  Close durations: avg=850.000ms max=1100ms samples=2
 
 Providers
-  Provider   Events  Connects  Closes
-  ---------  ------  --------  ------
-  openai          3         2       1
-  anthropic       2         1       1
+  Provider   Events  Connects  Closes  Domains  IPs
+  ---------  ------  --------  ------  -------  ---
+  openai          3         2       1        1    1
+  anthropic       2         1       1        1    1
+
+Hourly Activity (UTC, selected event counts)
+  2026-01-18T11:00:00Z  anthropic:2, openai:3
 
 Top Domains
    #  Domain                                            Events  Provider 

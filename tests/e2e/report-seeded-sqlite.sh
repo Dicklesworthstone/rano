@@ -378,6 +378,152 @@ with sqlite3.connect(broken) as conn:conn.execute('CREATE TABLE events(id INTEGE
 run('schema-error-status',['status'],False,broken)
 run('schema-error-report',['report','--json'],False,broken)
 print('PASS UTC offsets/nanoseconds/order, missing/empty/named/ambiguous sessions, legacy fallback, Unicode, malformed/range/nonfinite/schema negatives',flush=True)
+
+insights=root/'insights.sqlite'
+timeline=[
+ ('2026-01-01T00:59:59Z','connect','anthropic','a.test','1.1.1.1',999000),
+ ('2026-01-01T01:00:00Z','connect','openai','b.test','2.2.2.2',None),
+ ('2026-01-01T02:00:00+01:00','close','anthropic','a.test','1.1.1.1',0),
+ ('2026-01-01T01:00:01Z','connect','anthropic','c.test','1.1.1.1',None),
+ ('2026-01-01T01:00:02Z','close','openai','b.test','2.2.2.2',1000),
+ ('2026-01-01T01:00:03Z','close','anthropic','c.test','1.1.1.1',2000),
+]
+with sqlite3.connect(insights) as conn:
+    conn.executescript(schema)
+    conn.execute("INSERT INTO sessions(run_id,start_ts,end_ts,connects,closes,session_name) VALUES('timeline','2026-01-01T00:59:59Z','2026-01-01T01:00:04Z',3,3,'timeline')")
+    conn.executemany("INSERT INTO events(ts,event,provider,domain,remote_ip,duration_ms,run_id) VALUES(?,?,?,?,?,?,'timeline')",timeline)
+def insight(label,bounds=(),run_id='timeline',db=insights):
+    return json.loads(run(label,['report','--json','--run-id',run_id,*bounds],db=db).stdout)
+full=insight('insights-full');summary=full['summary']
+assert (summary['total_events'],summary['connects'],summary['closes'])==(6,3,3),'insight count regression'
+assert (summary['avg_duration_ms'],summary['max_duration_ms'],summary['duration_samples'])==(1000,2000,3),'connect durations incorrectly included or valid zero excluded'
+assert summary['peak_active']==2 and summary['peak_unavailable_reason'] is None and summary['peak_basis']=='max_per_session_stored_episode_balance','timeline peak/basis incorrect'
+assert full['hourly_activity']==[{'hour':'2026-01-01T00:00:00Z','providers':{'anthropic':1}},{'hour':'2026-01-01T01:00:00Z','providers':{'anthropic':3,'openai':2}}],'hour bins use original offsets or wrong counts'
+providers={row['provider']:row for row in full['providers']}
+assert (providers['anthropic']['domains'],providers['anthropic']['ips'])==(2,1) and (providers['openai']['domains'],providers['openai']['ips'])==(1,1),'distinct provider counts incorrect'
+clipped=insight('insights-clipped',['--since','2026-01-01T01:00:02Z','--until','2026-01-01T01:00:04Z'])
+assert (clipped['summary']['connects'],clipped['summary']['closes'],clipped['summary']['peak_active'])==(0,2,2),'opening window balance was discarded'
+assert clipped['summary']['avg_duration_ms']==1500 and clipped['summary']['duration_samples']==2,'duration window includes earlier closes'
+assert clipped['meta']['metric_scope']=='selected_window' and clipped['meta']['session_metadata_scope']=='full_session' and clipped['session']['connects']==clipped['session']['closes']==3,'window metrics misrepresent full session metadata'
+no_close=insight('insights-no-close',['--since','2026-01-01T00:59:59Z','--until','2026-01-01T01:00:00Z'])['summary']
+assert no_close['avg_duration_ms'] is None and no_close['max_duration_ms'] is None and no_close['duration_samples']==0 and no_close['peak_active']==1,'no-close window invented duration zero'
+zero=insight('insights-zero',['--since','2026-01-01T01:00:00Z','--until','2026-01-01T01:00:01Z'])['summary']
+assert (zero['avg_duration_ms'],zero['max_duration_ms'],zero['duration_samples'])==(0,0,1),'legitimate zero duration is unavailable'
+pretty=run('insights-pretty',['report','--run-id','timeline','--no-color'],db=insights).stdout
+assert 'Close durations: avg=1000.000ms max=2000ms samples=3' in pretty and 'Observed event peak: 2' in pretty and 'Hourly Activity (UTC' in pretty,'pretty and JSON insight semantics differ'
+with sqlite3.connect(insights) as conn:
+    for name,count in [('independent-a',2),('independent-b',3)]:
+        conn.executemany("INSERT INTO events(ts,event,provider,domain,remote_ip,run_id) VALUES('2026-01-02T00:00:00Z','connect','unknown','independent.test','3.3.3.3',?)",[(name,)]*count)
+    conn.execute("INSERT INTO events(ts,event,provider,domain,remote_ip,run_id) VALUES('2026-01-03T00:00:00Z','close','unknown','orphan.test','4.4.4.4','orphan')")
+independent=json.loads(run('insights-independent',['report','--json','--since','2026-01-02','--until','2026-01-03'],db=insights).stdout)
+assert independent['summary']['peak_active']==3,'separate observers were added into one invented network peak'
+orphan=insight('insights-orphan',run_id='orphan')['summary']
+assert orphan['peak_active'] is None and orphan['peak_unavailable_reason']=='unmatched_close_in_history','missing opening history produced a confident peak'
+with sqlite3.connect(insights) as conn:
+    conn.executemany("INSERT INTO events(ts,event,provider,domain,remote_ip,run_id) VALUES('2026-01-04T00:00:00Z','connect',?,?,?,'ties')",[
+        ('openai','z.test','2.2.2.2'),('anthropic','a.test','1.1.1.1'),('openai','a.test','2.2.2.2'),('anthropic','z.test','1.1.1.1')])
+ties=insight('insights-ties',run_id='ties')
+assert [row['provider'] for row in ties['providers']]==['anthropic','openai'],'provider count ties unstable'
+assert [row['domain'] for row in ties['top_domains']]==['a.test','a.test','z.test','z.test'],'domain ties unstable'
+assert [row['ip'] for row in ties['top_ips']]==['1.1.1.1','2.2.2.2'] and all(row['domain']=='a.test' for row in ties['top_ips']),'IP ties/domain representative arbitrary'
+with sqlite3.connect(insights) as conn:conn.execute("INSERT INTO events(ts,event,provider,run_id,duration_ms) VALUES('bad-time','close','unknown','malformed',-1)")
+malformed=insight('insights-malformed',run_id='malformed')
+assert malformed['unbucketed_events']==1 and malformed['summary']['peak_active'] is None and malformed['summary']['peak_unavailable_reason']=='invalid_event_timestamps','invalid history silently became ordered activity'
+assert malformed['summary']['avg_duration_ms'] is None and malformed['summary']['duration_samples']==0,'invalid negative duration accepted'
+run('insights-malformed-range',['report','--json','--run-id','malformed','--since','2026-01-01'],False,insights)
+no_duration=root/'no-duration.sqlite'
+with sqlite3.connect(no_duration) as conn:
+    conn.execute('CREATE TABLE events(ts TEXT,run_id TEXT,event TEXT,provider TEXT,remote_ip TEXT,domain TEXT)')
+    conn.execute("INSERT INTO events VALUES('2026-01-01T00:00:00Z','minimal','connect','unknown','1.1.1.1','minimal.test')")
+minimal=insight('insights-no-duration',run_id='minimal',db=no_duration)
+assert minimal['summary']['avg_duration_ms'] is None and minimal['summary']['max_duration_ms'] is None and minimal['summary']['duration_samples']==0 and minimal['summary']['peak_active']==1,'missing duration metadata invented values or broke stable rowid ordering'
+with sqlite3.connect(no_duration) as conn:conn.execute("INSERT INTO events(ts,run_id,event,provider,remote_ip,domain) VALUES('2026-01-05T00:00:00Z',NULL,'connect','unknown','2.2.2.2','unidentified.test')")
+missing_identity=json.loads(run('insights-missing-identity',['report','--json'],db=no_duration).stdout)
+assert missing_identity['summary']['peak_active'] is None and missing_identity['summary']['peak_unavailable_reason']=='run_identity_unavailable','unidentified history yielded a confident peak'
+without_order=root/'without-order.sqlite'
+with sqlite3.connect(without_order) as conn:
+    conn.execute('CREATE TABLE events(ts TEXT PRIMARY KEY,run_id TEXT,event TEXT,provider TEXT,remote_ip TEXT,domain TEXT) WITHOUT ROWID')
+    conn.execute("INSERT INTO events VALUES('2026-01-01T00:00:00Z','unordered','connect','unknown','1.1.1.1','minimal.test')")
+unordered=insight('insights-without-order',run_id='unordered',db=without_order)
+assert unordered['summary']['peak_active'] is None and unordered['summary']['peak_unavailable_reason']=='stable_event_order_unavailable','missing stable order fabricated a peak'
+baseline=__import__('os').environ.get('RANO_REPORT_BASELINE')
+if baseline:
+    result=subprocess.run([baseline,'report','--sqlite',str(insights),'--run-id','timeline','--json'],capture_output=True,text=True,timeout=20)
+    (root/'insights-baseline.stdout').write_text(result.stdout);(root/'insights-baseline.stderr').write_text(result.stderr)
+    assert result.returncode==0 and 'avg_duration_ms' not in json.loads(result.stdout)['summary'] and 'hourly_activity' not in json.loads(result.stdout),'baseline no longer discriminates omitted report capability'
+print('PASS independently seeded UTC hourly/duration/zero/no-close/peak/window/distinct/tie/malformed/minimal-schema report insights; no live-packet peak claimed',flush=True)
+PY
+
+e2e_section "Report from actual held and churning TCP sockets"
+python3 - "${RANO_BIN}" "${TMP_DIR}" <<'PY' || e2e_fail "Live socket report insights failed"
+import collections,datetime,json,os,pathlib,signal,socket,sqlite3,subprocess,sys,time
+binary=sys.argv[1];root=pathlib.Path(sys.argv[2])/'live-report';root.mkdir();database=root/'events.sqlite'
+listener=socket.socket();listener.bind(('127.0.0.1',0));listener.listen()
+pairs=[]
+def open_pair():
+    client=socket.create_connection(listener.getsockname());server,_=listener.accept();pairs.append((client,server))
+def counts():
+    if not database.exists():return (0,0)
+    try:
+        with sqlite3.connect(database,timeout=1) as conn:
+            return conn.execute("SELECT COUNT(CASE WHEN event='connect' THEN 1 END),COUNT(CASE WHEN event='close' THEN 1 END) FROM events").fetchone()
+    except sqlite3.OperationalError:return (0,0)
+def wait_counts(expected):
+    deadline=time.monotonic()+20
+    while time.monotonic()<deadline:
+        assert monitor.poll() is None,'observer exited before the live workload completed'
+        actual=counts()
+        if actual==expected:return
+        assert actual[0]<=expected[0] and actual[1]<=expected[1],f'unexpected socket counts {actual}, expected {expected}'
+        time.sleep(.05)
+    raise AssertionError(f'observer did not reach {expected}; got {counts()}')
+monitor=None
+with (root/'monitor.stdout').open('w') as stdout,(root/'monitor.stderr').open('w') as stderr:
+    try:
+        open_pair();open_pair()
+        monitor=subprocess.Popen([binary,'--no-config','--pid',str(os.getpid()),'--no-descendants','--no-dns','--no-banner','--json',
+            '--interval-ms','50','--stats-interval-ms','0','--db-flush-ms','50','--sqlite',str(database)],stdout=stdout,stderr=stderr)
+        wait_counts((4,0))
+        for sock in pairs.pop(0):sock.close()
+        wait_counts((4,2))
+        open_pair();wait_counts((6,2))
+        for pair in pairs:
+            for sock in pair:sock.close()
+        pairs.clear();wait_counts((6,6))
+        monitor.send_signal(signal.SIGINT)
+        assert monitor.wait(timeout=20)==0,'live observer completed unhealthy'
+    finally:
+        for pair in pairs:
+            for sock in pair:sock.close()
+        listener.close()
+        if monitor is not None and monitor.poll() is None:
+            monitor.send_signal(signal.SIGINT);monitor.wait(timeout=20)
+summaries=[row['summary'] for row in map(json.loads,(root/'monitor.stdout').read_text().splitlines()) if isinstance(row.get('summary'),dict)]
+assert len(summaries)==1 and summaries[0]['sqlite_dropped']==0,'missing summary or lost durable events'
+with sqlite3.connect(database) as conn:
+    run_id=conn.execute('SELECT run_id FROM sessions').fetchone()[0]
+    rows=conn.execute("SELECT id,ts,event,provider,duration_ms,remote_ip,domain FROM events WHERE event IN ('connect','close') ORDER BY id").fetchall()
+assert len(rows)==12 and counts()==(6,6),'live socket ledger does not reconcile'
+def utc(stamp):return datetime.datetime.fromisoformat(stamp.replace('Z','+00:00')).astimezone(datetime.timezone.utc)
+balance=0;peak=0;durations=[];hours=collections.defaultdict(collections.Counter)
+for event_id,stamp,event,provider,duration,ip,domain in sorted(rows,key=lambda row:(utc(row[1]),row[0])):
+    balance+=1 if event=='connect' else -1
+    assert balance>=0,'live close lacks an opening observation'
+    peak=max(peak,balance)
+    hours[utc(stamp).strftime('%Y-%m-%dT%H:00:00Z')][provider]+=1
+    if event=='close':
+        assert isinstance(duration,int) and duration>=0,'live close duration missing or invalid'
+        durations.append(duration)
+assert balance==0 and peak==4 and len(durations)==6,'controlled held/churning socket phases changed'
+result=subprocess.run([binary,'report','--sqlite',str(database),'--run-id',run_id,'--json'],capture_output=True,text=True,timeout=20)
+(root/'report.stdout').write_text(result.stdout);(root/'report.stderr').write_text(result.stderr)
+assert result.returncode==0,result.stderr
+report=json.loads(result.stdout);summary=report['summary']
+assert (summary['connects'],summary['closes'],summary['peak_active'])==(6,6,4),'report differs from controlled live phases'
+assert summary['duration_samples']==6 and abs(summary['avg_duration_ms']-sum(durations)/6)<.000001 and summary['max_duration_ms']==max(durations),'report durations differ from real stored closes'
+assert report['hourly_activity']==[{'hour':hour,'providers':dict(providers)} for hour,providers in sorted(hours.items())],'live UTC bins differ from independently parsed ledger'
+assert sum(row['events'] for row in report['providers'])==12 and sum(row['ips'] for row in report['providers'])==1,'live provider/IP totals changed'
+print('PASS live sockets: six endpoint opens, six closes, observed ledger peak four, six real durations, UTC bins, healthy lossless writer',flush=True)
 PY
 
 e2e_section "Summary"

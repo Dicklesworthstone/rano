@@ -8860,6 +8860,10 @@ fn run_report(args: ReportArgs) -> Result<(), String> {
         );
     }
 
+    let snapshot = conn
+        .transaction()
+        .map_err(|error| format!("Failed to start report snapshot: {error}"))?;
+    let conn = &snapshot;
     let color_enabled = resolve_color_mode(args.color);
 
     // Determine run_id filter
@@ -9260,7 +9264,16 @@ fn format_report_json(
     if let Some(ref until) = filter.until {
         out.push_str(&format!("    \"until\": \"{}\",\n", escape_json(until)));
     }
-    out.push_str("    \"version\": \"1.0\"\n");
+    out.push_str(&format!(
+        "    \"metric_scope\": \"{}\",\n",
+        if filter.since.is_some() || filter.until.is_some() {
+            "selected_window"
+        } else {
+            "selected_sessions"
+        }
+    ));
+    out.push_str("    \"session_metadata_scope\": \"full_session\",\n");
+    out.push_str("    \"version\": \"2.0\"\n");
     out.push_str("  },\n");
 
     // Session info (if available and filtering by run_id)
@@ -9313,8 +9326,38 @@ fn format_report_json(
     out.push_str(&format!("    \"connects\": {},\n", summary.connects));
     out.push_str(&format!("    \"closes\": {},\n", summary.closes));
     out.push_str(&format!(
-        "    \"active\": {}\n",
+        "    \"active\": {},\n",
         summary.connects.saturating_sub(summary.closes)
+    ));
+    out.push_str(&format!(
+        "    \"avg_duration_ms\": {},\n",
+        summary
+            .avg_duration_ms
+            .map_or_else(|| "null".to_string(), |value| value.to_string())
+    ));
+    out.push_str(&format!(
+        "    \"max_duration_ms\": {},\n",
+        summary
+            .max_duration_ms
+            .map_or_else(|| "null".to_string(), |value| value.to_string())
+    ));
+    out.push_str(&format!(
+        "    \"duration_samples\": {},\n",
+        summary.duration_samples
+    ));
+    out.push_str(&format!(
+        "    \"peak_active\": {},\n",
+        summary
+            .peak_active
+            .map_or_else(|| "null".to_string(), |value| value.to_string())
+    ));
+    out.push_str("    \"peak_basis\": \"max_per_session_stored_episode_balance\",\n");
+    out.push_str("    \"peak_order\": \"utc_then_event_id_or_rowid\",\n");
+    out.push_str(&format!(
+        "    \"peak_unavailable_reason\": {}\n",
+        summary
+            .peak_unavailable
+            .map_or_else(|| "null".to_string(), |reason| format!("\"{reason}\""))
     ));
     out.push_str("  },\n");
 
@@ -9323,11 +9366,13 @@ fn format_report_json(
     out.push_str("  \"providers\": [\n");
     for (i, p) in providers.iter().enumerate() {
         out.push_str(&format!(
-            "    {{\"provider\": \"{}\", \"events\": {}, \"connects\": {}, \"closes\": {}}}",
+            "    {{\"provider\": \"{}\", \"events\": {}, \"connects\": {}, \"closes\": {}, \"domains\": {}, \"ips\": {}}}",
             escape_json(&p.provider),
             p.events,
             p.connects,
-            p.closes
+            p.closes,
+            p.domains,
+            p.ips
         ));
         if i < providers.len() - 1 {
             out.push(',');
@@ -9335,6 +9380,23 @@ fn format_report_json(
         out.push('\n');
     }
     out.push_str("  ],\n");
+
+    let (hours, unbucketed) = query_hourly_activity(conn, filter)?;
+    out.push_str("  \"hourly_activity\": [\n");
+    for (index, hour) in hours.iter().enumerate() {
+        let providers: Vec<_> = hour
+            .providers
+            .iter()
+            .map(|(provider, count)| format!("\"{}\":{count}", escape_json(provider)))
+            .collect();
+        out.push_str(&format!(
+            "    {{\"hour\":\"{}\",\"providers\":{{{}}}}}{}\n",
+            escape_json(&hour.hour),
+            providers.join(","),
+            if index + 1 < hours.len() { "," } else { "" }
+        ));
+    }
+    out.push_str(&format!("  ],\n  \"unbucketed_events\": {unbucketed},\n"));
 
     // Top domains
     let domains = query_top_domains(conn, filter, top)?;
@@ -9484,6 +9546,32 @@ fn output_report_pretty(
         "  Observed connect-close balance: {} (filtered history)",
         summary.connects.saturating_sub(summary.closes)
     );
+    println!(
+        "  Metrics: {} (session metadata covers the full session)",
+        if filter.since.is_some() || filter.until.is_some() {
+            "selected window"
+        } else {
+            "selected sessions"
+        }
+    );
+    match summary.peak_active {
+        Some(peak) => println!(
+            "  Observed event peak: {peak} (maximum per-session stored balance; UTC/event ID order)"
+        ),
+        None => println!(
+            "  Observed event peak: unavailable ({})",
+            summary.peak_unavailable.unwrap_or("unknown")
+        ),
+    }
+    match (summary.avg_duration_ms, summary.max_duration_ms) {
+        (Some(average), Some(maximum)) => println!(
+            "  Close durations: avg={average:.3}ms max={maximum}ms samples={}",
+            summary.duration_samples
+        ),
+        _ => println!(
+            "  Close durations: unavailable (no valid nonnegative integer close durations)"
+        ),
+    }
 
     // Providers
     let providers = query_providers(conn, filter)?;
@@ -9520,39 +9608,77 @@ fn output_report_pretty(
             .max()
             .unwrap_or(6)
             .max("Closes".len());
+        let domains_width = providers
+            .iter()
+            .map(|provider| provider.domains.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max("Domains".len());
+        let ips_width = providers
+            .iter()
+            .map(|provider| provider.ips.to_string().len())
+            .max()
+            .unwrap_or(0)
+            .max("IPs".len());
 
         println!(
-            "  {:<provider_width$}  {:>events_width$}  {:>connects_width$}  {:>closes_width$}",
+            "  {:<provider_width$}  {:>events_width$}  {:>connects_width$}  {:>closes_width$}  {:>domains_width$}  {:>ips_width$}",
             "Provider",
             "Events",
             "Connects",
             "Closes",
+            "Domains",
+            "IPs",
             provider_width = provider_width,
             events_width = events_width,
             connects_width = connects_width,
-            closes_width = closes_width
+            closes_width = closes_width,
+            domains_width = domains_width,
+            ips_width = ips_width
         );
         println!(
-            "  {}  {}  {}  {}",
+            "  {}  {}  {}  {}  {}  {}",
             "-".repeat(provider_width),
             "-".repeat(events_width),
             "-".repeat(connects_width),
-            "-".repeat(closes_width)
+            "-".repeat(closes_width),
+            "-".repeat(domains_width),
+            "-".repeat(ips_width)
         );
         for p in &providers {
             let label = provider_label(&p.provider, color);
             let label = pad_right(&label, provider_width, p.provider.len());
             println!(
-                "  {}  {:>events_width$}  {:>connects_width$}  {:>closes_width$}",
+                "  {}  {:>events_width$}  {:>connects_width$}  {:>closes_width$}  {:>domains_width$}  {:>ips_width$}",
                 label,
                 p.events,
                 p.connects,
                 p.closes,
+                p.domains,
+                p.ips,
                 events_width = events_width,
                 connects_width = connects_width,
-                closes_width = closes_width
+                closes_width = closes_width,
+                domains_width = domains_width,
+                ips_width = ips_width
             );
         }
+    }
+
+    let (hours, unbucketed) = query_hourly_activity(conn, filter)?;
+    if !hours.is_empty() {
+        println!("\nHourly Activity (UTC, selected event counts)");
+        for hour in hours {
+            let counts: Vec<_> = hour
+                .providers
+                .iter()
+                .map(|(provider, count)| format!("{provider}:{count}"))
+                .collect();
+            println!("  {}  {}", hour.hour, counts.join(", "));
+        }
+    }
+    if unbucketed > 0 {
+        println!("  Unbucketed events (invalid timestamps): {unbucketed}");
     }
 
     // Spawned From (ancestry roots)
@@ -9782,6 +9908,11 @@ struct SummaryStats {
     total_events: i64,
     connects: i64,
     closes: i64,
+    avg_duration_ms: Option<f64>,
+    max_duration_ms: Option<i64>,
+    duration_samples: i64,
+    peak_active: Option<i64>,
+    peak_unavailable: Option<&'static str>,
 }
 
 struct ProviderStats {
@@ -9789,6 +9920,167 @@ struct ProviderStats {
     events: i64,
     connects: i64,
     closes: i64,
+    domains: i64,
+    ips: i64,
+}
+
+struct HourlyActivity {
+    hour: String,
+    providers: BTreeMap<String, i64>,
+}
+
+fn append_report_filter(sql: &mut String, params: &mut Vec<String>, filter: &ReportFilter) {
+    if let Some(run_id) = &filter.run_id {
+        sql.push_str(" AND run_id=?");
+        params.push(run_id.clone());
+    }
+    if let Some(since) = &filter.since {
+        sql.push_str(" AND rano_utc(ts)>=rano_utc(?)");
+        params.push(since.clone());
+    }
+    if let Some(until) = &filter.until {
+        sql.push_str(" AND rano_utc(ts)<rano_utc(?)");
+        params.push(until.clone());
+    }
+}
+
+fn query_hourly_activity(
+    conn: &Connection,
+    filter: &ReportFilter,
+) -> Result<(Vec<HourlyActivity>, i64), String> {
+    let mut sql = String::from(
+        "SELECT substr(rano_report_utc(ts),1,13)||':00:00Z',provider,COUNT(*) FROM events WHERE rano_report_utc(ts) IS NOT NULL",
+    );
+    let mut params = Vec::new();
+    append_report_filter(&mut sql, &mut params, filter);
+    sql.push_str(" GROUP BY 1,provider ORDER BY 1 ASC,provider ASC");
+    let refs: Vec<&dyn rusqlite::ToSql> = params
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let mut statement = conn
+        .prepare(&sql)
+        .map_err(|error| format!("Failed to prepare hourly activity: {error}"))?;
+    let rows = statement
+        .query_map(refs.as_slice(), |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })
+        .map_err(|error| format!("Failed to query hourly activity: {error}"))?;
+    let mut hours: BTreeMap<String, BTreeMap<String, i64>> = BTreeMap::new();
+    for row in rows {
+        let (hour, provider, count) =
+            row.map_err(|error| format!("Failed to read hourly activity: {error}"))?;
+        hours.entry(hour).or_default().insert(provider, count);
+    }
+    let mut invalid_sql =
+        String::from("SELECT COUNT(*) FROM events WHERE rano_report_utc(ts) IS NULL");
+    let mut invalid_params = Vec::new();
+    append_report_filter(&mut invalid_sql, &mut invalid_params, filter);
+    let refs: Vec<&dyn rusqlite::ToSql> = invalid_params
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let unbucketed = conn
+        .query_row(&invalid_sql, refs.as_slice(), |row| row.get(0))
+        .map_err(|error| format!("Failed to count unbucketed events: {error}"))?;
+    Ok((
+        hours
+            .into_iter()
+            .map(|(hour, providers)| HourlyActivity { hour, providers })
+            .collect(),
+        unbucketed,
+    ))
+}
+
+/// Reconstruct a stored episode ledger, separately for every monitoring run.
+/// Earlier rows carry the opening window balance; independent runs are never
+/// added together. This does not reconstruct packet activity missed by polling.
+fn query_observed_peak(
+    conn: &Connection,
+    filter: &ReportFilter,
+) -> Result<(Option<i64>, Option<&'static str>), String> {
+    let since = parse_time_filter(&filter.since)?;
+    let until = parse_time_filter(&filter.until)?;
+    let mut sql = String::from(
+        "SELECT rano_report_utc(ts),run_id,event FROM events WHERE event IN ('connect','close')",
+    );
+    let mut params = Vec::new();
+    if let Some(run_id) = &filter.run_id {
+        sql.push_str(" AND run_id=?");
+        params.push(run_id.clone());
+    }
+    // Include earlier observations to establish the window's opening ledger.
+    let sequence = if column_exists(conn, "events", "id")? {
+        "id"
+    } else {
+        "rowid"
+    };
+    sql.push_str(&format!(" ORDER BY rano_report_utc(ts) ASC,{sequence} ASC"));
+    let refs: Vec<&dyn rusqlite::ToSql> = params
+        .iter()
+        .map(|value| value as &dyn rusqlite::ToSql)
+        .collect();
+    let mut statement = match conn.prepare(&sql) {
+        Ok(statement) => statement,
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("no such column") && message.contains("rowid") {
+                return Ok((None, Some("stable_event_order_unavailable")));
+            }
+            return Err(format!("Failed to prepare observed peak: {error}"));
+        }
+    };
+    let mut rows = statement
+        .query(refs.as_slice())
+        .map_err(|error| format!("Failed to query observed peak: {error}"))?;
+    let mut balances: HashMap<String, i64> = HashMap::new();
+    let mut peak: Option<i64> = None;
+    while let Some(row) = rows
+        .next()
+        .map_err(|error| format!("Failed to read observed peak: {error}"))?
+    {
+        let Some(ts) = row
+            .get::<_, Option<String>>(0)
+            .map_err(|error| format!("Failed to read peak timestamp: {error}"))?
+        else {
+            return Ok((None, Some("invalid_event_timestamps")));
+        };
+        if until.as_ref().is_some_and(|until| ts >= *until) {
+            break;
+        }
+        let Some(run) = row
+            .get::<_, Option<String>>(1)
+            .map_err(|error| format!("Failed to read peak run: {error}"))?
+        else {
+            return Ok((None, Some("run_identity_unavailable")));
+        };
+        if run.is_empty() {
+            return Ok((None, Some("run_identity_unavailable")));
+        }
+        let event: String = row
+            .get(2)
+            .map_err(|error| format!("Failed to read peak event: {error}"))?;
+        let balance = balances.entry(run).or_default();
+        let before = *balance;
+        *balance = balance
+            .checked_add(if event == "connect" { 1 } else { -1 })
+            .ok_or_else(|| "Observed episode balance overflow".to_string())?;
+        if *balance < 0 {
+            return Ok((None, Some("unmatched_close_in_history")));
+        }
+        if since.as_ref().is_none_or(|since| ts >= *since) {
+            let value = before.max(*balance);
+            peak = Some(peak.unwrap_or(0).max(value));
+        }
+    }
+    Ok((
+        peak,
+        peak.is_none().then_some("no_selected_endpoint_events"),
+    ))
 }
 
 struct AncestryRootStats {
@@ -9831,25 +10123,41 @@ fn query_session(conn: &Connection, run_id: &str) -> Result<Option<SessionInfo>,
 }
 
 fn query_summary(conn: &Connection, filter: &ReportFilter) -> Result<SummaryStats, String> {
-    let (sql, params) = build_summary_query(filter);
+    let has_duration = column_exists(conn, "events", "duration_ms")?;
+    let (sql, params) = build_summary_query(filter, has_duration);
     let params_refs: Vec<&dyn rusqlite::ToSql> =
         params.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
 
-    conn.query_row(&sql, params_refs.as_slice(), |row| {
-        Ok(SummaryStats {
-            total_events: row.get(0)?,
-            connects: row.get(1)?,
-            closes: row.get(2)?,
+    let mut summary = conn
+        .query_row(&sql, params_refs.as_slice(), |row| {
+            Ok(SummaryStats {
+                total_events: row.get(0)?,
+                connects: row.get(1)?,
+                closes: row.get(2)?,
+                avg_duration_ms: row.get(3)?,
+                max_duration_ms: row.get(4)?,
+                duration_samples: row.get(5)?,
+                peak_active: None,
+                peak_unavailable: None,
+            })
         })
-    })
-    .map_err(|e| format!("Failed to query summary: {}", e))
+        .map_err(|e| format!("Failed to query summary: {}", e))?;
+    let (peak, reason) = query_observed_peak(conn, filter)?;
+    summary.peak_active = peak;
+    summary.peak_unavailable = reason;
+    Ok(summary)
 }
 
-fn build_summary_query(filter: &ReportFilter) -> (String, Vec<String>) {
-    let mut sql = String::from(
+fn build_summary_query(filter: &ReportFilter, has_duration: bool) -> (String, Vec<String>) {
+    let duration = if has_duration { "duration_ms" } else { "NULL" };
+    let eligible = format!("event='close' AND typeof({duration})='integer' AND {duration}>=0");
+    let mut sql = format!(
         "SELECT COUNT(*) as total,
                 COALESCE(SUM(CASE WHEN event='connect' THEN 1 ELSE 0 END), 0) as connects,
-                COALESCE(SUM(CASE WHEN event='close' THEN 1 ELSE 0 END), 0) as closes
+                COALESCE(SUM(CASE WHEN event='close' THEN 1 ELSE 0 END), 0) as closes,
+                AVG(CASE WHEN {eligible} THEN {duration} END),
+                MAX(CASE WHEN {eligible} THEN {duration} END),
+                COUNT(CASE WHEN {eligible} THEN 1 END)
          FROM events WHERE 1=1",
     );
     let mut params: Vec<String> = Vec::new();
@@ -9886,6 +10194,8 @@ fn query_providers(conn: &Connection, filter: &ReportFilter) -> Result<Vec<Provi
                 events: row.get(1)?,
                 connects: row.get(2)?,
                 closes: row.get(3)?,
+                domains: row.get(4)?,
+                ips: row.get(5)?,
             })
         })
         .map_err(|e| format!("Failed to query providers: {}", e))?;
@@ -9902,7 +10212,9 @@ fn build_providers_query(filter: &ReportFilter) -> (String, Vec<String>) {
         "SELECT provider,
                 COUNT(*) as events,
                 SUM(CASE WHEN event='connect' THEN 1 ELSE 0 END) as connects,
-                SUM(CASE WHEN event='close' THEN 1 ELSE 0 END) as closes
+                SUM(CASE WHEN event='close' THEN 1 ELSE 0 END) as closes,
+                COUNT(DISTINCT CASE WHEN event IN ('connect','close') AND domain IS NOT NULL AND domain NOT IN ('','unknown') THEN domain END),
+                COUNT(DISTINCT CASE WHEN event IN ('connect','close') AND remote_ip IS NOT NULL AND remote_ip NOT IN ('','0.0.0.0','::') THEN remote_ip END)
          FROM events WHERE 1=1",
     );
     let mut params: Vec<String> = Vec::new();
@@ -9920,7 +10232,7 @@ fn build_providers_query(filter: &ReportFilter) -> (String, Vec<String>) {
         params.push(until.clone());
     }
 
-    sql.push_str(" GROUP BY provider ORDER BY events DESC");
+    sql.push_str(" GROUP BY provider ORDER BY events DESC, provider ASC");
     (sql, params)
 }
 
@@ -9992,7 +10304,7 @@ fn build_ancestry_roots_query(filter: &ReportFilter, top: usize) -> (String, Vec
     }
 
     sql.push_str(&format!(
-        " GROUP BY root_seg ORDER BY connects DESC LIMIT {}",
+        " GROUP BY root_seg ORDER BY connects DESC, root_seg ASC LIMIT {}",
         top
     ));
     (sql, params)
@@ -10095,8 +10407,8 @@ fn build_ips_query(filter: &ReportFilter, top: usize) -> (String, Vec<String>) {
     let mut sql = String::from(
         "SELECT remote_ip,
                 COUNT(*) as events,
-                domain
-         FROM events WHERE remote_ip IS NOT NULL",
+                MIN(CASE WHEN domain IS NOT NULL AND domain!='' AND domain!='unknown' THEN domain END)
+         FROM events WHERE remote_ip IS NOT NULL AND remote_ip NOT IN ('','0.0.0.0','::')",
     );
     let mut params: Vec<String> = Vec::new();
 
@@ -10114,7 +10426,7 @@ fn build_ips_query(filter: &ReportFilter, top: usize) -> (String, Vec<String>) {
     }
 
     sql.push_str(&format!(
-        " GROUP BY remote_ip ORDER BY events DESC LIMIT {}",
+        " GROUP BY remote_ip ORDER BY events DESC, remote_ip ASC LIMIT {}",
         top
     ));
     (sql, params)
@@ -10269,6 +10581,19 @@ fn configure_query_connection(conn: &Connection) -> rusqlite::Result<()> {
                     })
                 })
                 .transpose()
+        },
+    )?;
+    // Unfiltered reports retain malformed legacy rows in their totals, while
+    // explicitly marking chronology-based metrics unavailable. Time filters
+    // still use the strict function above and refuse unorderable timestamps.
+    conn.create_scalar_function(
+        "rano_report_utc",
+        1,
+        rusqlite::functions::FunctionFlags::SQLITE_UTF8
+            | rusqlite::functions::FunctionFlags::SQLITE_DETERMINISTIC,
+        |context| {
+            let value: Option<String> = context.get(0)?;
+            Ok(value.and_then(|value| normalize_utc_timestamp(&value).ok()))
         },
     )
 }
@@ -11007,7 +11332,7 @@ mod tests {
             since: Some("2026-01-01T00:00:00Z".to_string()),
             until: Some("2026-01-02T00:00:00Z".to_string()),
         };
-        let (sql, params) = build_summary_query(&filter);
+        let (sql, params) = build_summary_query(&filter, true);
         assert!(sql.contains("run_id = ?"));
         assert!(sql.contains("rano_utc(ts) >= rano_utc(?)"));
         assert!(sql.contains("rano_utc(ts) < rano_utc(?)"));
@@ -11192,6 +11517,234 @@ mod tests {
             times,
             rows.iter().map(|row| row.ts.clone()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn report_insights_use_utc_bins_close_durations_and_carried_window_balance() {
+        let mut conn = setup_test_db();
+        let cases = [
+            (
+                "2026-01-01T00:59:59Z",
+                "connect",
+                Provider::Anthropic,
+                "a.test",
+                "1.1.1.1",
+                Some(999_000),
+            ),
+            (
+                "2026-01-01T01:00:00Z",
+                "connect",
+                Provider::OpenAI,
+                "b.test",
+                "2.2.2.2",
+                None,
+            ),
+            (
+                "2026-01-01T02:00:00+01:00",
+                "close",
+                Provider::Anthropic,
+                "a.test",
+                "1.1.1.1",
+                Some(0),
+            ),
+            (
+                "2026-01-01T01:00:01Z",
+                "connect",
+                Provider::Anthropic,
+                "c.test",
+                "1.1.1.1",
+                None,
+            ),
+            (
+                "2026-01-01T01:00:02Z",
+                "close",
+                Provider::OpenAI,
+                "b.test",
+                "2.2.2.2",
+                Some(1000),
+            ),
+            (
+                "2026-01-01T01:00:03Z",
+                "close",
+                Provider::Anthropic,
+                "c.test",
+                "1.1.1.1",
+                Some(2000),
+            ),
+        ];
+        let events: Vec<_> = cases
+            .into_iter()
+            .map(|(ts, kind, provider, domain, ip, duration)| {
+                let mut event = create_test_event(ts, kind, provider);
+                event.domain = Some(domain.to_string());
+                event.key.remote_ip = ip.parse().unwrap();
+                event.duration_ms = duration;
+                event
+            })
+            .collect();
+        write_sqlite_batch(&mut conn, &events).unwrap();
+        let filter = ReportFilter {
+            run_id: Some("test-run".to_string()),
+            since: None,
+            until: None,
+        };
+        let summary = query_summary(&conn, &filter).unwrap();
+        assert_eq!(
+            (summary.total_events, summary.connects, summary.closes),
+            (6, 3, 3)
+        );
+        assert_eq!(
+            (
+                summary.avg_duration_ms,
+                summary.max_duration_ms,
+                summary.duration_samples
+            ),
+            (Some(1000.0), Some(2000), 3)
+        );
+        assert_eq!(summary.peak_active, Some(2));
+        assert_eq!(summary.peak_unavailable, None);
+        let (hours, unbucketed) = query_hourly_activity(&conn, &filter).unwrap();
+        assert_eq!(unbucketed, 0);
+        assert_eq!(hours.len(), 2);
+        assert_eq!(hours[0].hour, "2026-01-01T00:00:00Z");
+        assert_eq!(hours[0].providers["anthropic"], 1);
+        assert_eq!(hours[1].hour, "2026-01-01T01:00:00Z");
+        assert_eq!(hours[1].providers["anthropic"], 3);
+        assert_eq!(hours[1].providers["openai"], 2);
+        let providers = query_providers(&conn, &filter).unwrap();
+        assert_eq!(
+            (
+                providers[0].provider.as_str(),
+                providers[0].domains,
+                providers[0].ips
+            ),
+            ("anthropic", 2, 1)
+        );
+        let clipped = ReportFilter {
+            run_id: filter.run_id.clone(),
+            since: Some("2026-01-01T01:00:02Z".to_string()),
+            until: Some("2026-01-01T01:00:04Z".to_string()),
+        };
+        let summary = query_summary(&conn, &clipped).unwrap();
+        assert_eq!(
+            (summary.connects, summary.closes, summary.peak_active),
+            (0, 2, Some(2))
+        );
+        assert_eq!(
+            (summary.avg_duration_ms, summary.duration_samples),
+            (Some(1500.0), 2)
+        );
+        let no_close = ReportFilter {
+            run_id: filter.run_id.clone(),
+            since: Some("2026-01-01T00:59:59Z".to_string()),
+            until: Some("2026-01-01T01:00:00Z".to_string()),
+        };
+        let summary = query_summary(&conn, &no_close).unwrap();
+        assert_eq!(
+            (
+                summary.avg_duration_ms,
+                summary.max_duration_ms,
+                summary.duration_samples,
+                summary.peak_active
+            ),
+            (None, None, 0, Some(1))
+        );
+        let zero = ReportFilter {
+            run_id: filter.run_id,
+            since: Some("2026-01-01T01:00:00Z".to_string()),
+            until: Some("2026-01-01T01:00:01Z".to_string()),
+        };
+        let summary = query_summary(&conn, &zero).unwrap();
+        assert_eq!(
+            (
+                summary.avg_duration_ms,
+                summary.max_duration_ms,
+                summary.duration_samples
+            ),
+            (Some(0.0), Some(0), 1)
+        );
+    }
+
+    #[test]
+    fn report_peak_does_not_add_runs_or_invent_missing_history() {
+        let mut conn = setup_test_db();
+        let mut events = Vec::new();
+        for (run, count) in [("first", 2), ("second", 3)] {
+            for _ in 0..count {
+                let mut event =
+                    create_test_event("2026-01-01T00:00:00Z", "connect", Provider::Anthropic);
+                event.run_id = run.to_string();
+                events.push(event);
+            }
+        }
+        write_sqlite_batch(&mut conn, &events).unwrap();
+        let filter = ReportFilter {
+            run_id: None,
+            since: None,
+            until: None,
+        };
+        assert_eq!(
+            query_observed_peak(&conn, &filter).unwrap(),
+            (Some(3), None)
+        );
+        let mut orphan = create_test_event("2026-01-01T00:00:01Z", "close", Provider::OpenAI);
+        orphan.run_id = "orphan".to_string();
+        write_sqlite_batch(&mut conn, &[orphan]).unwrap();
+        assert_eq!(
+            query_observed_peak(&conn, &filter).unwrap(),
+            (None, Some("unmatched_close_in_history"))
+        );
+        let empty = ReportFilter {
+            run_id: Some("empty".to_string()),
+            since: None,
+            until: None,
+        };
+        assert_eq!(
+            query_observed_peak(&conn, &empty).unwrap(),
+            (None, Some("no_selected_endpoint_events"))
+        );
+    }
+
+    #[test]
+    fn report_ranks_ties_stably_and_invalid_time_duration_remain_explicit() {
+        let mut conn = setup_test_db();
+        let mut events = Vec::new();
+        for (domain, ip, provider) in [
+            ("z.test", "2.2.2.2", Provider::OpenAI),
+            ("a.test", "1.1.1.1", Provider::Anthropic),
+        ] {
+            let mut event = create_test_event("2026-01-01T00:00:00Z", "connect", provider);
+            event.domain = Some(domain.to_string());
+            event.key.remote_ip = ip.parse().unwrap();
+            events.push(event);
+        }
+        write_sqlite_batch(&mut conn, &events).unwrap();
+        let filter = ReportFilter {
+            run_id: Some("test-run".to_string()),
+            since: None,
+            until: None,
+        };
+        assert_eq!(
+            query_providers(&conn, &filter).unwrap()[0].provider,
+            "anthropic"
+        );
+        assert_eq!(
+            query_top_domains(&conn, &filter, 10).unwrap()[0].domain,
+            "a.test"
+        );
+        assert_eq!(query_top_ips(&conn, &filter, 10).unwrap()[0].ip, "1.1.1.1");
+        conn.execute("INSERT INTO events(ts,run_id,event,provider,duration_ms) VALUES('invalid-time','test-run','close','anthropic',-1)",[]).unwrap();
+        let summary = query_summary(&conn, &filter).unwrap();
+        assert_eq!(
+            (
+                summary.avg_duration_ms,
+                summary.max_duration_ms,
+                summary.duration_samples
+            ),
+            (None, None, 0)
+        );
+        assert_eq!(summary.peak_unavailable, Some("invalid_event_timestamps"));
+        assert_eq!(query_hourly_activity(&conn, &filter).unwrap().1, 1);
     }
 
     #[test]

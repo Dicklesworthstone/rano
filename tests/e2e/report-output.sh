@@ -3,14 +3,13 @@ set -euo pipefail
 
 TMP_DIR=$(mktemp -d)
 cleanup() {
-  rm -rf "${TMP_DIR}"
+  e2e_info "Retained report fixtures: ${TMP_DIR}"
 }
 trap cleanup EXIT
 
 RANO_BIN="${RANO_BIN:-${E2E_RANO_RELEASE:-./target/release/rano}}"
 if [ ! -x "${RANO_BIN}" ]; then
-  e2e_section "Building rano"
-  cargo build --release --quiet
+  e2e_fail "Compiled rano binary not found: ${RANO_BIN}"
 fi
 
 DB_PATH="${TMP_DIR}/report.sqlite"
@@ -118,7 +117,7 @@ head -n 6 "${E2E_LAST_OUTPUT_FILE}" | while IFS= read -r line; do
   e2e_info "${line}"
 done
 
-python3 - "${E2E_LAST_OUTPUT_FILE}" <<'PY'
+python3 - "${E2E_LAST_OUTPUT_FILE}" <<'PY' || e2e_fail "report schema/count/duration/peak/hourly assertions failed"
 import json
 import sys
 from pathlib import Path
@@ -131,6 +130,10 @@ for key in ["meta", "summary", "providers", "top_domains", "top_ips"]:
         raise SystemExit(f"missing key: {key}")
 
 summary = data["summary"]
+assert summary['avg_duration_ms']==850 and summary['max_duration_ms']==1100 and summary['duration_samples']==2,'valid close duration formula incorrect'
+assert summary['peak_active']==2 and summary['peak_basis']=='max_per_session_stored_episode_balance' and summary['peak_unavailable_reason'] is None,'observed event peak incorrect'
+assert data['hourly_activity']==[{'hour':'2026-01-18T11:00:00Z','providers':{'anthropic':2,'openai':3}}],'UTC hourly activity incorrect'
+assert data['unbucketed_events']==0 and data['meta']['metric_scope']=='selected_sessions','scope/invalid-time metadata incorrect'
 if summary.get("total_events") != 5:
     raise SystemExit(f"unexpected total_events: {summary.get('total_events')}")
 if summary.get("connects") != 3:
@@ -139,6 +142,7 @@ if summary.get("closes") != 2:
     raise SystemExit(f"unexpected closes: {summary.get('closes')}")
 
 providers = {p["provider"]: p for p in data["providers"]}
+assert all(provider['domains']==provider['ips']==1 for provider in providers.values()),'provider distinct counts incorrect'
 if providers.get("openai", {}).get("events") != 3:
     raise SystemExit("openai event count mismatch")
 if providers.get("anthropic", {}).get("events") != 2:
@@ -146,7 +150,7 @@ if providers.get("anthropic", {}).get("events") != 2:
 PY
 
 NORMALIZED_JSON="${TMP_DIR}/report_latest.normalized.json"
-python3 - "${E2E_LAST_OUTPUT_FILE}" "${NORMALIZED_JSON}" <<'PY'
+python3 - "${E2E_LAST_OUTPUT_FILE}" "${NORMALIZED_JSON}" <<'PY' || e2e_fail "report JSON normalization failed"
 import json
 import sys
 from pathlib import Path
@@ -171,7 +175,7 @@ e2e_assert_last_eq "${expected_json}"$'\n'
 e2e_run "report range json" sh -c "\"${RANO_BIN}\" report --sqlite \"${DB_PATH}\" --since 2026-01-18 --until 2026-01-19 --json 2>\"${TMP_DIR}/range.stderr\""
 e2e_assert_last_status 0
 
-python3 - "${E2E_LAST_OUTPUT_FILE}" <<'PY'
+python3 - "${E2E_LAST_OUTPUT_FILE}" <<'PY' || e2e_fail "filtered report summary failed"
 import json
 import sys
 from pathlib import Path

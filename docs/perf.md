@@ -1,6 +1,6 @@
 # Performance
 
-Evidence for the low-overhead design pillar. Historical measurements below are retained with their limits; they do not qualify the current source. The repaired soak requires actual accepted progress, durable row growth and a complete final summary. Scan/throughput benchmark repair and whole-mode cache/resolver qualification remain in progress.
+Evidence for the low-overhead design pillar. Historical measurements below are retained with their limits; they do not qualify the current source. The repaired soak and benchmark require actual accepted progress, exact observed/durable counts and complete final summaries. Whole-mode cache/resolver qualification remains in progress.
 
 **Hardware note**: benchmarks below were captured on an AMD EPYC (Genoa) VM, Linux 6.x, rustc nightly (`rust-toolchain.toml`), release profile, 2026-08-24. Absolute numbers shift with hardware; the ratios and boundedness claims are what matter.
 
@@ -15,6 +15,10 @@ Historical wall time of a complete `rano --pid <holder> --once` run includes sta
 
 These means do not establish flat scaling or a universal duty cycle. A later CI invocation at `7f342a3` measured 38.100 ms for 500 and 103.266 ms for 2000 on different hardware (2026-10-08, run 37765403655); that comparison is not a speedup claim. A new optimization result requires candidate and incumbent in the same invocation with validated socket counts and identical flags. Pure no-DNS/no-SQLite scans must be reported separately from default end-to-end costs.
 
+The revised harness synchronously connects and accepts every dynamic-port fixture pair before measuring. It targets its own socket-owning PID, holds both endpoints until all measured commands complete, and requires exactly twice the pair count in emitted opens and the final summary. It separates no-DNS/no-SQLite invocation costs from default PTR/SQLite invocation costs; both include startup, output and finalization, rather than claiming individual poll latency. It reports mean, median, p95 and maximum, retains stdout/stderr and records actual flags, host, toolchain, binary hashes and separately supplied build revisions. Every command must succeed; an absent summary fails.
+
+An optional second binary is the incumbent. Both run in the same invocation against the same held sockets, with order alternating between iterations. Timings remain observations rather than automatic win/loss qualification. Build revisions must come from each binary's build receipt, not inferred workspace HEAD. A smoke run with the same exact `1cbd545` binary in both arms exercises this pairing mechanism but proves no optimization.
+
 ## Durable SQLite throughput
 
 Connection-churn generator driving events through the batched writer at `--interval-ms 20`, counting rows that actually landed in SQLite over the run window:
@@ -25,6 +29,8 @@ Connection-churn generator driving events through the batched writer at `--inter
 | 1000              | 2400                 | ~217 events/s         | 0     |
 
 The historical rate is workload-specific and does not establish a throughput ceiling. `--db-queue-max` defaults to 10,000; `sqlite_dropped` reconciles queue and write losses. Current summaries also report observed/persisted counts and sink failure. A successful durable measurement requires all those counters to reconcile with actual SQLite rows.
+
+The revised benchmark's two batch arms use a counted, accepted workload paced by durable readiness: each pair remains held until its two opens persist, then must produce two persisted closes before the next pair. Generation therefore keeps progressing, and final opens/closes, observed/persisted rows, actual SQLite rows and all loss counters must agree. Retained samples include each open/close operation's completion time. This measures a paced end-to-end workload, not maximum writer capacity or queue-saturation behavior.
 
 ## Memory soak (`scripts/e2e/soak-memory.sh`)
 
@@ -46,7 +52,7 @@ RSS plateaued within the first minute (~10.5 MB) and never grew — final
 with **2,031 events durably written and zero `sqlite_dropped`**.
 Full sample series: `logs/e2e/soak-memory-20260824T081800Z.log`.
 
-That producer never accepted its listener's backlog and stopped progressing. The RSS result applies to a finite stalled workload, not sustained churn. The repaired >=600-second run and broader endpoint/PID, PTR, ancestry and pcap/cache axes remain unqualified. Runs shorter than 600 s are explicitly smoke tests. `SOAK_SOURCE_REVISION` must identify the binary's exact build receipt for a long run; workspace HEAD and the binary hash are recorded separately and are not substitutes for that binding.
+That producer never accepted its listener's backlog and stopped progressing. The RSS result applies to a finite stalled workload, not sustained churn. A repaired exact-`bc72781241cef39bcc4a2472ed93550b1ce0540a` default/no-DNS run requested600 seconds and completed626 seconds including startup/finalization:46,290 exact durable rows, generation=acceptance progressing every5 seconds, zero event loss, RSS20,888KB reference to21,072KB final/peak. That is scoped author evidence for that revision and workload; later revisions and broader endpoint/PID, PTR, ancestry and pcap/cache axes remain unqualified. Runs shorter than600 seconds are smoke tests. `SOAK_SOURCE_REVISION` must identify the binary's exact build receipt for a long run; workspace HEAD and the binary hash are recorded separately and are not substitutes for that binding.
 
 The stats-view regression now waits for all four requested views against held real sockets, then checks durable observations and a healthy graceful summary. Its 20 s watchdog bounds failure; it makes no 1 s rendering or poll-latency claim. Missing-view, missing-summary and nonzero-exit controls must fail.
 
@@ -55,6 +61,12 @@ The stats-view regression now waits for all four requested views against held re
 ```bash
 cargo build --release
 scripts/bench.sh target/release/rano
+# Optional same-invocation incumbent; supplied SHAs must match build receipts:
+BENCH_SOURCE_REVISION="$(git rev-parse HEAD)" BENCH_INCUMBENT_REVISION=<incumbent-sha> \
+  scripts/bench.sh target/release/rano /path/to/incumbent/rano
+# Fast harness smoke (no scaling or capacity qualification):
+BENCH_PASSES=2 BENCH_CONNECTIONS=5,15 BENCH_CHURN_SECS=1 \
+  scripts/bench.sh target/release/rano
 SOAK_SECS=600 SOAK_SOURCE_REVISION="$(git rev-parse HEAD)" \
   scripts/e2e/run.sh soak-memory scripts/e2e/soak-memory.sh
 ```

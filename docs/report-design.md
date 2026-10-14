@@ -1,6 +1,6 @@
 # Report Subcommand Design
 
-Status: design for bead rust_agent_network_observer-35w.2.1
+Status: implemented report contract; the initial design belongs to bead rust_agent_network_observer-35w.2.1. Report insight repairs are tracked in reality-check task .8; their independent companion remains a separate qualification gate.
 
 ## CLI Design
 
@@ -36,7 +36,7 @@ rano report --sqlite /path/to/rano.sqlite --latest
 | `--latest` | Report on most recent session | - |
 | `--run-id <id>` | Report on specific session | - |
 | `--since <ts>` | Start of time range (UTC or relative) | - |
-| `--until <ts>` | End of time range (UTC, exclusive) | now |
+| `--until <ts>` | End of time range (UTC, exclusive) | no upper bound |
 | `--json` | Output as JSON | false |
 | `--top <n>` | Limit top-N entries | 10 |
 | `--sqlite <path>` | SQLite database path | observer.sqlite |
@@ -50,7 +50,7 @@ rano report --sqlite /path/to/rano.sqlite --latest
 
 ### Timestamp Format
 
-- All timestamps in SQLite are stored as **RFC3339 UTC** (`2026-01-17T12:34:56Z`)
+- The monitor stores RFC3339 UTC. Imported history may use known offsets; queries normalize to UTC rather than comparing raw text.
 - CLI accepts:
   - RFC3339 format: `2026-01-17T12:34:56Z`
   - ISO-8601 date only: `2026-01-17` (interpreted as `2026-01-17T00:00:00Z`)
@@ -90,13 +90,16 @@ Source: `sessions` table
 ### Summary Statistics
 
 ```
-Events:     1,234 connects, 1,180 closes
-Active:     54 (peak: 89)
-Avg duration: 45.2s
-Max duration: 5m 32s
+Total events: 2414
+Connects: 1234  Closes: 1180
+Observed connect-close balance: 54
+Observed event peak: 89 (max per-session stored episode balance)
+Close durations: avg=45200.000ms max=332000ms samples=1180
 ```
 
-Source: `events` table aggregates or `sessions.connects/closes`
+Source: selected `events` rows. Duration aggregates include only nonnegative integer close durations; missing samples are unavailable, distinct from measured zero. Full-session metadata counters do not replace filtered event totals.
+
+The event peak orders endpoint connect/close rows by normalized UTC and then event ID (or SQLite rowid for tables without an ID). Earlier history establishes a window's opening balance. Aggregate reports take the maximum per session, never the sum of independent observers. This is an episode-ledger peak, not the monitor's reconciled poll-boundary peak or a reconstruction of unobserved network activity. Same-timestamp opens before closes can create a transient event-order peak. Unmatched closes, invalid timestamps, missing run identity/order or no selected endpoint events return a null peak and an explicit reason.
 
 ### Provider Breakdown
 
@@ -109,35 +112,31 @@ google         100      95        5     3
 unknown          0       5        2     2
 ```
 
-Source: `provider_counts` view + count distinct from events
+Source: filtered event aggregates plus distinct known domains and peer IPs. Empty/unknown domains and absent-peer sentinels are excluded. The displayed table also includes total events.
 
-### Top Domains (per provider)
+### Top Domains
 
 ```
-Top Domains (anthropic):
-  1. api.anthropic.com        456 events
-  2. console.anthropic.com     89 events
-  ...
-
-Top Domains (openai):
-  1. api.openai.com           234 events
+Top Domains:
+  1. api.anthropic.com        456 events  anthropic [sni]
+  2. api.openai.com           234 events  openai [dns]
   ...
 ```
 
-Source: `provider_domains` view, ordered by events DESC, LIMIT --top
+The actual output is one ranked list of domain/provider pairs, with observed attribution provenance and its event count. It orders by count descending, then domain and provider names, and applies one global `--top` limit.
 
-### Top IPs (per provider)
+### Top IPs
 
 ```
-Top IPs (anthropic):
+Top IPs:
   1. 34.149.66.137            567 events
   2. 34.36.57.103             123 events
   ...
 ```
 
-Source: `provider_ips` view, ordered by events DESC, LIMIT --top
+The actual output is one ranked list of peer IPs across selected providers, ordered by count descending and IP text ascending with a global `--top` limit. For multiple known domains on one IP, the alphabetically first is a deterministic display representative; it is not a claim that all events belong to that domain.
 
-### Hourly Activity (if time range spans multiple hours)
+### Hourly Activity
 
 ```
 Hourly Activity:
@@ -146,7 +145,7 @@ Hourly Activity:
   ...
 ```
 
-Source: `provider_hourly` view, filtered by time range
+Source: filtered event timestamps normalized to UTC, then grouped into hour/provider bins. Single-hour activity is included. Unfiltered reports keep malformed-time rows in totals and expose their count in `unbucketed_events`; filtered queries refuse unorderable timestamps rather than assigning them to a window.
 
 ## Queries by Section
 
@@ -154,12 +153,12 @@ Source: `provider_hourly` view, filtered by time range
 |---------|-----------|---------|
 | Session Info | `sessions WHERE run_id = ?` | run_id |
 | Summary | `SELECT COUNT(*) ... FROM events` | run_id or ts range |
-| Provider Breakdown | `provider_counts` or aggregate | run_id or ts range |
-| Top Domains | `provider_domains ORDER BY events DESC LIMIT ?` | provider, run_id or ts range |
-| Top IPs | `provider_ips ORDER BY events DESC LIMIT ?` | provider, run_id or ts range |
-| Hourly Activity | `provider_hourly` | ts range |
+| Provider Breakdown | filtered event aggregates and distinct endpoint domain/IP counts | run_id or ts range |
+| Top Domains | filtered domain/provider aggregates with provenance | run_id or ts range |
+| Top IPs | filtered peer-IP aggregates and deterministic domain representative | run_id or ts range |
+| Hourly Activity | normalized UTC hour/provider event aggregates | run_id or ts range |
 
-For time-filtered queries, views won't work directly; use inline aggregates:
+Report queries use inline aggregates within one read transaction, so every section shares a consistent snapshot. Session metadata remains full-session; JSON labels `metric_scope` (`selected_window` or `selected_sessions`) and `session_metadata_scope` (`full_session`). Time filters use strict normalized comparisons:
 
 ```sql
 -- Provider counts for time range
@@ -168,7 +167,7 @@ SELECT provider,
        SUM(CASE WHEN event='connect' THEN 1 ELSE 0 END) AS connects,
        SUM(CASE WHEN event='close' THEN 1 ELSE 0 END) AS closes
 FROM events
-WHERE ts >= ? AND ts < ?
+WHERE rano_utc(ts) >= rano_utc(?) AND rano_utc(ts) < rano_utc(?)
 GROUP BY provider;
 ```
 
@@ -187,9 +186,9 @@ GROUP BY provider;
    Error: SQLite file does not contain rano event data
    ```
 
-3. If views missing but `events` exists: warn and use inline queries
+3. If views missing but `events` exists: warn; report sections use inline queries
    ```
-   Warning: SQLite views not found, using fallback queries (slower)
+   Warning: SQLite views not found, using fallback queries
    ```
 
 ### Schema Version
@@ -198,16 +197,19 @@ Future: add `schema_version` to sessions or separate metadata table. For now, as
 
 ## JSON Output Format
 
-### Stable Keys (alphabetical)
+### Stable Keys (schema version 2.0)
 
 ```json
 {
   "hourly_activity": [...],
-  "provider_breakdown": [...],
+  "unbucketed_events": 0,
+  "meta": {...},
+  "providers": [...],
   "session": {...},
   "summary": {...},
-  "top_domains": {...},
-  "top_ips": {...}
+  "top_domains": [...],
+  "top_ips": [...],
+  "ancestry_roots": [...]
 }
 ```
 
@@ -216,8 +218,8 @@ Future: add `schema_version` to sessions or separate metadata table. For now, as
 ```json
 {
   "session": {
-    "args": "rano --pattern claude",
-    "duration_seconds": 5104,
+    "connects": 1234,
+    "closes": 1180,
     "end_ts": "2026-01-17T14:00:00Z",
     "host": "myhost",
     "patterns": "claude, codex, gemini",
@@ -238,7 +240,12 @@ Future: add `schema_version` to sessions or separate metadata table. For now, as
     "closes": 1180,
     "connects": 1234,
     "max_duration_ms": 332000,
-    "peak_active": 89
+    "peak_active": 89,
+    "duration_samples": 1180,
+    "total_events": 2414,
+    "peak_basis": "max_per_session_stored_episode_balance",
+    "peak_order": "utc_then_event_id_or_rowid",
+    "peak_unavailable_reason": null
   }
 }
 ```
@@ -247,10 +254,11 @@ Future: add `schema_version` to sessions or separate metadata table. For now, as
 
 ```json
 {
-  "provider_breakdown": [
+  "providers": [
     {
       "closes": 750,
       "connects": 789,
+      "events": 1539,
       "domains": 12,
       "ips": 8,
       "provider": "anthropic"
@@ -259,23 +267,16 @@ Future: add `schema_version` to sessions or separate metadata table. For now, as
 }
 ```
 
-### Top Domains/IPs Object
+### Top Domains/IPs Arrays
 
 ```json
 {
-  "top_domains": {
-    "anthropic": [
-      {"domain": "api.anthropic.com", "events": 456},
-      {"domain": "console.anthropic.com", "events": 89}
-    ],
-    "openai": [...]
-  },
-  "top_ips": {
-    "anthropic": [
-      {"events": 567, "ip": "34.149.66.137"},
-      {"events": 123, "ip": "34.36.57.103"}
-    ]
-  }
+  "top_domains": [
+    {"domain": "api.anthropic.com", "events": 456, "provider": "anthropic", "source": "sni"}
+  ],
+  "top_ips": [
+    {"events": 567, "ip": "34.149.66.137", "domain": "api.anthropic.com"}
+  ]
 }
 ```
 
@@ -285,11 +286,8 @@ Future: add `schema_version` to sessions or separate metadata table. For now, as
 {
   "hourly_activity": [
     {
-      "anthropic": 45,
-      "google": 10,
       "hour": "2026-01-17T12:00:00Z",
-      "openai": 23,
-      "unknown": 0
+      "providers": {"anthropic": 45, "google": 10, "openai": 23}
     }
   ]
 }
@@ -297,10 +295,10 @@ Future: add `schema_version` to sessions or separate metadata table. For now, as
 
 ## Deterministic Ordering
 
-- Provider breakdown: alphabetical by provider name
+- Provider breakdown: event count descending, then provider name ascending
 - Top domains/IPs: by event count DESC, then alphabetically
 - Hourly activity: chronological (ASC by hour)
-- JSON keys: alphabetical at every level
+- JSON section keys: fixed schema order; hourly provider keys: alphabetical
 
 ## Error Cases
 

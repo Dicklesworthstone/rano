@@ -338,10 +338,15 @@ rano report --latest --color always
 **Report sections**
 
 - **Session**: run ID, start/end times, duration, host, patterns
-- **Summary**: total events, connects, closes, and the observed connect-close balance in the filtered history
-- **Providers**: event counts per provider (anthropic, openai, google, unknown)
+- **Summary**: total events, connects, closes, filtered connect-close balance, observed event peak, and average/maximum valid close duration with sample count
+- **Providers**: event/connect/close counts and distinct observed domains and peer IPs per provider
 - **Top Domains**: most active domains with provider attribution
 - **Top IPs**: most active remote IPs with reverse DNS
+- **Hourly Activity**: UTC hour bins with event counts per provider
+
+All report sections use one database read snapshot. JSON schema `meta.version = "2.0"` labels filtered metrics separately from full-session metadata. Durations include only nonnegative integer `duration_ms` values on close rows; absent samples produce `null`, while a measured zero remains zero. Domain/IP counts exclude unknown domains and absent peer addresses. Count ties sort by name, and an IP with several known domains uses the alphabetically first as its display representative.
+
+`summary.peak_active` reconstructs the stored connect/close ledger in UTC timestamp and event-ID order, carrying earlier history into a selected window. Aggregate reports take the maximum per session; they never add separate observers together. This event-order peak can differ from the monitor's reconciled poll-boundary peak and cannot recover connections missed by polling. Missing opening history, invalid timestamps, absent run identity or event ordering, and windows with no endpoint events produce a typed `peak_unavailable_reason`. Unfiltered reports count malformed-time rows in `unbucketed_events`; time-filtered queries refuse timestamps they cannot order. The filtered connect-close balance is historical arithmetic and can be negative when a window contains only closes.
 
 **Time range formats**
 
