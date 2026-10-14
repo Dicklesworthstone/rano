@@ -20,9 +20,7 @@ TEMP_PRESET_DIR=""
 
 # Cleanup on exit
 cleanup() {
-    if [ -n "${TEMP_PRESET_DIR}" ] && [ -d "${TEMP_PRESET_DIR}" ]; then
-        rm -rf "${TEMP_PRESET_DIR}"
-    fi
+    e2e_info "Retained preset fixtures: ${TEMP_PRESET_DIR}"
 }
 trap cleanup EXIT
 
@@ -33,6 +31,15 @@ e2e_info "rano=${RANO}"
 if [ ! -x "${RANO}" ]; then
     e2e_fail "rano binary not found at ${RANO}. Run 'cargo build' first."
 fi
+
+TEMP_PRESET_DIR="$(mktemp -d)"
+export XDG_CONFIG_HOME="${TEMP_PRESET_DIR}/.config"
+mkdir -p "${XDG_CONFIG_HOME}/rano/presets"
+export RANO_CONFIG="${TEMP_PRESET_DIR}/monitor.conf"
+unset RANO_CONFIG_TOML
+cat > "${RANO_CONFIG}" <<'EOF'
+no_sqlite=true
+EOF
 
 # Test 1: --list-presets shows available presets
 e2e_section "Test 1: --list-presets shows built-in presets"
@@ -129,7 +136,6 @@ e2e_info "PASS: Multiple presets merge in order (later wins)"
 e2e_section "Test 10: Custom user preset"
 
 # Create temporary preset directory
-TEMP_PRESET_DIR="$(mktemp -d)"
 PRESET_FILE="${TEMP_PRESET_DIR}/custom.conf"
 cat > "${PRESET_FILE}" << 'EOF'
 # Description: Custom test preset
@@ -138,8 +144,7 @@ stats_interval_ms=3333
 EOF
 e2e_info "Created custom preset at ${PRESET_FILE}"
 
-# Set HOME to use our custom preset dir
-export HOME="${TEMP_PRESET_DIR}"
+# The same isolated XDG location contains builtins' optional user overrides.
 mkdir -p "${TEMP_PRESET_DIR}/.config/rano/presets"
 cp "${PRESET_FILE}" "${TEMP_PRESET_DIR}/.config/rano/presets/custom.conf"
 

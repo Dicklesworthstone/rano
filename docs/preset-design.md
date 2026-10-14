@@ -10,7 +10,8 @@ Presets are applied like config files, with deterministic precedence and merge r
 ## File Format and Location
 
 - **Format**: same `key=value` style as `config.conf` (one setting per line, `#` comments)
-- **Location**: `~/.config/rano/presets/<name>.conf`
+- **Location**: `$XDG_CONFIG_HOME/rano/presets/<name>.conf`, falling back to
+  `~/.config/rano/presets/<name>.conf` when XDG is unset
 - **Encoding**: UTF-8
 
 Example preset file:
@@ -32,6 +33,11 @@ Settings apply in this order (later wins):
 3. Preset(s) in the order specified on the CLI
 4. CLI flags
 
+Later sources replace list settings; repeated list keys/flags within a source append.
+Presets preserve file order, including repeated keys. `config check` and `config show`
+accept the same options and resolve the same sources as the monitor. `--no-config`
+disables KV/TOML loading; explicitly requested presets still load.
+
 If multiple `--preset` flags are used, they are merged in order:
 
 ```bash
@@ -46,9 +52,9 @@ User presets override built-in presets of the same name.
 
 | Preset | Purpose | Key settings (example) |
 |--------|---------|------------------------|
-| `audit` | Security review / minimal noise | `summary_only=true`, `stats_interval_ms=0`, `include_udp=false`, `no_dns=false`, `log_format=json` |
+| `audit` | Security review / minimal noise | `summary_only=true`, `stats_interval_ms=0`, `include_udp=true`, `no_dns=false`, `log_format=json`, `redact_cmdline=secrets` |
 | `quiet` | Reduce terminal output | `summary_only=true`, `stats_interval_ms=0`, `no_banner=true` |
-| `live` | Real-time monitoring | `stats_interval_ms=2000`, `stats_view=provider,domain`, `stats_cycle_ms=5000` |
+| `live` | Real-time monitoring | `stats_interval_ms=500`, `stats_top=10`, `stats_view=provider,domain`, `stats_cycle_ms=5000` |
 | `verbose` | Maximum detail | `include_udp=true`, `include_listening=true`, `stats_interval_ms=1000`, `stats_top=10` |
 
 Notes:
@@ -81,8 +87,12 @@ rano --list-presets
 ## Error Handling
 
 - **Unknown preset**: print available presets (built-in + user) and exit with error.
-- **Invalid preset file**: warn, skip invalid lines, continue processing remaining lines.
-- **Unreadable preset file**: warn and ignore the preset.
+- **Invalid preset file**: fail check/show/monitor with a source error; later overrides
+  cannot conceal an invalid selected source.
+- **Unreadable preset file**: fail with its path and read error.
+- **Unknown key**: retain a visible warning and ignore the unknown setting.
+- **Preset names**: letters, digits, hyphens and underscores identify a file within
+  the preset directory.
 
 ## Output Format for --list-presets
 

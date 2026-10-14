@@ -925,6 +925,10 @@ rano config show
 # Show configuration as JSON
 rano config show --json
 
+# Inspect the same presets and overrides a monitor would use
+rano config show --json --preset live --interval-ms 100
+rano config check --preset live --interval-ms 100
+
 # List config file search paths
 rano config paths
 ```
@@ -933,10 +937,28 @@ rano config paths
 
 | Subcommand | Description |
 |------------|-------------|
-| `config check` | Validate all config files and report errors/warnings; `--config <path>` / `--config-toml <path>` include overrides, and a set `RANO_CONFIG_TOML` is always checked |
-| `config show` | Display the resolved configuration (all sources merged) |
-| `config show --json` | Output resolved configuration as JSON |
+| `config check` | Resolve and validate the same selected files, ordered presets and monitor options; report errors/warnings |
+| `config show` | Display effective monitor settings, provider matcher and source origins |
+| `config show --json` | Typed `effective` settings, `providers`, `origins`, `sources` and `warnings`; recognized credentials are masked |
 | `config paths` | Show where rano looks for config files |
+
+Both `check` and `show` accept monitor options. `show --json` selects the inspection
+format; use `show --json -- --json` to also inspect JSON monitoring. Inspection
+does not open output sinks or start capture. Runtime file/database permissions and
+capture availability are checked when monitoring starts.
+
+Settings resolve as defaults, the selected KV file, presets in their given order,
+then CLI options. A later source replaces a list setting; repeated list keys or
+flags within that source append. An invalid selected source fails even if a later
+option would replace its value. Unknown file keys remain visible warnings.
+`--no-config` suppresses KV/TOML discovery and explicit/env file overrides;
+explicitly requested presets still load. Missing explicit or environment-selected
+sources are errors.
+
+Inspection omits raw source contents and masks recognized credential flags,
+assignments and token shapes even when monitoring uses `redact_cmdline=off`.
+Original values still drive matching. Arbitrary credentials embedded in unrecognized
+free text or filenames remain outside this heuristic policy.
 
 ### Validation Output
 
@@ -1013,7 +1035,10 @@ Logs are written to `logs/e2e/config-validation-*.log`.
 
 ## Configuration
 
-Default path: `~/.config/rano/config.conf`
+The KV path is `--config <path>`, then a set `RANO_CONFIG`, then
+`$XDG_CONFIG_HOME/rano/config.conf` (or `~/.config/rano/config.conf` when XDG is unset).
+User presets use the same configuration directory under `rano/presets/` and override
+builtins with the same name.
 
 ```ini
 # Process matching

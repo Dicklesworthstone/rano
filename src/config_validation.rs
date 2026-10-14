@@ -47,6 +47,7 @@ pub const KNOWN_CONFIG_KEYS: &[&str] = &[
     "stats_view",
     "stats_cycle_ms",
     "no_banner",
+    "session_name",
     "theme",
     "alert_domain",
     "alert_max_connections",
@@ -206,6 +207,7 @@ pub fn validate_config_file(path: &Path) -> ValidationResult {
         let value = parts.next().map(|v| v.trim());
 
         if key.is_empty() {
+            result.add_error(path, Some(line_num), "missing key");
             continue;
         }
 
@@ -246,213 +248,8 @@ fn validate_config_value(
     value: &str,
     result: &mut ValidationResult,
 ) {
-    match key {
-        // Boolean values
-        "no_descendants"
-        | "json"
-        | "summary_only"
-        | "pcap"
-        | "no_dns"
-        | "include_udp"
-        | "include_listening"
-        | "show_ancestry"
-        | "once"
-        | "no_sqlite"
-        | "no_banner"
-        | "alert_unknown_domain"
-        | "alert_bell"
-        | "no_alerts"
-            if !is_valid_bool(value) =>
-        {
-            result.add_error(
-                path,
-                Some(line),
-                format!(
-                    "'{}' must be a boolean (true/false/yes/no/1/0), got '{}'",
-                    key, value
-                ),
-            );
-        }
-
-        // Positive integer values
-        "pid" if value.parse::<u32>().is_err() => {
-            result.add_error(
-                path,
-                Some(line),
-                format!(
-                    "'{}' must be a valid process ID (positive integer), got '{}'",
-                    key, value
-                ),
-            );
-        }
-
-        // Positive u64 values
-        "interval_ms" | "db_flush_ms" | "stats_interval_ms" | "stats_cycle_ms"
-        | "alert_cooldown_ms"
-            if value.parse::<u64>().is_err() =>
-        {
-            result.add_error(
-                path,
-                Some(line),
-                format!("'{}' must be a non-negative integer, got '{}'", key, value),
-            );
-        }
-
-        // Positive u64 values that must be >= 1
-        "alert_max_connections"
-        | "alert_max_per_provider"
-        | "alert_duration_ms"
-        | "retry_window_ms" => match value.parse::<u64>() {
-            Ok(0) => {
-                result.add_error(path, Some(line), format!("'{}' must be >= 1, got 0", key));
-            }
-            Err(_) => {
-                result.add_error(
-                    path,
-                    Some(line),
-                    format!("'{}' must be a positive integer, got '{}'", key, value),
-                );
-            }
-            Ok(_) => {}
-        },
-
-        // Positive usize values that must be >= 1
-        "db_batch_size" | "db_queue_max" | "retry_threshold" => match value.parse::<usize>() {
-            Ok(0) => {
-                result.add_error(path, Some(line), format!("'{}' must be >= 1, got 0", key));
-            }
-            Err(_) => {
-                result.add_error(
-                    path,
-                    Some(line),
-                    format!("'{}' must be a positive integer, got '{}'", key, value),
-                );
-            }
-            Ok(_) => {}
-        },
-
-        // pcap tuning knobs
-        "pcap_cache_max" => match value.parse::<usize>() {
-            Ok(n) if n < 100 => {
-                result.add_error(
-                    path,
-                    Some(line),
-                    format!("'pcap_cache_max' must be >= 100, got {}", n),
-                );
-            }
-            Err(_) => {
-                result.add_error(
-                    path,
-                    Some(line),
-                    format!("'{}' must be a non-negative integer, got '{}'", key, value),
-                );
-            }
-            Ok(_) => {}
-        },
-        "stats_width" | "stats_top" if value.parse::<usize>().is_err() => {
-            result.add_error(
-                path,
-                Some(line),
-                format!("'{}' must be a non-negative integer, got '{}'", key, value),
-            );
-        }
-
-        // Enum values
-        "domain_mode" if !VALID_DOMAIN_MODES.contains(&value.to_lowercase().as_str()) => {
-            result.add_error(
-                path,
-                Some(line),
-                format!(
-                    "'{}' must be one of [{}], got '{}'",
-                    key,
-                    VALID_DOMAIN_MODES.join(", "),
-                    value
-                ),
-            );
-        }
-
-        "redact_cmdline" if !["off", "secrets", "all"].contains(&value.to_lowercase().as_str()) => {
-            result.add_error(
-                path,
-                Some(line),
-                format!(
-                    "'{}' must be one of [off, secrets, all], got '{}'",
-                    key, value
-                ),
-            );
-        }
-
-        "log_format" if !VALID_LOG_FORMATS.contains(&value.to_lowercase().as_str()) => {
-            result.add_error(
-                path,
-                Some(line),
-                format!(
-                    "'{}' must be one of [{}], got '{}'",
-                    key,
-                    VALID_LOG_FORMATS.join(", "),
-                    value
-                ),
-            );
-        }
-
-        "color" if !VALID_COLOR_MODES.contains(&value.to_lowercase().as_str()) => {
-            result.add_error(
-                path,
-                Some(line),
-                format!(
-                    "'{}' must be one of [{}], got '{}'",
-                    key,
-                    VALID_COLOR_MODES.join(", "),
-                    value
-                ),
-            );
-        }
-
-        "theme" if !VALID_THEMES.contains(&value.to_lowercase().as_str()) => {
-            result.add_error(
-                path,
-                Some(line),
-                format!(
-                    "'{}' must be one of [{}], got '{}'",
-                    key,
-                    VALID_THEMES.join(", "),
-                    value
-                ),
-            );
-        }
-
-        "stats_view" => {
-            // stats_view can be comma-separated
-            for part in value.split(',') {
-                let trimmed = part.trim().to_lowercase();
-                if !trimmed.is_empty() && !VALID_STATS_VIEWS.contains(&trimmed.as_str()) {
-                    result.add_error(
-                        path,
-                        Some(line),
-                        format!(
-                            "'stats_view' contains invalid value '{}' (valid: [{}])",
-                            part.trim(),
-                            VALID_STATS_VIEWS.join(", ")
-                        ),
-                    );
-                }
-            }
-        }
-
-        // Path values - just check they're not empty
-        "log_file" | "log_dir" | "sqlite" if value.is_empty() => {
-            result.add_error(path, Some(line), format!("'{}' cannot be empty", key));
-        }
-
-        // String/pattern values - no validation needed for syntax
-        "pattern" | "exclude_pattern" | "alert_domain" => {
-            // These are string values that allow comma-separated lists
-            // We could validate glob patterns here in the future
-        }
-
-        _ => {
-            // Should not reach here if KNOWN_CONFIG_KEYS is complete
-        }
+    if let Err(error) = crate::apply_config_value(key, value, &mut crate::MonitorArgs::default()) {
+        result.add_error(path, Some(line), error);
     }
 }
 
@@ -483,13 +280,17 @@ pub fn validate_toml_config(path: &Path) -> ValidationResult {
         }
     };
 
-    // Parse as TOML
-    let parsed: toml::Value = match toml::from_str(&contents) {
+    validate_toml_contents(path, &contents)
+}
+
+pub fn validate_toml_contents(path: &Path, contents: &str) -> ValidationResult {
+    let mut result = ValidationResult::new();
+    // Parse the same immutable source bytes used by runtime resolution.
+    let parsed: toml::Value = match toml::from_str(contents) {
         Ok(v) => v,
-        Err(e) => {
-            // Try to extract line number from TOML error
-            let msg = e.to_string();
-            result.add_error(path, None, format!("TOML parse error: {}", msg));
+        Err(_) => {
+            // Source excerpts may contain credentials; keep them out of errors.
+            result.add_error(path, None, "TOML parse error (source contents omitted)");
             return result;
         }
     };
@@ -540,7 +341,7 @@ fn validate_providers_section(path: &Path, providers: &toml::Value, result: &mut
         .copied()
         .collect();
 
-    for (key, value) in table {
+    for key in table.keys() {
         if !valid_provider_keys.contains(key.as_str()) {
             result.add_warning(
                 path,
@@ -550,48 +351,18 @@ fn validate_providers_section(path: &Path, providers: &toml::Value, result: &mut
                     key
                 ),
             );
-            continue;
         }
-
-        match key.as_str() {
-            "mode" => {
-                if let Some(mode_str) = value.as_str() {
-                    if !VALID_PROVIDER_MODES.contains(&mode_str.to_lowercase().as_str()) {
-                        result.add_error(
-                            path,
-                            None,
-                            format!(
-                                "providers.mode must be one of [{}], got '{}'",
-                                VALID_PROVIDER_MODES.join(", "),
-                                mode_str
-                            ),
-                        );
-                    }
-                } else {
-                    result.add_error(path, None, "providers.mode must be a string");
-                }
-            }
-            "anthropic" | "openai" | "google" => {
-                if let Some(arr) = value.as_array() {
-                    for (idx, item) in arr.iter().enumerate() {
-                        if item.as_str().is_none() {
-                            result.add_error(
-                                path,
-                                None,
-                                format!("providers.{}[{}] must be a string", key, idx),
-                            );
-                        }
-                    }
-                } else {
-                    result.add_error(
-                        path,
-                        None,
-                        format!("providers.{} must be an array of strings", key),
-                    );
-                }
-            }
-            _ => {}
+    }
+    let parsed: crate::ProvidersConfig = match providers.clone().try_into() {
+        Ok(config) => config,
+        Err(_) => {
+            result.add_error(path, None, "providers must use a string mode and arrays of strings (type mismatch; source contents omitted)");
+            return;
         }
+    };
+    if let Err(error) = crate::apply_provider_config(&mut crate::ProviderMatcher::default(), parsed)
+    {
+        result.add_error(path, None, error);
     }
 }
 

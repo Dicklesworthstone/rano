@@ -92,13 +92,8 @@ struct ConfigArgs {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum ConfigSubcommand {
-    Check {
-        config: Option<PathBuf>,
-        config_toml: Option<PathBuf>,
-    },
-    Show {
-        json: bool,
-    },
+    Check { options: Vec<String> },
+    Show { json: bool, options: Vec<String> },
     Paths,
 }
 
@@ -109,10 +104,24 @@ struct ConfigPaths {
     use_config: bool,
 }
 
+#[derive(Clone, Debug)]
+struct ConfigSource {
+    kind: &'static str,
+    origin: String,
+    keys: Vec<String>,
+    provider_mode: Option<ProviderMode>,
+}
+
+struct ProviderResolution {
+    matcher: ProviderMatcher,
+    notes: Vec<String>,
+    sources: Vec<ConfigSource>,
+}
+
 const PRESET_AUDIT: &str = "# Description: Security review / minimal noise\n\
 summary_only=true\n\
 stats_interval_ms=0\n\
-include_udp=false\n\
+include_udp=true\n\
 no_dns=false\n\
 log_format=json\n\
 redact_cmdline=secrets\n";
@@ -123,7 +132,8 @@ stats_interval_ms=0\n\
 no_banner=true\n";
 
 const PRESET_LIVE: &str = "# Description: Real-time monitoring focus\n\
-stats_interval_ms=2000\n\
+stats_interval_ms=500\n\
+stats_top=10\n\
 stats_view=provider,domain\n\
 stats_cycle_ms=5000\n";
 
@@ -158,8 +168,8 @@ impl PresetLoader {
         builtin_presets.insert("verbose", PRESET_VERBOSE);
 
         let mut user_preset_dirs = Vec::new();
-        if let Ok(home) = env::var("HOME") {
-            user_preset_dirs.push(PathBuf::from(home).join(".config/rano/presets"));
+        if let Some(config_dir) = xdg_config_home() {
+            user_preset_dirs.push(config_dir.join("rano/presets"));
         }
 
         Self {
@@ -168,10 +178,13 @@ impl PresetLoader {
         }
     }
 
-    fn load_preset(&self, name: &str) -> Result<HashMap<String, String>, String> {
-        // Check builtin presets first
-        if let Some(content) = self.builtin_presets.get(name) {
-            return self.parse_preset_content(content);
+    fn load_preset(&self, name: &str) -> Result<Vec<(String, String)>, String> {
+        if name.is_empty()
+            || !name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        {
+            return Err("Preset names must contain only letters, digits, '-' or '_'".to_string());
         }
 
         // Search user preset directories
@@ -184,6 +197,10 @@ impl PresetLoader {
             }
         }
 
+        if let Some(content) = self.builtin_presets.get(name) {
+            return self.parse_preset_content(content);
+        }
+
         // Preset not found - list available presets
         let available = self.list_preset_names();
         Err(format!(
@@ -193,8 +210,8 @@ impl PresetLoader {
         ))
     }
 
-    fn parse_preset_content(&self, content: &str) -> Result<HashMap<String, String>, String> {
-        let mut result = HashMap::new();
+    fn parse_preset_content(&self, content: &str) -> Result<Vec<(String, String)>, String> {
+        let mut result = Vec::new();
         for (idx, line) in content.lines().enumerate() {
             let raw = line.split('#').next().unwrap_or("").trim();
             if raw.is_empty() {
@@ -204,7 +221,7 @@ impl PresetLoader {
             let key = parts.next().unwrap_or("").trim();
             let value = parts.next().unwrap_or("").trim();
             if key.is_empty() {
-                continue;
+                return Err(format!("preset line {}: missing key", idx + 1));
             }
             if value.is_empty() {
                 return Err(format!(
@@ -213,7 +230,7 @@ impl PresetLoader {
                     key
                 ));
             }
-            result.insert(key.to_string(), value.to_string());
+            result.push((key.to_string(), value.to_string()));
         }
         Ok(result)
     }
@@ -243,6 +260,9 @@ impl PresetLoader {
                                 // Mark as user override
                                 if let Some(preset) = presets.iter_mut().find(|p| p.name == stem) {
                                     preset.source = PresetSource::User(path.clone());
+                                    if let Ok(content) = fs::read_to_string(&path) {
+                                        preset.description = self.extract_description(&content);
+                                    }
                                 }
                                 continue;
                             }
@@ -286,26 +306,61 @@ impl PresetLoader {
     }
 }
 
-fn apply_preset_values(
-    values: &HashMap<String, String>,
-    args: &mut MonitorArgs,
-) -> Result<(), String> {
+fn apply_preset_values(values: &[(String, String)], args: &mut MonitorArgs) -> Result<(), String> {
+    let mut seen = HashSet::new();
     for (key, value) in values {
-        match key.as_str() {
+        if seen.insert(key) {
+            clear_config_list(key, args);
+        }
+        if !apply_config_value(key, value, args)? {
+            args.warnings.push(format!("unknown key '{key}' in preset"));
+        }
+    }
+    Ok(())
+}
+
+/// The typed setting parser used by runtime files, presets, CLI and validation.
+/// Unknown keys are warnings at the source boundary; their values are not echoed.
+fn apply_config_value(key: &str, value: &str, args: &mut MonitorArgs) -> Result<bool, String> {
+    if key != "pcap_interface" && value.trim().is_empty() {
+        return Err(format!("missing value for key '{key}'"));
+    }
+    if matches!(
+        key,
+        "pattern" | "exclude_pattern" | "alert_domain" | "stats_view"
+    ) && value.split(',').all(|part| part.trim().is_empty())
+    {
+        return Err(format!("{key} must contain at least one value"));
+    }
+    let parsed: Result<bool, String> = (|| {
+        match key {
             "pattern" => push_list_value(&mut args.patterns, value),
             "exclude_pattern" => push_list_value(&mut args.exclude_patterns, value),
             "pid" => {
                 let pid = value
                     .parse::<u32>()
-                    .map_err(|_| format!("Invalid pid in preset: {}", value))?;
+                    .map_err(|_| "pid must be a valid process ID (positive integer)".to_string())?;
+                if pid == 0 {
+                    return Err("pid must be >= 1".to_string());
+                }
                 args.pids.push(pid);
             }
             "no_descendants" => args.no_descendants = parse_bool(value)?,
             "interval_ms" => args.interval_ms = parse_u64(value, "interval_ms")?,
             "json" => args.json = parse_bool(value)?,
             "summary_only" => args.summary_only = parse_bool(value)?,
-            "domain_mode" => args.domain_mode = parse_domain_mode(value)?,
-            "pcap" => args.pcap = parse_bool(value)?,
+            "domain_mode" => {
+                args.domain_mode = parse_domain_mode(value)?;
+                args.pcap = false;
+            }
+            "pcap" => {
+                args.pcap = parse_bool(value)?;
+                if args.pcap {
+                    args.domain_mode = DomainMode::Pcap;
+                } else if args.domain_mode == DomainMode::Pcap {
+                    args.domain_mode = DomainMode::Auto;
+                }
+            }
             "no_dns" => args.no_dns = parse_bool(value)?,
             "include_udp" => args.include_udp = parse_bool(value)?,
             "include_listening" => args.include_listening = parse_bool(value)?,
@@ -338,17 +393,24 @@ fn apply_preset_values(
             "pcap_cache_max" => {
                 let n = parse_usize(value, "pcap_cache_max")?;
                 if n < PCAP_CACHE_MIN_ENTRIES {
-                    return Err("pcap_cache_max must be >= 100".to_string());
+                    return Err("pcap_cache_max (--pcap-cache-max) must be >= 100".to_string());
                 }
                 args.pcap_cache_max = Some(n);
             }
-            "pcap_interface" => set_pcap_interface(args, value, "pcap_interface")?,
+            "pcap_interface" => {
+                set_pcap_interface(args, value, "pcap_interface / --pcap-interface")?
+            }
             "stats_interval_ms" => args.stats_interval_ms = parse_u64(value, "stats_interval_ms")?,
             "stats_width" => {
                 args.stats_width = parse_usize(value, "stats_width")?;
                 args.stats_width_set = true;
             }
-            "stats_top" => args.stats_top = parse_usize(value, "stats_top")?,
+            "stats_top" => {
+                args.stats_top = parse_usize(value, "stats_top")?;
+                if args.stats_top == 0 {
+                    return Err("stats_top must be >= 1".to_string());
+                }
+            }
             "stats_view" => {
                 push_stats_views(&mut args.stats_views, value)?;
             }
@@ -356,6 +418,7 @@ fn apply_preset_values(
                 args.stats_cycle_ms = parse_u64(value, "stats_cycle_ms")?;
             }
             "no_banner" => args.no_banner = parse_bool(value)?,
+            "session_name" => args.session_name = Some(value.to_string()),
             "theme" => args.theme = parse_theme(value)?,
             "redact_cmdline" => args.redact_cmdline = parse_redact_mode(value)?,
             "alert_domain" => push_list_value(&mut args.alert.domain_patterns, value),
@@ -398,13 +461,33 @@ fn apply_preset_values(
                 }
                 args.retry_window_ms = n;
             }
-            _ => {
-                args.warnings
-                    .push(format!("warning: unknown preset key '{}'", key));
-            }
+            _ => return Ok(false),
         }
+        Ok(true)
+    })();
+    parsed.map_err(|error| format!("{key}: {error}"))
+}
+
+fn clear_config_list(key: &str, args: &mut MonitorArgs) {
+    match key {
+        "pattern" => args.patterns.clear(),
+        "exclude_pattern" => args.exclude_patterns.clear(),
+        "pid" => args.pids.clear(),
+        "stats_view" => args.stats_views.clear(),
+        "alert_domain" => args.alert.domain_patterns.clear(),
+        _ => {}
     }
-    Ok(())
+}
+
+fn record_config_origin(key: &str, origin: &str, args: &mut MonitorArgs) {
+    args.config_origins
+        .insert(key.to_string(), origin.to_string());
+    if matches!(key, "pcap" | "domain_mode") {
+        args.config_origins
+            .insert("pcap".to_string(), origin.to_string());
+        args.config_origins
+            .insert("domain_mode".to_string(), origin.to_string());
+    }
 }
 
 fn print_presets_list(loader: &PresetLoader) {
@@ -427,6 +510,9 @@ fn print_presets_list(loader: &PresetLoader) {
 
 #[derive(Clone, Debug)]
 struct MonitorArgs {
+    config_sources: Vec<ConfigSource>,
+    config_origins: BTreeMap<String, String>,
+    provider_matcher: ProviderMatcher,
     warnings: Vec<String>,
     patterns: Vec<String>,
     exclude_patterns: Vec<String>,
@@ -685,6 +771,9 @@ fn suppressed_banner_note_lines(notes: &[String], json_mode: bool) -> Vec<String
 impl Default for MonitorArgs {
     fn default() -> Self {
         Self {
+            config_sources: Vec::new(),
+            config_origins: BTreeMap::new(),
+            provider_matcher: ProviderMatcher::default(),
             warnings: Vec::new(),
             patterns: Vec::new(),
             exclude_patterns: Vec::new(),
@@ -1952,20 +2041,8 @@ fn main() {
         }
     }
 
-    let mut args = cli.monitor;
-    if args.pcap {
-        args.domain_mode = DomainMode::Pcap;
-    }
-    if args.patterns.is_empty() && args.pids.is_empty() {
-        args.patterns = default_patterns();
-    }
-    if args.stats_views.is_empty() {
-        args.stats_views = vec![StatsView::Provider];
-    }
-
-    let cli_args: Vec<String> = env::args().collect();
-    let config_paths = find_config_flag(&cli_args);
-    let (provider_matcher, mut config_notes) = load_provider_matcher(&config_paths);
+    let args = cli.monitor;
+    let provider_matcher = args.provider_matcher.clone();
 
     let color_enabled = resolve_color_mode(args.color);
     let style = OutputStyle {
@@ -2001,7 +2078,6 @@ fn main() {
     if args.no_dns {
         domain_notes.push("PTR lookups disabled (--no-dns); PTR fallback disabled.".to_string());
     }
-    domain_notes.append(&mut config_notes);
     let mut domain_label = if domain_mode == DomainMode::Pcap {
         "pcap"
     } else if ptr_enabled {
@@ -2143,7 +2219,7 @@ fn main() {
         let poll_started = SystemTime::now();
         let capture_floor = previous_poll_started;
         previous_poll_started = poll_started;
-        let snapshot = collect_process_snapshot(&provider_matcher);
+        let snapshot = collect_process_snapshot_for_scope(&provider_matcher, &args);
         ancestry_cache.retain_live(&snapshot);
         let excluded = excluded_processes(&args.exclude_patterns, &snapshot);
         let roots = find_root_pids(&args.patterns, &excluded, &args.pids, &snapshot);
@@ -2816,7 +2892,8 @@ fn parse_cli() -> Result<Cli, String> {
 }
 
 fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
-    for arg in argv {
+    for index in monitor_option_indices(argv) {
+        let arg = &argv[index];
         if arg == "-h" || arg == "--help" {
             print_help();
             std::process::exit(0);
@@ -2834,12 +2911,8 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
 
     let config = find_config_flag(argv);
     let mut args = MonitorArgs::default();
-    if config.use_config {
-        if let Some(path) = config.kv_path.clone().or_else(default_config_path) {
-            if path.exists() {
-                apply_config_file(&path, &mut args)?;
-            }
-        }
+    if let Some(path) = selected_config_path(&config)? {
+        apply_config_file(&path, &mut args)?;
     }
 
     // Load presets (in order specified on CLI)
@@ -2849,80 +2922,125 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
         for name in preset_names {
             let values = loader.load_preset(&name)?;
             apply_preset_values(&values, &mut args)?;
+            let path = loader
+                .user_preset_dirs
+                .iter()
+                .map(|dir| dir.join(format!("{name}.conf")))
+                .find(|path| path.exists());
+            let origin = path.as_ref().map_or_else(
+                || format!("builtin:{name}"),
+                |path| path.display().to_string(),
+            );
+            let mut keys: Vec<_> = values.iter().map(|(key, _)| key.clone()).collect();
+            keys.sort();
+            keys.dedup();
+            for key in &keys {
+                if config_validation::KNOWN_CONFIG_KEYS.contains(&key.as_str()) {
+                    record_config_origin(key, &origin, &mut args);
+                }
+            }
+            args.config_sources.push(ConfigSource {
+                kind: if path.is_some() {
+                    "user_preset"
+                } else {
+                    "builtin_preset"
+                },
+                origin,
+                keys,
+                provider_mode: None,
+            });
         }
     }
 
+    let mut args = apply_monitor_cli(argv, args)?;
+    let providers = load_provider_matcher(&config)?;
+    args.provider_matcher = providers.matcher;
+    args.warnings.extend(providers.notes);
+    args.config_sources.extend(providers.sources);
+    Ok(args)
+}
+
+fn apply_monitor_cli(argv: &[String], mut args: MonitorArgs) -> Result<MonitorArgs, String> {
     let mut i = 0;
+    let mut cli_keys = HashSet::new();
     while i < argv.len() {
         let arg = &argv[i];
+        let key = match arg.as_str() {
+            "--no-udp" => "include_udp".to_string(),
+            "--no-color" => "color".to_string(),
+            other => other.trim_start_matches('-').replace('-', "_"),
+        };
+        if config_validation::KNOWN_CONFIG_KEYS.contains(&key.as_str()) {
+            if cli_keys.insert(key.clone()) {
+                clear_config_list(&key, &mut args);
+            }
+            record_config_origin(&key, "cli", &mut args);
+        }
         match arg.as_str() {
             "--pattern" => {
                 i += 1;
                 let value = require_value(argv, i, "--pattern")?;
-                args.patterns.push(value.to_string());
+                apply_config_value("pattern", value, &mut args)?;
                 i += 1;
             }
             "--exclude-pattern" => {
                 i += 1;
                 let value = require_value(argv, i, "--exclude-pattern")?;
-                args.exclude_patterns.push(value.to_string());
+                apply_config_value("exclude_pattern", value, &mut args)?;
                 i += 1;
             }
             "--pid" => {
                 i += 1;
                 let value = require_value(argv, i, "--pid")?;
-                let pid = value
-                    .parse::<u32>()
-                    .map_err(|_| "Invalid --pid value".to_string())?;
-                args.pids.push(pid);
+                apply_config_value("pid", value, &mut args)?;
                 i += 1;
             }
             "--no-descendants" => {
-                args.no_descendants = true;
+                apply_config_value("no_descendants", "true", &mut args)?;
                 i += 1;
             }
             "--interval-ms" => {
                 i += 1;
                 let value = require_value(argv, i, "--interval-ms")?;
-                args.interval_ms = parse_u64(value, "--interval-ms")?;
+                apply_config_value("interval_ms", value, &mut args)?;
                 i += 1;
             }
             "--json" => {
-                args.json = true;
+                apply_config_value("json", "true", &mut args)?;
                 i += 1;
             }
             "--summary-only" => {
-                args.summary_only = true;
+                apply_config_value("summary_only", "true", &mut args)?;
                 i += 1;
             }
             "--domain-mode" => {
                 i += 1;
                 let value = require_value(argv, i, "--domain-mode")?;
-                args.domain_mode = parse_domain_mode(value)?;
+                apply_config_value("domain_mode", value, &mut args)?;
                 i += 1;
             }
             "--pcap" => {
-                args.pcap = true;
+                apply_config_value("pcap", "true", &mut args)?;
                 i += 1;
             }
             "--no-dns" => {
-                args.no_dns = true;
+                apply_config_value("no_dns", "true", &mut args)?;
                 i += 1;
             }
             "--include-udp" => {
-                args.include_udp = true;
+                apply_config_value("include_udp", "true", &mut args)?;
                 i += 1;
             }
             "--no-udp" => {
-                args.include_udp = false;
+                apply_config_value("include_udp", "false", &mut args)?;
                 i += 1;
             }
             "--include-listening" => {
-                args.include_listening = true;
+                apply_config_value("include_listening", "true", &mut args)?;
                 i += 1;
             }
             "--show-ancestry" => {
-                args.show_ancestry = true;
+                apply_config_value("show_ancestry", "true", &mut args)?;
                 i += 1;
             }
             "--redact-cmdline" => {
@@ -2932,210 +3050,179 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
                     Some(v @ ("off" | "secrets" | "all")) => (v, 1),
                     _ => ("secrets", 0),
                 };
-                args.redact_cmdline =
-                    parse_redact_mode(value).map_err(|e| format!("--redact-cmdline: {e}"))?;
+                apply_config_value("redact_cmdline", value, &mut args)?;
                 i += 1 + consumed;
             }
             "--log-file" => {
                 i += 1;
                 let value = require_value(argv, i, "--log-file")?;
-                args.log_file = Some(PathBuf::from(value));
+                apply_config_value("log_file", value, &mut args)?;
                 i += 1;
             }
             "--theme" => {
                 i += 1;
                 let value = require_value(argv, i, "--theme")?;
-                args.theme = parse_theme(value)?;
+                apply_config_value("theme", value, &mut args)?;
                 i += 1;
             }
             "--log-dir" => {
                 i += 1;
                 let value = require_value(argv, i, "--log-dir")?;
-                args.log_dir = Some(PathBuf::from(value));
+                apply_config_value("log_dir", value, &mut args)?;
                 i += 1;
             }
             "--log-format" => {
                 i += 1;
                 let value = require_value(argv, i, "--log-format")?;
-                args.log_format = parse_log_format(value)?;
+                apply_config_value("log_format", value, &mut args)?;
                 i += 1;
             }
             "--once" => {
-                args.once = true;
+                apply_config_value("once", "true", &mut args)?;
                 i += 1;
             }
             "--color" => {
                 i += 1;
                 let value = require_value(argv, i, "--color")?;
-                args.color = parse_color_mode(value)?;
+                apply_config_value("color", value, &mut args)?;
                 i += 1;
             }
             "--no-color" => {
-                args.color = ColorMode::Never;
+                apply_config_value("color", "never", &mut args)?;
                 i += 1;
             }
             "--sqlite" => {
                 i += 1;
                 let value = require_value(argv, i, "--sqlite")?;
-                args.sqlite_path = value.to_string();
+                apply_config_value("sqlite", value, &mut args)?;
                 i += 1;
             }
             "--no-sqlite" => {
-                args.no_sqlite = true;
+                apply_config_value("no_sqlite", "true", &mut args)?;
                 i += 1;
             }
             "--db-batch-size" => {
                 i += 1;
                 let value = require_value(argv, i, "--db-batch-size")?;
-                args.db_batch_size = parse_usize(value, "--db-batch-size")?;
-                if args.db_batch_size == 0 {
-                    return Err("--db-batch-size must be >= 1".to_string());
-                }
+                apply_config_value("db_batch_size", value, &mut args)?;
                 i += 1;
             }
             "--db-flush-ms" => {
                 i += 1;
                 let value = require_value(argv, i, "--db-flush-ms")?;
-                args.db_flush_ms = parse_u64(value, "--db-flush-ms")?;
-                if args.db_flush_ms == 0 {
-                    return Err("--db-flush-ms must be >= 1".to_string());
-                }
+                apply_config_value("db_flush_ms", value, &mut args)?;
                 i += 1;
             }
             "--db-queue-max" => {
                 i += 1;
                 let value = require_value(argv, i, "--db-queue-max")?;
-                args.db_queue_max = parse_usize(value, "--db-queue-max")?;
-                if args.db_queue_max == 0 {
-                    return Err("--db-queue-max must be >= 1".to_string());
-                }
+                apply_config_value("db_queue_max", value, &mut args)?;
                 i += 1;
             }
             "--stats-interval-ms" => {
                 i += 1;
                 let value = require_value(argv, i, "--stats-interval-ms")?;
-                args.stats_interval_ms = parse_u64(value, "--stats-interval-ms")?;
+                apply_config_value("stats_interval_ms", value, &mut args)?;
                 i += 1;
             }
             "--pcap-cache-max" => {
                 i += 1;
                 let value = require_value(argv, i, "--pcap-cache-max")?;
-                let n = parse_usize(value, "--pcap-cache-max")?;
-                if n < PCAP_CACHE_MIN_ENTRIES {
-                    return Err("--pcap-cache-max must be >= 100".to_string());
-                }
-                args.pcap_cache_max = Some(n);
+                apply_config_value("pcap_cache_max", value, &mut args)?;
                 i += 1;
             }
             "--pcap-interface" => {
                 i += 1;
                 let value = require_value(argv, i, "--pcap-interface")?;
-                set_pcap_interface(&mut args, value, "--pcap-interface")?;
+                apply_config_value("pcap_interface", value, &mut args)?;
                 i += 1;
             }
             "--stats-top" => {
                 i += 1;
                 let value = require_value(argv, i, "--stats-top")?;
-                args.stats_top = parse_usize(value, "--stats-top")?;
-                if args.stats_top == 0 {
-                    return Err("--stats-top must be >= 1".to_string());
-                }
+                apply_config_value("stats_top", value, &mut args)?;
                 i += 1;
             }
             "--stats-view" => {
                 i += 1;
                 let value = require_value(argv, i, "--stats-view")?;
-                let view = parse_stats_view(value)?;
-                args.stats_views.push(view);
+                apply_config_value("stats_view", value, &mut args)?;
                 i += 1;
             }
             "--stats-width" => {
                 i += 1;
                 let value = require_value(argv, i, "--stats-width")?;
-                args.stats_width = parse_usize(value, "--stats-width")?;
-                args.stats_width_set = true;
+                apply_config_value("stats_width", value, &mut args)?;
                 i += 1;
             }
             "--stats-cycle-ms" => {
                 i += 1;
                 let value = require_value(argv, i, "--stats-cycle-ms")?;
-                args.stats_cycle_ms = parse_u64(value, "--stats-cycle-ms")?;
+                apply_config_value("stats_cycle_ms", value, &mut args)?;
                 i += 1;
             }
             "--no-banner" => {
-                args.no_banner = true;
+                apply_config_value("no_banner", "true", &mut args)?;
                 i += 1;
             }
             "--session-name" => {
                 i += 1;
                 let value = require_value(argv, i, "--session-name")?;
-                args.session_name = Some(value.to_string());
+                apply_config_value("session_name", value, &mut args)?;
                 i += 1;
             }
             "--alert-domain" => {
                 i += 1;
                 let value = require_value(argv, i, "--alert-domain")?;
-                args.alert.domain_patterns.push(value.to_string());
+                apply_config_value("alert_domain", value, &mut args)?;
                 i += 1;
             }
             "--alert-max-connections" => {
                 i += 1;
                 let value = require_value(argv, i, "--alert-max-connections")?;
-                let n = parse_u64(value, "--alert-max-connections")?;
-                if n == 0 {
-                    return Err("--alert-max-connections must be >= 1".to_string());
-                }
-                args.alert.max_connections = Some(n);
+                apply_config_value("alert_max_connections", value, &mut args)?;
                 i += 1;
             }
             "--alert-max-per-provider" => {
                 i += 1;
                 let value = require_value(argv, i, "--alert-max-per-provider")?;
-                let n = parse_u64(value, "--alert-max-per-provider")?;
-                if n == 0 {
-                    return Err("--alert-max-per-provider must be >= 1".to_string());
-                }
-                args.alert.max_per_provider = Some(n);
+                apply_config_value("alert_max_per_provider", value, &mut args)?;
                 i += 1;
             }
             "--alert-duration-ms" => {
                 i += 1;
                 let value = require_value(argv, i, "--alert-duration-ms")?;
-                let n = parse_u64(value, "--alert-duration-ms")?;
-                if n == 0 {
-                    return Err("--alert-duration-ms must be >= 1".to_string());
-                }
-                args.alert.duration_threshold_ms = Some(n);
+                apply_config_value("alert_duration_ms", value, &mut args)?;
                 i += 1;
             }
             "--alert-unknown-domain" => {
-                args.alert.alert_unknown_domain = true;
+                apply_config_value("alert_unknown_domain", "true", &mut args)?;
                 i += 1;
             }
             "--alert-bell" => {
-                args.alert.bell = true;
+                apply_config_value("alert_bell", "true", &mut args)?;
                 i += 1;
             }
             "--alert-cooldown-ms" => {
                 i += 1;
                 let value = require_value(argv, i, "--alert-cooldown-ms")?;
-                args.alert.cooldown_ms = parse_u64(value, "--alert-cooldown-ms")?;
+                apply_config_value("alert_cooldown_ms", value, &mut args)?;
                 i += 1;
             }
             "--no-alerts" => {
-                args.alert.no_alerts = true;
+                apply_config_value("no_alerts", "true", &mut args)?;
                 i += 1;
             }
             "--retry-threshold" => {
                 i += 1;
                 let value = require_value(argv, i, "--retry-threshold")?;
-                args.retry_threshold = parse_usize(value, "--retry-threshold")?;
+                apply_config_value("retry_threshold", value, &mut args)?;
                 i += 1;
             }
             "--retry-window-ms" => {
                 i += 1;
                 let value = require_value(argv, i, "--retry-window-ms")?;
-                args.retry_window_ms = parse_u64(value, "--retry-window-ms")?;
+                apply_config_value("retry_window_ms", value, &mut args)?;
                 i += 1;
             }
             "--preset" => {
@@ -3169,8 +3256,21 @@ fn load_monitor_args(argv: &[String]) -> Result<MonitorArgs, String> {
         }
     }
 
-    if args.stats_top == 0 {
-        args.stats_top = 1;
+    if args.patterns.is_empty() && args.pids.is_empty() {
+        args.patterns = default_patterns();
+    }
+    if args.stats_views.is_empty() {
+        args.stats_views.push(StatsView::Provider);
+    }
+    if !cli_keys.is_empty() {
+        let mut keys: Vec<_> = cli_keys.into_iter().collect();
+        keys.sort();
+        args.config_sources.push(ConfigSource {
+            kind: "cli",
+            origin: "cli".to_string(),
+            keys,
+            provider_mode: None,
+        });
     }
 
     Ok(args)
@@ -3355,40 +3455,33 @@ fn parse_report_args(argv: &[String]) -> Result<ReportArgs, String> {
     Ok(args)
 }
 
-/// Parse `rano config check [--config <path>] [--config-toml <path>]`.
+/// Validate option syntax without opening sources or starting an observer.
 fn parse_config_check_args(argv: &[String]) -> Result<ConfigArgs, String> {
-    let mut config = None;
-    let mut config_toml = None;
-    let mut i = 0;
-    while i < argv.len() {
-        match argv[i].as_str() {
-            "--config" => {
-                i += 1;
-                let value = require_value(argv, i, "--config")?;
-                config = Some(PathBuf::from(value));
-                i += 1;
-            }
-            "--config-toml" => {
-                i += 1;
-                let value = require_value(argv, i, "--config-toml")?;
-                config_toml = Some(PathBuf::from(value));
-                i += 1;
-            }
-            other => {
-                return Err(format!("Unknown config check flag: '{}'", other));
-            }
-        }
-    }
+    apply_monitor_cli(argv, MonitorArgs::default())?;
     Ok(ConfigArgs {
         subcommand: ConfigSubcommand::Check {
-            config,
-            config_toml,
+            options: argv.to_vec(),
         },
     })
 }
 
 fn parse_config_args(argv: &[String]) -> Result<ConfigArgs, String> {
-    for arg in argv {
+    if argv
+        .first()
+        .is_some_and(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        print_config_help();
+        std::process::exit(0);
+    }
+    if argv
+        .first()
+        .is_some_and(|arg| matches!(arg.as_str(), "-V" | "--version"))
+    {
+        print_version();
+        std::process::exit(0);
+    }
+    for index in monitor_option_indices(argv.get(1..).unwrap_or_default()) {
+        let arg = &argv[index + 1];
         if arg == "-h" || arg == "--help" {
             print_config_help();
             std::process::exit(0);
@@ -3408,18 +3501,21 @@ fn parse_config_args(argv: &[String]) -> Result<ConfigArgs, String> {
         "check" => parse_config_check_args(&argv[1..])?.subcommand,
         "show" => {
             let mut json = false;
-            for arg in &argv[1..] {
-                match arg.as_str() {
-                    "--json" => json = true,
-                    other => {
-                        return Err(format!(
-                            "Unknown config show flag: '{}'. Use 'rano config --help' for usage.",
-                            other
-                        ));
-                    }
+            let mut options = Vec::new();
+            let tail = &argv[1..];
+            let positions: HashSet<_> = monitor_option_indices(tail).into_iter().collect();
+            let mut monitor_tail = false;
+            for (index, arg) in tail.iter().enumerate() {
+                if arg == "--" && positions.contains(&index) && !monitor_tail {
+                    monitor_tail = true;
+                } else if arg == "--json" && positions.contains(&index) && !monitor_tail {
+                    json = true;
+                } else {
+                    options.push(arg.clone());
                 }
             }
-            ConfigSubcommand::Show { json }
+            apply_monitor_cli(&options, MonitorArgs::default())?;
+            ConfigSubcommand::Show { json, options }
         }
         "paths" => {
             if argv.len() > 1 {
@@ -3695,13 +3791,13 @@ fn require_value<'a>(argv: &'a [String], index: usize, flag: &str) -> Result<&'a
 fn parse_u64(value: &str, flag: &str) -> Result<u64, String> {
     value
         .parse::<u64>()
-        .map_err(|_| format!("Invalid value for {}", flag))
+        .map_err(|_| format!("'{flag}' must be a non-negative integer"))
 }
 
 fn parse_usize(value: &str, flag: &str) -> Result<usize, String> {
     value
         .parse::<usize>()
-        .map_err(|_| format!("Invalid value for {}", flag))
+        .map_err(|_| format!("'{flag}' must be a non-negative integer"))
 }
 
 fn parse_domain_mode(value: &str) -> Result<DomainMode, String> {
@@ -3709,7 +3805,7 @@ fn parse_domain_mode(value: &str) -> Result<DomainMode, String> {
         "auto" => Ok(DomainMode::Auto),
         "ptr" => Ok(DomainMode::Ptr),
         "pcap" => Ok(DomainMode::Pcap),
-        _ => Err("Invalid --domain-mode (use auto|ptr|pcap)".to_string()),
+        _ => Err("domain_mode must be one of [auto, ptr, pcap]".to_string()),
     }
 }
 
@@ -3773,7 +3869,10 @@ fn parse_stats_view(value: &str) -> Result<StatsView, String> {
         "domain" => Ok(StatsView::Domain),
         "port" => Ok(StatsView::Port),
         "process" => Ok(StatsView::Process),
-        _ => Err("Invalid --stats-view (use provider|domain|port|process)".to_string()),
+        _ => Err(
+            "stats_view contains invalid value (valid: provider, domain, port, process)"
+                .to_string(),
+        ),
     }
 }
 
@@ -3781,26 +3880,22 @@ fn find_config_flag(argv: &[String]) -> ConfigPaths {
     let mut config_path = None;
     let mut toml_path = None;
     let mut use_config = true;
-    let mut i = 0;
-    while i < argv.len() {
+    for i in monitor_option_indices(argv) {
         match argv[i].as_str() {
             "--config" => {
                 if let Some(path) = argv.get(i + 1) {
                     config_path = Some(PathBuf::from(path));
                 }
-                i += 2;
             }
             "--config-toml" => {
                 if let Some(path) = argv.get(i + 1) {
                     toml_path = Some(PathBuf::from(path));
                 }
-                i += 2;
             }
             "--no-config" => {
                 use_config = false;
-                i += 1;
             }
-            _ => i += 1,
+            _ => {}
         }
     }
     ConfigPaths {
@@ -3812,28 +3907,91 @@ fn find_config_flag(argv: &[String]) -> ConfigPaths {
 
 fn find_preset_flags(argv: &[String]) -> Vec<String> {
     let mut presets = Vec::new();
-    let mut i = 0;
-    while i < argv.len() {
+    for i in monitor_option_indices(argv) {
         if argv[i] == "--preset" {
             if let Some(name) = argv.get(i + 1) {
                 presets.push(name.to_string());
             }
-            i += 2;
-        } else {
-            i += 1;
         }
     }
     presets
 }
 
+fn monitor_option_indices(argv: &[String]) -> Vec<usize> {
+    let mut indices = Vec::new();
+    let mut index = 0;
+    while index < argv.len() {
+        indices.push(index);
+        let flag = argv[index].as_str();
+        let bare = matches!(
+            flag,
+            "-h" | "--help"
+                | "-V"
+                | "--version"
+                | "--list-presets"
+                | "--no-config"
+                | "--no-descendants"
+                | "--json"
+                | "--summary-only"
+                | "--pcap"
+                | "--no-dns"
+                | "--include-udp"
+                | "--no-udp"
+                | "--include-listening"
+                | "--show-ancestry"
+                | "--once"
+                | "--no-color"
+                | "--no-sqlite"
+                | "--no-banner"
+                | "--alert-unknown-domain"
+                | "--alert-bell"
+                | "--no-alerts"
+        );
+        let consumes_value = if flag == "--redact-cmdline" {
+            argv.get(index + 1)
+                .is_some_and(|value| matches!(value.as_str(), "off" | "secrets" | "all"))
+        } else {
+            flag.starts_with('-') && !bare
+        };
+        index += if consumes_value { 2 } else { 1 };
+    }
+    indices
+}
+
 fn default_config_path() -> Option<PathBuf> {
-    let home = env::var("HOME").ok()?;
-    Some(PathBuf::from(home).join(".config/rano/config.conf"))
+    xdg_config_home().map(|dir| dir.join("rano/config.conf"))
+}
+
+fn selected_config_path(config: &ConfigPaths) -> Result<Option<PathBuf>, String> {
+    if !config.use_config {
+        return Ok(None);
+    }
+    let selected = if let Some(path) = &config.kv_path {
+        Some((path.clone(), "--config"))
+    } else if let Ok(value) = env::var("RANO_CONFIG") {
+        if value.trim().is_empty() {
+            return Err("RANO_CONFIG is set but empty".to_string());
+        }
+        Some((PathBuf::from(value.trim()), "RANO_CONFIG"))
+    } else {
+        None
+    };
+    if let Some((path, source)) = selected {
+        if !path.is_file() {
+            return Err(format!(
+                "{source} path not found or not a regular file: {}",
+                path.display()
+            ));
+        }
+        return Ok(Some(path));
+    }
+    Ok(default_config_path().filter(|path| path.exists()))
 }
 
 fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> {
     let contents = fs::read_to_string(path)
         .map_err(|e| format!("Failed to read config {}: {}", path.display(), e))?;
+    let mut keys = HashSet::new();
     for (idx, line) in contents.lines().enumerate() {
         let raw = line.split('#').next().unwrap_or("").trim();
         if raw.is_empty() {
@@ -3843,7 +4001,7 @@ fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> 
         let key = parts.next().unwrap_or("").trim();
         let value = parts.next().unwrap_or("").trim();
         if key.is_empty() {
-            continue;
+            return Err(format!("{}:{}: missing key", path.display(), idx + 1));
         }
         if value.is_empty() {
             return Err(format!(
@@ -3852,122 +4010,29 @@ fn apply_config_file(path: &Path, args: &mut MonitorArgs) -> Result<(), String> 
                 key
             ));
         }
-        match key {
-            "pattern" => push_list_value(&mut args.patterns, value),
-            "exclude_pattern" => push_list_value(&mut args.exclude_patterns, value),
-            "pid" => {
-                let pid = value
-                    .parse::<u32>()
-                    .map_err(|_| format!("Invalid pid at line {}", idx + 1))?;
-                args.pids.push(pid);
-            }
-            "no_descendants" => args.no_descendants = parse_bool(value)?,
-            "interval_ms" => args.interval_ms = parse_u64(value, "interval_ms")?,
-            "json" => args.json = parse_bool(value)?,
-            "summary_only" => args.summary_only = parse_bool(value)?,
-            "domain_mode" => args.domain_mode = parse_domain_mode(value)?,
-            "pcap" => args.pcap = parse_bool(value)?,
-            "no_dns" => args.no_dns = parse_bool(value)?,
-            "include_udp" => args.include_udp = parse_bool(value)?,
-            "include_listening" => args.include_listening = parse_bool(value)?,
-            "show_ancestry" => args.show_ancestry = parse_bool(value)?,
-            "log_file" => args.log_file = Some(PathBuf::from(value)),
-            "log_dir" => args.log_dir = Some(PathBuf::from(value)),
-            "log_format" => args.log_format = parse_log_format(value)?,
-            "once" => args.once = parse_bool(value)?,
-            "color" => args.color = parse_color_mode(value)?,
-            "sqlite" => args.sqlite_path = value.to_string(),
-            "no_sqlite" => args.no_sqlite = parse_bool(value)?,
-            "db_batch_size" => {
-                args.db_batch_size = parse_usize(value, "db_batch_size")?;
-                if args.db_batch_size == 0 {
-                    return Err("db_batch_size must be >= 1".to_string());
-                }
-            }
-            "db_flush_ms" => {
-                args.db_flush_ms = parse_u64(value, "db_flush_ms")?;
-                if args.db_flush_ms == 0 {
-                    return Err("db_flush_ms must be >= 1".to_string());
-                }
-            }
-            "db_queue_max" => {
-                args.db_queue_max = parse_usize(value, "db_queue_max")?;
-                if args.db_queue_max == 0 {
-                    return Err("db_queue_max must be >= 1".to_string());
-                }
-            }
-            "pcap_cache_max" => {
-                let n = parse_usize(value, "pcap_cache_max")?;
-                if n < PCAP_CACHE_MIN_ENTRIES {
-                    return Err("pcap_cache_max must be >= 100".to_string());
-                }
-                args.pcap_cache_max = Some(n);
-            }
-            "pcap_interface" => set_pcap_interface(args, value, "pcap_interface")?,
-            "stats_interval_ms" => args.stats_interval_ms = parse_u64(value, "stats_interval_ms")?,
-            "stats_width" => {
-                args.stats_width = parse_usize(value, "stats_width")?;
-                args.stats_width_set = true;
-            }
-            "stats_top" => args.stats_top = parse_usize(value, "stats_top")?,
-            "stats_view" => {
-                push_stats_views(&mut args.stats_views, value)?;
-            }
-            "stats_cycle_ms" => {
-                args.stats_cycle_ms = parse_u64(value, "stats_cycle_ms")?;
-            }
-            "no_banner" => args.no_banner = parse_bool(value)?,
-            "theme" => args.theme = parse_theme(value)?,
-            "redact_cmdline" => args.redact_cmdline = parse_redact_mode(value)?,
-            "alert_domain" => push_list_value(&mut args.alert.domain_patterns, value),
-            "alert_max_connections" => {
-                let n = parse_u64(value, "alert_max_connections")?;
-                if n == 0 {
-                    return Err("alert_max_connections must be >= 1".to_string());
-                }
-                args.alert.max_connections = Some(n);
-            }
-            "alert_max_per_provider" => {
-                let n = parse_u64(value, "alert_max_per_provider")?;
-                if n == 0 {
-                    return Err("alert_max_per_provider must be >= 1".to_string());
-                }
-                args.alert.max_per_provider = Some(n);
-            }
-            "alert_duration_ms" => {
-                let n = parse_u64(value, "alert_duration_ms")?;
-                if n == 0 {
-                    return Err("alert_duration_ms must be >= 1".to_string());
-                }
-                args.alert.duration_threshold_ms = Some(n);
-            }
-            "alert_unknown_domain" => args.alert.alert_unknown_domain = parse_bool(value)?,
-            "alert_bell" => args.alert.bell = parse_bool(value)?,
-            "alert_cooldown_ms" => args.alert.cooldown_ms = parse_u64(value, "alert_cooldown_ms")?,
-            "no_alerts" => args.alert.no_alerts = parse_bool(value)?,
-            "retry_threshold" => {
-                let n = parse_usize(value, "retry_threshold")?;
-                if n == 0 {
-                    return Err("retry_threshold must be >= 1".to_string());
-                }
-                args.retry_threshold = n;
-            }
-            "retry_window_ms" => {
-                let n = parse_u64(value, "retry_window_ms")?;
-                if n == 0 {
-                    return Err("retry_window_ms must be >= 1".to_string());
-                }
-                args.retry_window_ms = n;
-            }
-            _ => {
-                args.warnings.push(format!(
-                    "warning: unknown config key '{}' in {}",
-                    key,
-                    path.display()
-                ));
-            }
+        if keys.insert(key.to_string()) {
+            clear_config_list(key, args);
+        }
+        if !apply_config_value(key, value, args)
+            .map_err(|error| format!("{}:{}: {error}", path.display(), idx + 1))?
+        {
+            args.warnings.push(format!(
+                "unknown key '{}' in config {}",
+                key,
+                path.display()
+            ));
+        } else {
+            record_config_origin(key, &path.display().to_string(), args);
         }
     }
+    let mut keys: Vec<_> = keys.into_iter().collect();
+    keys.sort();
+    args.config_sources.push(ConfigSource {
+        kind: "kv",
+        origin: path.display().to_string(),
+        keys,
+        provider_mode: None,
+    });
     Ok(())
 }
 
@@ -3996,55 +4061,104 @@ fn parse_bool(value: &str) -> Result<bool, String> {
     match value.to_lowercase().as_str() {
         "true" | "1" | "yes" | "on" => Ok(true),
         "false" | "0" | "no" | "off" => Ok(false),
-        _ => Err(format!("Invalid boolean value '{}'.", value)),
+        _ => Err("must be a boolean (true/false/yes/no/on/off/1/0)".to_string()),
     }
 }
 
-fn load_provider_matcher(config: &ConfigPaths) -> (ProviderMatcher, Vec<String>) {
+fn load_provider_matcher(config: &ConfigPaths) -> Result<ProviderResolution, String> {
     let mut notes = Vec::new();
+    let mut sources = Vec::new();
     if !config.use_config {
-        return (ProviderMatcher::default(), notes);
+        return Ok(ProviderResolution {
+            matcher: ProviderMatcher::default(),
+            notes,
+            sources,
+        });
     }
 
     let (paths, mut path_notes) = provider_config_paths(config);
+    if !path_notes.is_empty() {
+        return Err(path_notes.join("; "));
+    }
     notes.append(&mut path_notes);
 
     let mut matcher = ProviderMatcher::default();
     for path in paths {
-        let contents = match fs::read_to_string(&path) {
-            Ok(contents) => contents,
-            Err(err) => {
-                notes.push(format!(
-                    "provider config: failed to read {}: {}",
-                    path.display(),
-                    err
-                ));
-                continue;
-            }
-        };
-
-        let parsed: TomlConfig = match toml::from_str(&contents) {
-            Ok(parsed) => parsed,
-            Err(err) => {
-                notes.push(format!(
-                    "provider config: failed to parse {}: {}",
-                    path.display(),
-                    err
-                ));
-                continue;
-            }
-        };
+        let contents = fs::read_to_string(&path).map_err(|error| {
+            format!(
+                "provider config: failed to read {}: {error}",
+                path.display()
+            )
+        })?;
+        let validation = config_validation::validate_toml_contents(&path, &contents);
+        if !validation.is_valid() {
+            return Err(validation
+                .errors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join("; "));
+        }
+        notes.extend(validation.warnings.iter().map(ToString::to_string));
+        let parsed: TomlConfig = toml::from_str(&contents)
+            .map_err(|_| format!("TOML parse error in {}", path.display()))?;
 
         let Some(providers) = parsed.providers else {
+            sources.push(ConfigSource {
+                kind: "providers",
+                origin: path.display().to_string(),
+                keys: Vec::new(),
+                provider_mode: None,
+            });
             continue;
         };
 
-        if let Err(err) = apply_provider_config(&mut matcher, providers) {
-            notes.push(format!("provider config: {}", err));
+        let mode = providers
+            .mode
+            .as_deref()
+            .map(parse_provider_mode)
+            .transpose()?
+            .unwrap_or(ProviderMode::Merge);
+        let mut keys = Vec::new();
+        if providers
+            .mode
+            .as_deref()
+            .is_some_and(|mode| mode.eq_ignore_ascii_case("replace"))
+        {
+            keys.extend(
+                [
+                    "providers.anthropic",
+                    "providers.openai",
+                    "providers.google",
+                ]
+                .map(str::to_string),
+            );
+        } else {
+            if providers.anthropic.is_some() {
+                keys.push("providers.anthropic".to_string());
+            }
+            if providers.openai.is_some() {
+                keys.push("providers.openai".to_string());
+            }
+            if providers.google.is_some() {
+                keys.push("providers.google".to_string());
+            }
         }
+        apply_provider_config(&mut matcher, providers)
+            .map_err(|error| format!("{}: {error}", path.display()))?;
+        sources.push(ConfigSource {
+            kind: "providers",
+            origin: path.display().to_string(),
+            keys,
+            provider_mode: Some(mode),
+        });
     }
 
-    (matcher, notes)
+    Ok(ProviderResolution {
+        matcher,
+        notes,
+        sources,
+    })
 }
 
 fn provider_config_paths(config: &ConfigPaths) -> (Vec<PathBuf>, Vec<String>) {
@@ -4104,9 +4218,10 @@ fn default_provider_config_paths() -> Vec<PathBuf> {
 }
 
 fn push_unique_path(paths: &mut Vec<PathBuf>, seen: &mut HashSet<PathBuf>, path: PathBuf) {
-    if seen.insert(path.clone()) {
-        paths.push(path);
+    if !seen.insert(path.clone()) {
+        paths.retain(|previous| previous != &path);
     }
+    paths.push(path);
 }
 
 fn xdg_config_home() -> Option<PathBuf> {
@@ -4188,7 +4303,7 @@ fn parse_provider_mode(value: &str) -> Result<ProviderMode, String> {
     match value.to_lowercase().as_str() {
         "merge" => Ok(ProviderMode::Merge),
         "replace" => Ok(ProviderMode::Replace),
-        _ => Err("Invalid providers.mode (use merge|replace)".to_string()),
+        _ => Err("Invalid providers.mode: must be one of [merge, replace]".to_string()),
     }
 }
 
@@ -4327,19 +4442,20 @@ fn print_config_help() {
 USAGE:\n  rano config <subcommand> [options]\n\n\
 SUBCOMMANDS:\n\
   check [options]    Validate all configuration sources\n\
-    --config <path>        Also validate this key-value config file\n\
-    --config-toml <path>   Also validate this TOML provider config\n\
-                           (RANO_CONFIG_TOML is always checked when set)\n\
-  show [--json]      Display resolved configuration\n\
+    Monitor options are accepted, including --config, --config-toml,\n\
+    ordered --preset flags and --no-config. Selected source errors fail.\n\
+  show [--json] [monitor options]  Display effective settings and origins\n\
+    --json formats this output; use -- --json to inspect JSON monitoring.\n\
   paths              Show config file search locations\n\n\
 OPTIONS:\n\
   -h, --help        Show this help\n\
   -V, --version     Show version\n\n\
 EXAMPLES:\n\
   rano config check                # Validate all config files\n\
-  rano config check --config-toml custom.toml  # Include an override file\n\
+  rano config check --config-toml custom.toml  # Check the same merged sources\n\
   rano config show                 # Show resolved config\n\
   rano config show --json          # Show config as JSON\n\
+  rano config show --json --preset live --interval-ms 100  # Inspect overrides\n\
   rano config paths                # List config search paths\n"
     );
 }
@@ -6862,33 +6978,62 @@ fn canonicalize_inode_owners(map: &mut HashMap<u64, Vec<ProcessIdentity>>) {
 fn collect_process_snapshot(matcher: &ProviderMatcher) -> ProcessSnapshot {
     let mut snapshot = ProcessSnapshot::default();
     for pid in list_pids() {
-        let Some(before) = read_proc_stat(pid) else {
-            continue;
-        };
-        let argv = read_argv(pid).unwrap_or_default();
-        let Some(after) = read_proc_stat(pid) else {
-            continue;
-        };
-        if before != after {
-            continue;
-        }
-        let comm = after.comm.clone();
-        let cmdline = argv.join(" ");
-        let provider = provider_from_text(&comm, &cmdline, matcher);
-        let provider_origin = (provider != Provider::Unknown).then_some(after.identity);
-        snapshot.stat.insert(pid, after);
-        snapshot.meta.insert(
-            pid,
-            PidMeta {
-                comm,
-                cmdline,
-                argv,
-                provider,
-                provider_origin,
-            },
-        );
+        snapshot_process(pid, matcher, &mut snapshot);
     }
     snapshot
+}
+
+fn collect_process_snapshot_for_scope(
+    matcher: &ProviderMatcher,
+    args: &MonitorArgs,
+) -> ProcessSnapshot {
+    if !args.no_descendants || !args.patterns.is_empty() || args.pids.is_empty() {
+        return collect_process_snapshot(matcher);
+    }
+    // An explicit PID without descendants needs only its own identity and the
+    // ancestor chains used by exclusions/ancestry. Scanning every unrelated
+    // process can delay a poll past the existing status freshness boundary.
+    let mut snapshot = ProcessSnapshot::default();
+    let mut pending = args.pids.clone();
+    let mut seen = HashSet::new();
+    while let Some(pid) = pending.pop() {
+        if pid != 0 && seen.insert(pid) {
+            if let Some(parent) = snapshot_process(pid, matcher, &mut snapshot) {
+                pending.push(parent);
+            }
+        }
+    }
+    snapshot
+}
+
+fn snapshot_process(
+    pid: u32,
+    matcher: &ProviderMatcher,
+    snapshot: &mut ProcessSnapshot,
+) -> Option<u32> {
+    let before = read_proc_stat(pid)?;
+    let argv = read_argv(pid).unwrap_or_default();
+    let after = read_proc_stat(pid)?;
+    if before != after {
+        return None;
+    }
+    let comm = after.comm.clone();
+    let cmdline = argv.join(" ");
+    let provider = provider_from_text(&comm, &cmdline, matcher);
+    let provider_origin = (provider != Provider::Unknown).then_some(after.identity);
+    let parent = after.ppid;
+    snapshot.stat.insert(pid, after);
+    snapshot.meta.insert(
+        pid,
+        PidMeta {
+            comm,
+            cmdline,
+            argv,
+            provider,
+            provider_origin,
+        },
+    );
+    Some(parent)
 }
 
 fn provider_from_text(comm: &str, cmdline: &str, matcher: &ProviderMatcher) -> Provider {
@@ -7295,11 +7440,8 @@ enum FieldValue {
 
 fn run_config(args: ConfigArgs) -> i32 {
     match args.subcommand {
-        ConfigSubcommand::Check {
-            config,
-            config_toml,
-        } => run_config_check_with_sources(config.as_deref(), config_toml.as_deref()),
-        ConfigSubcommand::Show { json } => run_config_show(json),
+        ConfigSubcommand::Check { options } => run_config_check(&options),
+        ConfigSubcommand::Show { json, options } => run_config_show(json, &options),
         ConfigSubcommand::Paths => run_config_paths(),
     }
 }
@@ -7313,60 +7455,272 @@ struct ExportFilter {
     domain_patterns: Vec<String>,
 }
 
-fn run_config_show(json: bool) -> i32 {
-    // Collect all config sources
-    let mut sources: Vec<(String, String)> = Vec::new();
-
-    // Key-value config
-    if let Some(kv_path) = default_config_path() {
-        if kv_path.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&kv_path) {
-                sources.push((kv_path.display().to_string(), contents));
-            }
-        }
+fn redact_config_text(value: &str) -> String {
+    if value.split_whitespace().any(|part| {
+        part.starts_with('-')
+            && looks_like_secret_key(part.trim_start_matches('-').split('=').next().unwrap_or(""))
+    }) {
+        return REDACTED_PLACEHOLDER.to_string();
     }
-
-    // TOML config files
-    for toml_path in default_provider_config_paths() {
-        if toml_path.exists() {
-            if let Ok(contents) = std::fs::read_to_string(&toml_path) {
-                sources.push((toml_path.display().to_string(), contents));
-            }
-        }
-    }
-
-    if sources.is_empty() {
-        if json {
-            println!("{{\"sources\": []}}");
+    let mut result = String::new();
+    for part in value.split_inclusive(char::is_whitespace) {
+        let token = part.trim_end_matches(char::is_whitespace);
+        if Path::new(token).is_absolute() || token.starts_with("./") || token.starts_with("../") {
+            result.push_str(token);
         } else {
-            println!("No configuration files found.");
-            println!("Use 'rano config paths' to see search locations.");
+            result.push_str(&mask_token(token));
         }
-        return 0;
+        result.push_str(&part[token.len()..]);
     }
+    result
+}
 
-    if json {
-        // Output as JSON
-        let entries: Vec<String> = sources
+fn config_json_text(value: &str) -> String {
+    format!("\"{}\"", escape_json(&redact_config_text(value)))
+}
+
+fn config_json_path(value: &str) -> String {
+    format!("\"{}\"", escape_json(value))
+}
+
+fn config_json_list(values: &[String]) -> String {
+    format!(
+        "[{}]",
+        values
             .iter()
-            .map(|(path, contents)| {
-                format!(
-                    "{{\"path\": \"{}\", \"contents\": \"{}\"}}",
-                    escape_json(path),
-                    escape_json(contents)
+            .map(|value| config_json_text(value))
+            .collect::<Vec<_>>()
+            .join(",")
+    )
+}
+
+fn effective_config_values(args: &MonitorArgs) -> BTreeMap<&'static str, String> {
+    fn optional(value: Option<String>) -> String {
+        value.map_or_else(|| "null".to_string(), |value| config_json_text(&value))
+    }
+    fn optional_path(value: Option<&Path>) -> String {
+        value.map_or_else(
+            || "null".to_string(),
+            |value| config_json_path(&value.to_string_lossy()),
+        )
+    }
+    let stats_views: Vec<_> = args
+        .stats_views
+        .iter()
+        .map(|view| format!("{view:?}").to_lowercase())
+        .collect();
+    BTreeMap::from([
+        ("pattern", config_json_list(&args.patterns)),
+        ("exclude_pattern", config_json_list(&args.exclude_patterns)),
+        (
+            "pid",
+            format!(
+                "[{}]",
+                args.pids
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            ),
+        ),
+        ("no_descendants", args.no_descendants.to_string()),
+        ("interval_ms", args.interval_ms.to_string()),
+        ("json", args.json.to_string()),
+        ("summary_only", args.summary_only.to_string()),
+        (
+            "domain_mode",
+            config_json_text(&format!("{:?}", args.domain_mode).to_lowercase()),
+        ),
+        ("pcap", args.pcap.to_string()),
+        ("no_dns", args.no_dns.to_string()),
+        ("include_udp", args.include_udp.to_string()),
+        ("include_listening", args.include_listening.to_string()),
+        ("show_ancestry", args.show_ancestry.to_string()),
+        ("log_file", optional_path(args.log_file.as_deref())),
+        ("log_dir", optional_path(args.log_dir.as_deref())),
+        (
+            "log_format",
+            config_json_text(&format!("{:?}", args.log_format).to_lowercase()),
+        ),
+        ("once", args.once.to_string()),
+        (
+            "color",
+            config_json_text(&format!("{:?}", args.color).to_lowercase()),
+        ),
+        ("sqlite", config_json_path(&args.sqlite_path)),
+        ("no_sqlite", args.no_sqlite.to_string()),
+        ("db_batch_size", args.db_batch_size.to_string()),
+        ("db_flush_ms", args.db_flush_ms.to_string()),
+        ("db_queue_max", args.db_queue_max.to_string()),
+        ("pcap_interface", optional(args.pcap_interface.clone())),
+        (
+            "pcap_cache_max",
+            args.pcap_cache_max
+                .unwrap_or(pcap_capture::DEFAULT_CACHE_MAX_ENTRIES)
+                .to_string(),
+        ),
+        ("stats_interval_ms", args.stats_interval_ms.to_string()),
+        ("stats_width", args.stats_width.to_string()),
+        ("stats_top", args.stats_top.to_string()),
+        ("stats_view", config_json_list(&stats_views)),
+        ("stats_cycle_ms", args.stats_cycle_ms.to_string()),
+        ("no_banner", args.no_banner.to_string()),
+        (
+            "theme",
+            config_json_text(&format!("{:?}", args.theme).to_lowercase()),
+        ),
+        ("session_name", optional(args.session_name.clone())),
+        (
+            "alert_domain",
+            config_json_list(&args.alert.domain_patterns),
+        ),
+        (
+            "alert_max_connections",
+            args.alert
+                .max_connections
+                .map_or_else(|| "null".to_string(), |value| value.to_string()),
+        ),
+        (
+            "alert_max_per_provider",
+            args.alert
+                .max_per_provider
+                .map_or_else(|| "null".to_string(), |value| value.to_string()),
+        ),
+        (
+            "alert_duration_ms",
+            args.alert
+                .duration_threshold_ms
+                .map_or_else(|| "null".to_string(), |value| value.to_string()),
+        ),
+        (
+            "alert_unknown_domain",
+            args.alert.alert_unknown_domain.to_string(),
+        ),
+        ("alert_bell", args.alert.bell.to_string()),
+        ("alert_cooldown_ms", args.alert.cooldown_ms.to_string()),
+        ("no_alerts", args.alert.no_alerts.to_string()),
+        (
+            "redact_cmdline",
+            config_json_text(&format!("{:?}", args.redact_cmdline).to_lowercase()),
+        ),
+        ("retry_threshold", args.retry_threshold.to_string()),
+        ("retry_window_ms", args.retry_window_ms.to_string()),
+    ])
+}
+
+fn format_effective_config_json(args: &MonitorArgs) -> String {
+    let effective = effective_config_values(args);
+    let entries: Vec<_> = effective
+        .iter()
+        .map(|(key, value)| format!("{}:{value}", config_json_text(key)))
+        .collect();
+    let mut origins: Vec<_> = effective
+        .keys()
+        .map(|key| {
+            format!(
+                "{}:{}",
+                config_json_text(key),
+                config_json_path(
+                    args.config_origins
+                        .get(*key)
+                        .map_or("defaults", String::as_str)
                 )
-            })
-            .collect();
-        println!("{{\"sources\": [{}]}}", entries.join(", "));
-    } else {
-        // Pretty print
-        for (path, contents) in &sources {
-            println!("=== {} ===", path);
-            println!("{}", contents);
-            println!();
+            )
+        })
+        .collect();
+    let mut provider_origins = BTreeMap::from([
+        ("providers.anthropic", vec!["defaults".to_string()]),
+        ("providers.openai", vec!["defaults".to_string()]),
+        ("providers.google", vec!["defaults".to_string()]),
+    ]);
+    for source in &args.config_sources {
+        if source.provider_mode == Some(ProviderMode::Replace) {
+            for values in provider_origins.values_mut() {
+                values.clear();
+            }
+        }
+        for key in &source.keys {
+            if let Some(values) = provider_origins.get_mut(key.as_str()) {
+                values.push(source.origin.clone());
+            }
         }
     }
+    origins.extend(provider_origins.into_iter().map(|(key, values)| {
+        format!(
+            "{}:[{}]",
+            config_json_text(key),
+            values
+                .iter()
+                .map(|value| config_json_path(value))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }));
+    let mut sources = vec!["{\"kind\":\"defaults\",\"origin\":\"defaults\"}".to_string()];
+    sources.extend(args.config_sources.iter().map(|source| {
+        format!(
+            "{{\"kind\":{},\"origin\":{},\"keys\":{},\"provider_mode\":{}}}",
+            config_json_text(source.kind),
+            config_json_path(&source.origin),
+            config_json_list(&source.keys),
+            source.provider_mode.map_or_else(
+                || "null".to_string(),
+                |mode| config_json_text(&format!("{mode:?}").to_lowercase())
+            )
+        )
+    }));
+    format!(
+        "{{\"effective\":{{{}}},\"origins\":{{{}}},\"providers\":{{\"anthropic\":{},\"openai\":{},\"google\":{}}},\"sources\":[{}],\"warnings\":{},\"introspection_redacted\":true,\"pcap_supported\":{}}}",
+        entries.join(","),
+        origins.join(","),
+        config_json_list(&args.provider_matcher.anthropic),
+        config_json_list(&args.provider_matcher.openai),
+        config_json_list(&args.provider_matcher.google),
+        sources.join(","),
+        config_json_list(&args.warnings),
+        pcap_capture::pcap_supported()
+    )
+}
 
+fn run_config_show(json: bool, options: &[String]) -> i32 {
+    let args = match load_monitor_args(options) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("error: {}", redact_config_text(&error));
+            return 1;
+        }
+    };
+    if json {
+        println!("{}", format_effective_config_json(&args));
+    } else {
+        println!("Effective configuration (credential masking applies):");
+        for (key, value) in effective_config_values(&args) {
+            println!(
+                "{key}={value} (origin={})",
+                config_json_path(
+                    args.config_origins
+                        .get(key)
+                        .map_or("defaults", String::as_str)
+                )
+            );
+        }
+        println!(
+            "Provider matcher: anthropic={} openai={} google={}",
+            config_json_list(&args.provider_matcher.anthropic),
+            config_json_list(&args.provider_matcher.openai),
+            config_json_list(&args.provider_matcher.google)
+        );
+        for source in &args.config_sources {
+            println!(
+                "Source {}: {}",
+                source.kind,
+                config_json_path(&source.origin)
+            );
+        }
+        for warning in &args.warnings {
+            println!("{}", config_json_text(warning));
+        }
+    }
     0
 }
 
@@ -7401,97 +7755,27 @@ fn run_config_paths() -> i32 {
 /// Validate every configured source: the default discovery paths plus any
 /// explicit `--config` / `--config-toml` overrides and `RANO_CONFIG_TOML`,
 /// mirroring what a monitor run actually loads.
-fn run_config_check_with_sources(kv_override: Option<&Path>, toml_override: Option<&Path>) -> i32 {
-    use config_validation::ConfigValidator;
-
-    fn check_path(
-        validator: &mut ConfigValidator,
-        checked_any: &mut bool,
-        path: &Path,
-        is_toml: bool,
-    ) -> bool {
-        if !path.exists() {
-            return false;
-        }
-        let errors_before = validator.errors.len();
-        let warnings_before = validator.warnings.len();
-        if is_toml {
-            validator.validate_toml_config(path);
-        } else {
-            validator.validate_config_file(path);
-        }
-        *checked_any = true;
-        let status = if validator.errors.len() > errors_before {
-            "[errors]"
-        } else if validator.warnings.len() > warnings_before {
-            "[warnings]"
-        } else {
-            "[ok]"
-        };
-        println!("  {} {}", path.display(), status);
-        true
-    }
-
-    let mut validator = ConfigValidator::new();
-    let mut checked_any = false;
-
-    println!("Checking configuration sources:\n");
-
-    // Key-value config
-    println!("Key-value config (config.conf):");
-    match kv_override {
-        Some(path) => {
-            if !check_path(&mut validator, &mut checked_any, path, false) {
-                eprintln!("error: --config path not found: {}", path.display());
-                return 1;
-            }
-        }
-        None => {
-            if let Some(path) = default_config_path() {
-                check_path(&mut validator, &mut checked_any, &path, false);
-            }
-        }
-    }
-    println!();
-
-    // TOML provider configs (CLI override and env both load, like the monitor)
-    println!("TOML provider config (rano.toml):");
-    match toml_override {
-        Some(path) => {
-            if !check_path(&mut validator, &mut checked_any, path, true) {
-                eprintln!("error: --config-toml path not found: {}", path.display());
-                return 1;
-            }
-        }
-        None => {
-            for path in default_provider_config_paths() {
-                check_path(&mut validator, &mut checked_any, &path, true);
-            }
-        }
-    }
-    if let Ok(env_path) = env::var("RANO_CONFIG_TOML") {
-        let trimmed = env_path.trim();
-        if !trimmed.is_empty() {
-            let path = PathBuf::from(trimmed);
-            if !check_path(&mut validator, &mut checked_any, &path, true) {
-                eprintln!(
-                    "warning: RANO_CONFIG_TOML path not found: {}",
-                    path.display()
+fn run_config_check(options: &[String]) -> i32 {
+    match load_monitor_args(options) {
+        Ok(args) => {
+            println!("Configuration is valid.");
+            for source in &args.config_sources {
+                println!(
+                    "  [ok] {} {}",
+                    source.kind,
+                    config_json_text(&source.origin)
                 );
             }
+            for warning in &args.warnings {
+                println!("warning: {}", redact_config_text(warning));
+            }
+            0
+        }
+        Err(error) => {
+            eprintln!("error: {}", redact_config_text(&error));
+            1
         }
     }
-
-    println!();
-    if !checked_any {
-        println!("No configuration files found.");
-        println!("Use 'rano config paths' to see search locations.");
-        return 0;
-    }
-
-    println!("{}", validator.summary());
-
-    if validator.is_valid() { 0 } else { 1 }
 }
 
 fn run_export(args: ExportArgs) -> Result<(), String> {
@@ -13076,6 +13360,236 @@ mod tests {
     // =========================================================================
 
     #[test]
+    fn config_sources_preserve_ordered_lists_aliases_and_cli_precedence() {
+        let mut args = MonitorArgs::default();
+        let loader = PresetLoader::new();
+        let first = loader
+            .parse_preset_content(
+                "pattern=first\npattern=second\nstats_view=domain\npcap=true\ndomain_mode=ptr\n",
+            )
+            .unwrap();
+        apply_preset_values(&first, &mut args).unwrap();
+        assert_eq!(args.patterns, ["first", "second"]);
+        assert_eq!(args.domain_mode, DomainMode::Ptr);
+        assert!(!args.pcap);
+        let second = loader
+            .parse_preset_content("pattern=third\nstats_view=port,process\n")
+            .unwrap();
+        apply_preset_values(&second, &mut args).unwrap();
+        assert_eq!(args.patterns, ["third"]);
+        assert_eq!(args.stats_views, [StatsView::Port, StatsView::Process]);
+        let args = apply_monitor_cli(
+            &[
+                "--pattern".to_string(),
+                "cli-a".to_string(),
+                "--pattern".to_string(),
+                "cli-b".to_string(),
+                "--stats-view".to_string(),
+                "provider".to_string(),
+                "--pcap".to_string(),
+                "--domain-mode".to_string(),
+                "ptr".to_string(),
+            ],
+            args,
+        )
+        .unwrap();
+        assert_eq!(args.patterns, ["cli-a", "cli-b"]);
+        assert_eq!(args.stats_views, [StatsView::Provider]);
+        assert_eq!(args.domain_mode, DomainMode::Ptr);
+        assert!(!args.pcap);
+        assert_eq!(args.config_origins["pattern"], "cli");
+    }
+
+    #[test]
+    fn user_preset_overrides_builtin_and_preserves_repeated_keys() {
+        let directory = tempfile::tempdir().unwrap().keep();
+        fs::write(
+            directory.join("audit.conf"),
+            "summary_only=false\ninclude_udp=false\npattern=first\npattern=second\n",
+        )
+        .unwrap();
+        let mut loader = PresetLoader::new();
+        loader.user_preset_dirs = vec![directory];
+        let values = loader.load_preset("audit").unwrap();
+        let mut args = MonitorArgs::default();
+        apply_preset_values(&values, &mut args).unwrap();
+        assert!(!args.summary_only && !args.include_udp);
+        assert_eq!(args.patterns, ["first", "second"]);
+        assert!(loader.load_preset("../audit").is_err());
+    }
+
+    #[test]
+    fn config_flag_values_are_never_reinterpreted_as_control_options() {
+        let options: Vec<_> = [
+            "--pattern",
+            "--no-config",
+            "--config",
+            "actual.conf",
+            "--preset",
+            "live",
+        ]
+        .into_iter()
+        .map(str::to_string)
+        .collect();
+        let paths = find_config_flag(&options);
+        assert!(paths.use_config);
+        assert_eq!(paths.kv_path, Some(PathBuf::from("actual.conf")));
+        assert_eq!(find_preset_flags(&options), ["live"]);
+        let args = load_monitor_args(&[
+            "--no-config".to_string(),
+            "--pattern".to_string(),
+            "--help".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(args.patterns, ["--help"]);
+        let request = parse_config_args(&[
+            "show".to_string(),
+            "--json".to_string(),
+            "--no-config".to_string(),
+            "--pattern".to_string(),
+            "--json".to_string(),
+        ])
+        .unwrap();
+        assert_eq!(
+            request.subcommand,
+            ConfigSubcommand::Show {
+                json: true,
+                options: ["--no-config", "--pattern", "--json"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect()
+            }
+        );
+    }
+
+    #[test]
+    fn effective_configuration_has_typed_defaults_and_masks_introspection() {
+        let mut args = load_monitor_args(&["--no-config".to_string()]).unwrap();
+        let values = effective_config_values(&args);
+        for key in config_validation::KNOWN_CONFIG_KEYS {
+            assert!(values.contains_key(key), "missing supported setting {key}");
+        }
+        assert_eq!(values["db_flush_ms"], "1000");
+        assert_eq!(values["include_udp"], "true");
+        assert_eq!(values["stats_view"], "[\"provider\"]");
+        assert_eq!(values["pcap_cache_max"], "10000");
+        args.patterns = vec![
+            "claude --password multi word secret".to_string(),
+            "  two  spaces \t".to_string(),
+            "sk-ant-api03-not-a-real-credential".to_string(),
+        ];
+        args.session_name = Some("API_KEY=not-a-real-secret".to_string());
+        args.log_file = Some(PathBuf::from(
+            "/tmp/ConfigSource12345678901234567890/actual.jsonl",
+        ));
+        args.sqlite_path = "/tmp/ConfigSource12345678901234567890/actual.sqlite".to_string();
+        args.config_origins.insert(
+            "pattern".to_string(),
+            "/tmp/ConfigSource12345678901234567890/actual.conf".to_string(),
+        );
+        let rendered = format_effective_config_json(&args);
+        for secret in [
+            "multi word secret",
+            "sk-ant-api03-not-a-real-credential",
+            "not-a-real-secret",
+        ] {
+            assert!(
+                !rendered.contains(secret),
+                "introspection disclosed credential"
+            );
+        }
+        assert!(rendered.contains("  two  spaces \\t"));
+        assert!(rendered.contains("<redacted>"));
+        for path in [
+            "/tmp/ConfigSource12345678901234567890/actual.jsonl",
+            "/tmp/ConfigSource12345678901234567890/actual.sqlite",
+            "/tmp/ConfigSource12345678901234567890/actual.conf",
+        ] {
+            assert!(
+                rendered.contains(path),
+                "ordinary diagnostic path was masked"
+            );
+        }
+        assert_eq!(args.patterns[0], "claude --password multi word secret");
+        assert_eq!(config_json_text("quote\"\n\\"), "\"quote\\\"\\n\\\\\"");
+    }
+
+    #[test]
+    fn typed_config_bounds_reject_zero_overflow_and_invalid_values() {
+        for (key, value) in [
+            ("pid", "0"),
+            ("pid", "4294967296"),
+            ("db_flush_ms", "0"),
+            ("db_batch_size", "0"),
+            ("db_queue_max", "0"),
+            ("stats_top", "0"),
+            ("pcap_cache_max", "99"),
+            ("retry_threshold", "0"),
+            ("retry_window_ms", "0"),
+            ("alert_max_connections", "0"),
+            ("alert_max_per_provider", "0"),
+            ("alert_duration_ms", "0"),
+            ("interval_ms", "18446744073709551616"),
+            ("interval_ms", "-1"),
+            ("json", "maybe"),
+            ("domain_mode", "invalid"),
+            ("stats_view", "port,invalid"),
+            ("pcap_interface", "   "),
+            ("pattern", ""),
+            ("log_format", "xml"),
+        ] {
+            assert!(
+                apply_config_value(key, value, &mut MonitorArgs::default()).is_err(),
+                "accepted {key}={value}"
+            );
+        }
+        let mut args = MonitorArgs::default();
+        for (key, value) in [
+            ("pid", "4294967295"),
+            ("interval_ms", "18446744073709551615"),
+            ("stats_interval_ms", "0"),
+            ("stats_cycle_ms", "0"),
+            ("alert_cooldown_ms", "0"),
+            ("pcap_cache_max", "100"),
+        ] {
+            assert!(
+                apply_config_value(key, value, &mut args).unwrap(),
+                "rejected {key}={value}"
+            );
+        }
+        assert_eq!(args.interval_ms, u64::MAX);
+        assert_eq!(args.pids, [u32::MAX]);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn explicit_pid_snapshot_retains_real_ancestors_and_omits_unselected_children() {
+        let mut child = ProcessCommand::new("sleep").arg("10").spawn().unwrap();
+        let args = MonitorArgs {
+            pids: vec![std::process::id()],
+            no_descendants: true,
+            ..MonitorArgs::default()
+        };
+        let snapshot = collect_process_snapshot_for_scope(&ProviderMatcher::default(), &args);
+        let target = snapshot
+            .stat
+            .get(&std::process::id())
+            .map(|stat| stat.identity);
+        let child_present = snapshot.stat.contains_key(&child.id());
+        let ancestry = ancestry_identities(std::process::id(), &snapshot);
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(target.is_some(), "requested live process absent");
+        assert!(!child_present, "no-descendants included an actual child");
+        assert_eq!(ancestry.last().copied(), target);
+        assert_eq!(
+            snapshot.stat.len(),
+            ancestry.len(),
+            "unrelated processes entered scoped snapshot"
+        );
+    }
+
+    #[test]
     fn preset_loader_has_builtin_presets() {
         let loader = PresetLoader::new();
         assert!(loader.builtin_presets.contains_key("audit"));
@@ -13090,6 +13604,7 @@ mod tests {
         let values = loader
             .load_preset("audit")
             .expect("audit preset should exist");
+        let values: BTreeMap<_, _> = values.into_iter().collect();
         assert_eq!(values.get("summary_only"), Some(&"true".to_string()));
         assert_eq!(values.get("stats_interval_ms"), Some(&"0".to_string()));
     }
@@ -13100,6 +13615,7 @@ mod tests {
         let values = loader
             .load_preset("quiet")
             .expect("quiet preset should exist");
+        let values: BTreeMap<_, _> = values.into_iter().collect();
         assert_eq!(values.get("summary_only"), Some(&"true".to_string()));
         assert_eq!(values.get("no_banner"), Some(&"true".to_string()));
     }
@@ -13110,7 +13626,9 @@ mod tests {
         let values = loader
             .load_preset("live")
             .expect("live preset should exist");
-        assert_eq!(values.get("stats_interval_ms"), Some(&"2000".to_string()));
+        let values: BTreeMap<_, _> = values.into_iter().collect();
+        assert_eq!(values.get("stats_interval_ms"), Some(&"500".to_string()));
+        assert_eq!(values.get("stats_top"), Some(&"10".to_string()));
     }
 
     #[test]
@@ -13119,6 +13637,7 @@ mod tests {
         let values = loader
             .load_preset("verbose")
             .expect("verbose preset should exist");
+        let values: BTreeMap<_, _> = values.into_iter().collect();
         assert_eq!(values.get("include_udp"), Some(&"true".to_string()));
         assert_eq!(values.get("include_listening"), Some(&"true".to_string()));
     }
@@ -13162,6 +13681,7 @@ mod tests {
         let values = loader
             .parse_preset_content(content)
             .expect("parse should succeed");
+        let values: BTreeMap<_, _> = values.into_iter().collect();
         assert_eq!(values.get("key1"), Some(&"value1".to_string()));
         assert_eq!(values.get("key2"), Some(&"value2".to_string()));
     }
@@ -13173,6 +13693,7 @@ mod tests {
         let values = loader
             .parse_preset_content(content)
             .expect("parse should succeed");
+        let values: BTreeMap<_, _> = values.into_iter().collect();
         // Note: current implementation treats everything after # as comment
         // so "value1 " (with trailing space) is the value
         assert!(values.contains_key("key1"));
@@ -13181,8 +13702,7 @@ mod tests {
     #[test]
     fn apply_preset_values_sets_summary_only() {
         let mut args = MonitorArgs::default();
-        let mut values = HashMap::new();
-        values.insert("summary_only".to_string(), "true".to_string());
+        let values = vec![("summary_only".to_string(), "true".to_string())];
 
         apply_preset_values(&values, &mut args).expect("apply should succeed");
         assert!(args.summary_only);
@@ -13191,8 +13711,7 @@ mod tests {
     #[test]
     fn apply_preset_values_sets_stats_interval() {
         let mut args = MonitorArgs::default();
-        let mut values = HashMap::new();
-        values.insert("stats_interval_ms".to_string(), "5000".to_string());
+        let values = vec![("stats_interval_ms".to_string(), "5000".to_string())];
 
         apply_preset_values(&values, &mut args).expect("apply should succeed");
         assert_eq!(args.stats_interval_ms, 5000);
@@ -13201,8 +13720,7 @@ mod tests {
     #[test]
     fn apply_preset_values_sets_include_udp() {
         let mut args = MonitorArgs::default();
-        let mut values = HashMap::new();
-        values.insert("include_udp".to_string(), "true".to_string());
+        let values = vec![("include_udp".to_string(), "true".to_string())];
 
         apply_preset_values(&values, &mut args).expect("apply should succeed");
         assert!(args.include_udp);
@@ -13211,10 +13729,11 @@ mod tests {
     #[test]
     fn apply_preset_values_multiple_values() {
         let mut args = MonitorArgs::default();
-        let mut values = HashMap::new();
-        values.insert("summary_only".to_string(), "true".to_string());
-        values.insert("no_banner".to_string(), "true".to_string());
-        values.insert("stats_interval_ms".to_string(), "0".to_string());
+        let values = vec![
+            ("summary_only".to_string(), "true".to_string()),
+            ("no_banner".to_string(), "true".to_string()),
+            ("stats_interval_ms".to_string(), "0".to_string()),
+        ];
 
         apply_preset_values(&values, &mut args).expect("apply should succeed");
         assert!(args.summary_only);
@@ -13225,8 +13744,7 @@ mod tests {
     #[test]
     fn apply_preset_values_ignores_unknown_keys() {
         let mut args = MonitorArgs::default();
-        let mut values = HashMap::new();
-        values.insert("unknown_key_xyz".to_string(), "some_value".to_string());
+        let values = vec![("unknown_key_xyz".to_string(), "some_value".to_string())];
 
         // Should not error, just warn (to stderr)
         let result = apply_preset_values(&values, &mut args);
@@ -14339,7 +14857,10 @@ mod tests {
     fn config_check_reports_invalid_override_path() {
         let file = NamedTempFile::new().expect("tempfile failed");
         std::fs::write(file.path(), "interval_ms=notanumber\n").expect("write failed");
-        let code = run_config_check_with_sources(Some(file.path()), None);
+        let code = run_config_check(&[
+            "--config".to_string(),
+            file.path().to_string_lossy().into_owned(),
+        ]);
         assert_eq!(code, 1, "invalid override must exit nonzero");
     }
 
@@ -14347,14 +14868,23 @@ mod tests {
     fn config_check_accepts_valid_override_path() {
         let file = NamedTempFile::new().expect("tempfile failed");
         std::fs::write(file.path(), "interval_ms=1000\njson=true\n").expect("write failed");
-        let code = run_config_check_with_sources(Some(file.path()), None);
+        let code = run_config_check(&[
+            "--config".to_string(),
+            file.path().to_string_lossy().into_owned(),
+        ]);
         assert_eq!(code, 0, "valid override must pass");
     }
 
     #[test]
     fn config_check_missing_override_path_is_error() {
         let missing = std::path::Path::new("/nonexistent/rano-test-does-not-exist.conf");
-        assert_ne!(run_config_check_with_sources(Some(missing), None), 0);
+        assert_ne!(
+            run_config_check(&[
+                "--config".to_string(),
+                missing.to_string_lossy().into_owned()
+            ]),
+            0
+        );
     }
 
     #[test]
@@ -14367,14 +14897,10 @@ mod tests {
         ])
         .expect("flags should parse");
         match args.subcommand {
-            ConfigSubcommand::Check {
-                config,
-                config_toml,
-            } => {
-                assert_eq!(config.as_deref(), Some(std::path::Path::new("/tmp/a.conf")));
+            ConfigSubcommand::Check { options } => {
                 assert_eq!(
-                    config_toml.as_deref(),
-                    Some(std::path::Path::new("/tmp/b.toml"))
+                    options,
+                    ["--config", "/tmp/a.conf", "--config-toml", "/tmp/b.toml"]
                 );
             }
             other => panic!("unexpected subcommand: {other:?}"),
@@ -14387,7 +14913,13 @@ mod tests {
     fn test_parse_config_args_subcommands() {
         let args_show = parse_config_args(&["show".to_string(), "--json".to_string()])
             .expect("should parse show --json");
-        assert_eq!(args_show.subcommand, ConfigSubcommand::Show { json: true });
+        assert_eq!(
+            args_show.subcommand,
+            ConfigSubcommand::Show {
+                json: true,
+                options: Vec::new()
+            }
+        );
 
         let args_paths = parse_config_args(&["paths".to_string()]).expect("should parse paths");
         assert_eq!(args_paths.subcommand, ConfigSubcommand::Paths);
