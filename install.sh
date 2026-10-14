@@ -189,7 +189,7 @@ ensure_rust() {
   fi
   info "Installing rustup (stable)"
   local rustup_script
-  rustup_script=$(mktemp)
+  rustup_script=$(mktemp "${TMPDIR:-/tmp}/rano-rustup.XXXXXXXXXX")
   download --url https://sh.rustup.rs -o "$rustup_script"
   sh "$rustup_script" -y --default-toolchain stable --profile minimal
   export PATH="$HOME/.cargo/bin:$PATH"
@@ -308,7 +308,7 @@ if [ "$FROM_SOURCE" -eq 0 ]; then
 fi
 
 # Cross-platform locking using mkdir (atomic on all POSIX systems including macOS)
-TMP=$(mktemp -d)
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/rano-install.XXXXXXXXXX")
 LOCK_DIR="${DEST}/.rano-install.lock"
 LOCKED=0
 cleanup() {
@@ -362,7 +362,7 @@ if [ "$FROM_SOURCE" -eq 1 ]; then
   git init --quiet "$TMP/src"
   git -C "$TMP/src" remote add origin "https://github.com/${OWNER}/${REPO}.git"
   git -c http.userAgent="$USER_AGENT" -C "$TMP/src" fetch --depth 1 origin "$SOURCE_REF"
-  SOURCE_COMMIT=$(git -C "$TMP/src" rev-parse FETCH_HEAD)
+  SOURCE_COMMIT=$(git -C "$TMP/src" rev-parse --verify 'FETCH_HEAD^{commit}')
   git -C "$TMP/src" checkout --quiet --detach "$SOURCE_COMMIT"
   info "Source ref $SOURCE_REF resolved to $SOURCE_COMMIT"
   (cd "$TMP/src" && CARGO_HTTP_USER_AGENT="$USER_AGENT" cargo build --locked --release --message-format=json-render-diagnostics) > "$TMP/build.jsonl"

@@ -21,6 +21,7 @@ checkouts=list(temporary.glob('*/src/.git'));assert len(checkouts)==1,'expected 
 checkout=checkouts[0].parent
 revision=subprocess.check_output(['git','-C',str(checkout),'rev-parse','HEAD'],text=True).strip()
 assert revision=='35041a2ea4304a63b012b32ab16e11e2a7b6b7b7','selected release was replaced by another ref'
+assert f'resolved to {revision}' in result.stdout and f'source {revision};' in result.stdout,'installer reported tag object or another ref instead of actual source commit'
 artifact_rows=list(map(json.loads,(checkout.parent/'build.jsonl').read_text().splitlines()))
 executables=[row['executable'] for row in artifact_rows if row.get('reason')=='compiler-artifact' and row.get('target',{}).get('name')=='rano' and row.get('executable')]
 assert len(executables)==1 and pathlib.Path(executables[0]).is_relative_to(target.resolve()),'actual Cargo artifact ignored the redirected output directory'
@@ -152,6 +153,7 @@ source_path=str(source_tools)+os.pathsep+os.environ['PATH']
 run('source-ref-seam',['--from-source','--ref','reviewed-branch','--quiet','--verify'],True,extra=source_env,path=source_path)
 git_calls=list(map(json.loads,git_capture.read_text().splitlines()))
 assert any('fetch' in call and call[-1]=='refs/heads/reviewed-branch' for call in git_calls),'selected source branch was ignored'
+assert any('rev-parse' in call and '--verify' in call and call[-1]=='FETCH_HEAD^{commit}' for call in git_calls),'source ref was not peeled to a verified commit'
 assert any('checkout' in call and call[-1]=='0123456789abcdef0123456789abcdef01234567' for call in git_calls),'resolved immutable source commit was not checked out'
 assert any('http.userAgent=OpenAI File Downloader, XaiImageApiFetch/1.0' in call for call in git_calls),'Git transport user agent missing'
 cargo_calls=list(map(json.loads,cargo_capture.read_text().splitlines()))
