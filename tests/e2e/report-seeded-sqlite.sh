@@ -526,6 +526,43 @@ assert sum(row['events'] for row in report['providers'])==12 and sum(row['ips'] 
 print('PASS live sockets: six endpoint opens, six closes, observed ledger peak four, six real durations, UTC bins, healthy lossless writer',flush=True)
 PY
 
+e2e_section "Unavailable procfs refuses monitoring before creating sinks"
+python3 - "${RANO_BIN}" "${TMP_DIR}" "${SQLITE_PATH}" <<'PY' || e2e_fail "Procfs capability/independent history commands failed"
+import json,os,pathlib,sqlite3,subprocess,sys
+binary=sys.argv[1];root=pathlib.Path(sys.argv[2])/'proc-capability';root.mkdir();history=sys.argv[3]
+# Every mount occurs after unshare creates a private mount namespace. No host
+# procfs or user files are changed, and all output fixtures remain retained.
+isolate='set -euo pipefail\nmount --make-rprivate /\nmount -t tmpfs -o size=1m tmpfs /proc\nexec "$@"'
+def isolated(label,args,success):
+    result=subprocess.run(['sudo','-n','unshare','--mount','--fork','bash','-c',isolate,'rano-proc-test',binary,*args],capture_output=True,text=True,timeout=30)
+    (root/f'{label}.stdout').write_text(result.stdout);(root/f'{label}.stderr').write_text(result.stderr)
+    assert (result.returncode==0)==success,f'{label}: unexpected exit {result.returncode}: {result.stderr}'
+    return result
+database=root/'refused.sqlite';log=root/'refused.jsonl'
+refused=isolated('monitor-refused',['--no-config','--once','--no-dns','--json','--sqlite',str(database),'--log-file',str(log)],False)
+assert not refused.stdout and not database.exists() and not log.exists(),'unsupported backend created monitoring output or sinks'
+diagnostic=json.loads(refused.stderr)
+assert diagnostic['type']=='backend_unavailable' and '/proc/self/stat' in diagnostic['message'] and 'readable procfs' in diagnostic['message'],'missing actionable typed backend diagnostic'
+report=json.loads(isolated('history-report',['report','--sqlite',history,'--run-id','test-run-001','--json'],True).stdout)
+assert report['summary']['connects']==6 and report['summary']['closes']==3,'history queries were gated on procfs'
+export=isolated('history-export',['export','--sqlite',history,'--run-id','test-run-001','--format','jsonl'],True)
+assert len(list(map(json.loads,export.stdout.splitlines())))==9,'export lost stored events without procfs'
+comparison=json.loads(isolated('history-diff',['diff','--sqlite',history,'--old','test-run-001','--new','test-run-001','--json'],True).stdout)
+assert not comparison['provider_changes'] and not comparison['changed_domains'],'same-history diff changed without procfs'
+status=isolated('history-status',['status','--sqlite',history,'--format','{active}|{total}'],True)
+assert status.stdout.strip()=='0|4','latest history status invented current activity or lost lifetime counts without procfs'
+config=json.loads(isolated('configuration-show',['config','show','--no-config','--json'],True).stdout)
+assert isinstance(config,dict) and config,'configuration inspection unavailable without procfs'
+baseline=os.environ.get('RANO_PLATFORM_BASELINE')
+if baseline:
+    old_database=root/'baseline.sqlite'
+    result=subprocess.run(['sudo','-n','unshare','--mount','--fork','bash','-c',isolate,'rano-proc-test',baseline,'--no-config','--once','--no-dns','--json','--sqlite',str(old_database)],capture_output=True,text=True,timeout=30)
+    (root/'baseline.stdout').write_text(result.stdout);(root/'baseline.stderr').write_text(result.stderr)
+    assert result.returncode!=0 and old_database.exists(),'baseline no longer discriminates initialization before backend failure'
+    with sqlite3.connect(old_database) as conn:assert conn.execute('SELECT COUNT(*) FROM sessions').fetchone()[0]==1,'baseline did not create the unobservable session'
+print('PASS real private unavailable procfs: typed nonzero monitor refusal, no SQLite/file sinks; stored report/export/diff/status/config remain usable. Native Darwin remains unproven.',flush=True)
+PY
+
 e2e_section "Summary"
 e2e_info "All report tests passed"
 e2e_info "Tested: all data, JSON, --latest, --run-id, --top, --since, --until, pretty format, error handling"

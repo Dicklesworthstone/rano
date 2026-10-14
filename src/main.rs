@@ -1987,6 +1987,69 @@ fn ancestry_chain_to_path(chain: &[(u32, String)]) -> String {
     out.join(",")
 }
 
+fn check_monitor_backend(
+    platform: &str,
+    proc_root: &Path,
+    include_udp: bool,
+) -> Result<(), String> {
+    if platform != "linux" {
+        return Err(format!(
+            "Native monitoring requires Linux /proc; platform '{platform}' has no observation backend. Use Linux, WSL2 or a Linux VM. History and configuration commands do not require this backend."
+        ));
+    }
+    let unavailable = |path: &Path, detail: String| {
+        format!(
+            "Linux /proc monitoring unavailable at {}: {detail}. Mount a readable procfs for this process and network namespace; history/config commands do not require it.",
+            path.display()
+        )
+    };
+    let stat_path = proc_root.join("self/stat");
+    let content = fs::read(&stat_path)
+        .map_err(|error| unavailable(&stat_path, format!("{:?}: {error}", error.kind())))?;
+    let stat = parse_proc_stat(&String::from_utf8_lossy(&content))
+        .ok_or_else(|| unavailable(&stat_path, "invalid Linux process identity".to_string()))?;
+    if stat.identity.pid != std::process::id() {
+        return Err(unavailable(
+            &stat_path,
+            "procfs process identity does not match this observer".to_string(),
+        ));
+    }
+    let fd_path = proc_root.join("self/fd");
+    fs::read_dir(&fd_path)
+        .and_then(|mut entries| entries.next().transpose())
+        .map_err(|error| unavailable(&fd_path, format!("{:?}: {error}", error.kind())))?;
+    let namespace_path = proc_root.join("self/ns/net");
+    fs::read_link(&namespace_path)
+        .map_err(|error| unavailable(&namespace_path, format!("{:?}: {error}", error.kind())))?;
+    let tables: &[&str] = if include_udp {
+        &["tcp", "tcp6", "udp", "udp6"]
+    } else {
+        &["tcp", "tcp6"]
+    };
+    for table in tables {
+        let path = proc_root.join("net").join(table);
+        let file = fs::File::open(&path)
+            .map_err(|error| unavailable(&path, format!("{:?}: {error}", error.kind())))?;
+        let header = BufReader::new(file)
+            .lines()
+            .next()
+            .transpose()
+            .map_err(|error| unavailable(&path, format!("{:?}: {error}", error.kind())))?;
+        if header.as_ref().is_none_or(|header| {
+            !header
+                .split_ascii_whitespace()
+                .any(|word| word == "local_address")
+                || !header.split_ascii_whitespace().any(|word| word == "inode")
+        }) {
+            return Err(unavailable(
+                &path,
+                "invalid Linux socket-table header".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn main() {
     let cli = match parse_cli() {
         Ok(cli) => cli,
@@ -2042,6 +2105,18 @@ fn main() {
     }
 
     let args = cli.monitor;
+    if let Err(error) = check_monitor_backend(env::consts::OS, Path::new("/proc"), args.include_udp)
+    {
+        if args.json {
+            eprintln!(
+                "{{\"type\":\"backend_unavailable\",\"message\":\"{}\"}}",
+                escape_json(&error)
+            );
+        } else {
+            eprintln!("error: {error}");
+        }
+        std::process::exit(1);
+    }
     let provider_matcher = args.provider_matcher.clone();
 
     let color_enabled = resolve_color_mode(args.color);
@@ -6523,16 +6598,7 @@ fn split_owner_repo(input: &str) -> Option<(String, String)> {
     Some((owner, repo))
 }
 
-fn self_update_unix(
-    update: &UpdateCommand,
-    owner: &str,
-    repo: &str,
-    branch: &str,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let script_url = format!(
-        "https://raw.githubusercontent.com/{}/{}/{}/install.sh",
-        owner, repo, branch
-    );
+fn update_installer_command(update: &UpdateCommand, owner: &str, repo: &str) -> ProcessCommand {
     let mut args: Vec<String> = Vec::new();
 
     if let Some(version) = &update.version {
@@ -6562,52 +6628,62 @@ fn self_update_unix(
         args.push("--no-gum".to_string());
     }
 
-    let mut escaped_args = String::new();
-    for (idx, arg) in args.iter().enumerate() {
-        if idx > 0 {
-            escaped_args.push(' ');
-        }
-        escaped_args.push_str(&shell_escape_posix(arg));
-    }
+    let mut command = ProcessCommand::new("bash");
+    command
+        .args(["-s", "--"])
+        .args(&args)
+        .env("OWNER", owner)
+        .env("REPO", repo)
+        .stdin(std::process::Stdio::piped());
+    command
+}
 
-    let mut command = String::new();
-    command.push_str("OWNER=");
-    command.push_str(&shell_escape_posix(owner));
-    command.push(' ');
-    command.push_str("REPO=");
-    command.push_str(&shell_escape_posix(repo));
-    command.push(' ');
-    if escaped_args.is_empty() {
-        command.push_str(&format!(
-            "curl -fsSL {} | bash -s --",
-            shell_escape_posix(&script_url)
-        ));
-    } else {
-        command.push_str(&format!(
-            "curl -fsSL {} | bash -s -- {}",
-            shell_escape_posix(&script_url),
-            escaped_args
-        ));
+fn self_update_unix(
+    update: &UpdateCommand,
+    owner: &str,
+    repo: &str,
+    branch: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let script_url = format!(
+        "https://raw.githubusercontent.com/{}/{}/{}/install.sh",
+        owner, repo, branch
+    );
+    // Finish and verify the transport before starting an installer. A pipeline
+    // can otherwise hide curl's failure behind a successful empty bash process.
+    let download = ProcessCommand::new("curl")
+        .args([
+            "-fsSL",
+            "--user-agent",
+            "OpenAI File Downloader, XaiImageApiFetch/1.0",
+            "--url",
+            &script_url,
+        ])
+        .output()?;
+    if !download.status.success() {
+        return Err(format!(
+            "Installer download failed with status {}: {}",
+            download.status,
+            String::from_utf8_lossy(&download.stderr).trim()
+        )
+        .into());
     }
-
-    let status = ProcessCommand::new("sh").arg("-c").arg(command).status()?;
+    if download.stdout.is_empty() {
+        return Err("Installer download was empty; refusing execution".into());
+    }
+    let mut installer = update_installer_command(update, owner, repo).spawn()?;
+    let write_result = match installer.stdin.take() {
+        Some(mut input) => input.write_all(&download.stdout),
+        None => Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "Installer input pipe unavailable",
+        )),
+    };
+    let status = installer.wait()?;
+    write_result?;
     if !status.success() {
         return Err(format!("Installer failed with status {status}").into());
     }
     Ok(())
-}
-
-fn shell_escape_posix(input: &str) -> String {
-    if input.is_empty() {
-        return "''".to_string();
-    }
-    if input
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c))
-    {
-        return input.to_string();
-    }
-    format!("'{}'", input.replace('\'', "'\"'\"'"))
 }
 
 fn resolve_domain(ip: IpAddr, cache: &mut HashMap<IpAddr, DnsCacheEntry>) -> Option<String> {
@@ -10824,6 +10900,114 @@ fn push_json_map_provider(out: &mut String, key: &str, map: &BTreeMap<Provider, 
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn updater_passes_literal_arguments_and_repo_environment_to_installer() {
+        let destination = "/tmp/quoted '$PATH;\ninstaller";
+        let update = UpdateCommand {
+            version: Some("v0.2.1".to_string()),
+            system: true,
+            easy_mode: true,
+            dest: Some(PathBuf::from(destination)),
+            from_source: true,
+            verify: true,
+            quiet: true,
+            no_gum: true,
+            owner: None,
+            repo: None,
+            branch: None,
+        };
+        let command = update_installer_command(&update, "custom-owner", "custom-repo");
+        assert_eq!(command.get_program(), "bash");
+        let args: Vec<_> = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            [
+                "-s",
+                "--",
+                "--version",
+                "v0.2.1",
+                "--system",
+                "--easy-mode",
+                "--dest",
+                destination,
+                "--from-source",
+                "--verify",
+                "--quiet",
+                "--no-gum"
+            ]
+        );
+        let environment: BTreeMap<_, _> = command
+            .get_envs()
+            .map(|(key, value)| {
+                (
+                    key.to_string_lossy().into_owned(),
+                    value.unwrap().to_string_lossy().into_owned(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            environment,
+            BTreeMap::from([
+                ("OWNER".to_string(), "custom-owner".to_string()),
+                ("REPO".to_string(), "custom-repo".to_string())
+            ])
+        );
+    }
+
+    #[test]
+    fn monitor_backend_rejects_unsupported_platforms_before_reading_proc() {
+        for platform in ["macos", "freebsd", "windows", "unknown"] {
+            let error =
+                check_monitor_backend(platform, Path::new("/nonexistent-proc"), true).unwrap_err();
+            assert!(error.contains(platform));
+            assert!(error.contains("requires Linux /proc"));
+            assert!(error.contains("History and configuration commands"));
+            assert!(!error.contains("NotFound"));
+        }
+    }
+
+    #[test]
+    fn monitor_backend_classifies_missing_and_invalid_proc_identity() {
+        let root = tempfile::tempdir().unwrap().keep();
+        let error = check_monitor_backend("linux", &root, true).unwrap_err();
+        assert!(error.contains("self/stat"));
+        assert!(error.contains("NotFound"));
+        assert!(error.contains("Mount a readable procfs"));
+        fs::create_dir(root.join("self")).unwrap();
+        fs::write(root.join("self/stat"), "not a Linux stat record").unwrap();
+        let error = check_monitor_backend("linux", &root, false).unwrap_err();
+        assert!(error.contains("invalid Linux process identity"));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn monitor_backend_checks_real_proc_and_refuses_missing_socket_tables() {
+        check_monitor_backend("linux", Path::new("/proc"), true).unwrap();
+        let root = tempfile::tempdir().unwrap().keep();
+        fs::create_dir(root.join("self")).unwrap();
+        fs::create_dir(root.join("self/ns")).unwrap();
+        fs::create_dir(root.join("self/fd")).unwrap();
+        fs::write(root.join("self/stat"), fs::read("/proc/self/stat").unwrap()).unwrap();
+        std::os::unix::fs::symlink("net:[fixture]", root.join("self/ns/net")).unwrap();
+        let error = check_monitor_backend("linux", &root, false).unwrap_err();
+        assert!(error.contains("net/tcp") && error.contains("NotFound"));
+        fs::create_dir(root.join("net")).unwrap();
+        fs::write(root.join("net/tcp"), "not a socket table\n").unwrap();
+        let error = check_monitor_backend("linux", &root, false).unwrap_err();
+        assert!(error.contains("invalid Linux socket-table header"));
+        fs::write(root.join("net/tcp"), "sl local_address inode\n").unwrap();
+        fs::write(root.join("net/tcp6"), "sl local_address inode\n").unwrap();
+        check_monitor_backend("linux", &root, false).unwrap();
+        let error = check_monitor_backend("linux", &root, true).unwrap_err();
+        assert!(error.contains("net/udp") && error.contains("NotFound"));
+        fs::write(root.join("net/udp"), "sl local_address inode\n").unwrap();
+        fs::write(root.join("net/udp6"), "sl local_address inode\n").unwrap();
+        check_monitor_backend("linux", &root, true).unwrap();
+    }
+
     #[test]
     #[cfg(target_os = "linux")]
     fn real_socket_owner_scan_rejects_stale_process_generation_and_topology() {
