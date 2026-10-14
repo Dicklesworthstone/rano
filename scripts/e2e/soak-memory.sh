@@ -113,8 +113,14 @@ PY
     return 0
 fi
 
-python3 - "${RANO}" "${SOAK_SECS}" "${E2E_OUTPUT_DIR}" <<'PY' || e2e_fail "soak progress, summary or conservation failed"
-import hashlib,json,os,pathlib,platform,select,signal,sqlite3,subprocess,sys,tempfile,time
+PYTHON_RUNNER=(python3)
+if [[ "${SOAK_DOMAIN_MODE:-disabled}" == pcap ]]; then
+    # Scope capture to this fixture's own network namespace, then drive real
+    # DNS packet/cache load there instead of relying on unrelated host traffic.
+    PYTHON_RUNNER=(sudo -n unshare --net --fork bash -c 'set -e; ip link set lo up; exec "$@"' rano-soak python3)
+fi
+"${PYTHON_RUNNER[@]}" - "${RANO}" "${SOAK_SECS}" "${E2E_OUTPUT_DIR}" "${SOAK_DOMAIN_MODE:-disabled}" "${SOAK_SOURCE_REVISION:-}" "${SOAK_PORT:-0}" "${SOAK_STALL_AFTER:--1}" "${SOAK_OMIT_SUMMARY:-0}" <<'PY' || e2e_fail "soak progress, summary or conservation failed"
+import hashlib,json,os,pathlib,platform,select,signal,socket,sqlite3,struct,subprocess,sys,tempfile,time
 binary=sys.argv[1];duration=float(sys.argv[2]);assert duration>=15,'smoke duration must allow at least three progress intervals'
 root=pathlib.Path(tempfile.mkdtemp(prefix='soak-',dir=sys.argv[3]));print(f'retained fixtures={root}',flush=True)
 code=r'''
@@ -136,8 +142,8 @@ while True:
         print(json.dumps({'generated':produced,'accepted':accepted,'elapsed':time.monotonic()-started}),flush=True)
 '''
 holder_log=open(root/'holder.stderr','w')
-holder=subprocess.Popen([sys.executable,'-u','-c',code,os.environ.get('SOAK_PORT','0'),os.environ.get('SOAK_STALL_AFTER','-1'),'claude'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=holder_log,text=True)
-monitor=None;out=None;err=None
+holder=subprocess.Popen([sys.executable,'-u','-c',code,sys.argv[6],sys.argv[7],'claude'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=holder_log,text=True)
+monitor=None;out=None;err=None;dns_sender=None;dns_receiver=None;dns_sent=0
 def progress():
     assert holder.poll() is None,'generator exited'
     holder.stdin.write('progress\n');holder.stdin.flush()
@@ -157,12 +163,15 @@ try:
     assert select.select([holder.stdout],[],[],5)[0],'fixture never became ready'
     ready=json.loads(holder.stdout.readline());initial=progress()
     assert initial['generated']==initial['accepted']>0,'fixture does not accept actual connections'
-    mode=os.environ.get('SOAK_DOMAIN_MODE','disabled');assert mode in ['disabled','ptr','pcap'],'invalid SOAK_DOMAIN_MODE'
+    mode=sys.argv[4];assert mode in ['disabled','ptr','pcap'],'invalid SOAK_DOMAIN_MODE'
     command=[binary,'--no-config','--pid',str(ready['pid']),'--no-descendants','--interval-ms','100',
         '--no-banner','--sqlite',str(root/'events.sqlite'),'--log-format','json','--log-file',str(root/'events.jsonl'),'--json','--stats-interval-ms','10000']
     if mode=='disabled':command.append('--no-dns')
-    if mode=='pcap':command+=['--pcap','--pcap-interface','lo']
-    source=os.environ.get('SOAK_SOURCE_REVISION')
+    if mode=='pcap':
+        command+=['--pcap','--pcap-interface','lo','--pcap-cache-max','100']
+        dns_sender=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);dns_sender.bind(('127.0.0.1',53))
+        dns_receiver=socket.socket(socket.AF_INET,socket.SOCK_DGRAM);dns_receiver.bind(('127.0.0.1',5353));dns_receiver.settimeout(1)
+    source=sys.argv[5] or None
     if duration>=600:assert source,'long run requires SOAK_SOURCE_REVISION bound to the binary build receipt'
     metadata={'host':platform.node(),'platform':platform.platform(),'binary_sha256':hashlib.sha256(pathlib.Path(binary).read_bytes()).hexdigest(),
         'binary_source':source,'workspace_revision':subprocess.check_output(['git','rev-parse','HEAD'],text=True).strip(),
@@ -174,19 +183,27 @@ try:
         time.sleep(min(5,max(0,duration-(time.monotonic()-started))))
         assert monitor.poll() is None,'monitor exited before duration'
         current=progress();assert current['generated']==current['accepted']>previous['generated'],'generator stopped making accepted progress'
+        if mode=='pcap':
+            for _ in range(60):
+                index=dns_sent%300;name=f'cache-{index}.fixture.test'
+                encoded=b''.join(bytes([len(part)])+part.encode() for part in name.split('.'))+b'\0'
+                response=struct.pack('!HHHHHH',dns_sent%65536,0x8180,1,1,0,0)+encoded+struct.pack('!HH',1,1)+b'\xc0\x0c'+struct.pack('!HHIH',1,1,30,4)+bytes([10,42,index//256,index%256])
+                dns_sender.sendto(response,('127.0.0.1',5353));assert dns_receiver.recvfrom(4096)[0]==response,'actual DNS fixture packet was lost before capture'
+                dns_sent+=1
         rss_fields=pathlib.Path(f'/proc/{monitor.pid}/status').read_text().splitlines()
         rss=int(next(line.split()[1] for line in rss_fields if line.startswith('VmRSS:')))
         assert rss>0,'missing RSS observation'
         with sqlite3.connect(root/'events.sqlite',timeout=10) as conn:rows=conn.execute('SELECT COUNT(*) FROM events').fetchone()[0]
         if previous_rows is not None:assert rows>previous_rows,'durable observations stopped progressing'
-        sample={'elapsed':time.monotonic()-started,'rss_kb':rss,'durable_rows':rows,**current};samples.append(sample)
+        sample={'elapsed':time.monotonic()-started,'rss_kb':rss,'durable_rows':rows,'dns_packets_generated_received':dns_sent,**current};samples.append(sample)
         with open(root/'progress.jsonl','a') as stream:stream.write(json.dumps(sample)+'\n')
         print(json.dumps(sample),flush=True);previous=current;previous_rows=rows
+    if mode=='pcap':time.sleep(.2)
     monitor.send_signal(signal.SIGTERM);status=monitor.wait(timeout=20);out.close();err.close();out=err=None
     assert status==0,f'monitor exited {status}; inspect retained stderr'
     final_progress=progress()
     records=[json.loads(line) for line in (root/'stdout.jsonl').read_text().splitlines() if line.strip()]
-    if os.environ.get('SOAK_OMIT_SUMMARY')=='1':
+    if sys.argv[8]=='1':
         records=[row for row in records if 'summary' not in row]
         (root/'validation-without-summary.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in records))
     summary=validate_summary(records)
@@ -196,6 +213,7 @@ try:
         assert ptr['pending']<=ptr['queue_capacity']+ptr['workers'] and ptr['cached']<=ptr['cache_max'],'PTR scratch limits exceeded'
     if mode=='pcap':
         health=summary['pcap'];assert not health['offline'] and health['packets']>0 and not health['unhealthy'],'live pcap unavailable, inactive or unhealthy'
+        assert dns_sent>100 and health['mappings']>=dns_sent and health['delivered']==health['drained']==health['mappings'],'generated/received DNS load was not completely captured and drained'
     try:validate_summary([row for row in records if 'summary' not in row])
     except AssertionError:pass
     else:raise AssertionError('missing-summary negative control was accepted')
@@ -221,4 +239,6 @@ finally:
     if out is not None:out.close()
     if err is not None:err.close()
     holder_log.close()
+    if dns_sender is not None:dns_sender.close()
+    if dns_receiver is not None:dns_receiver.close()
 PY

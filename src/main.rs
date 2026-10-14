@@ -2576,6 +2576,7 @@ fn main() {
                 Some(info) => {
                     let evidence = resolve_observed_domain(
                         &key,
+                        Some(&info.domain_evidence),
                         domain_cache.as_mut(),
                         &mut dns_cache,
                         ptr_enabled,
@@ -2594,6 +2595,7 @@ fn main() {
                 }
                 None => resolve_observed_domain(
                     &key,
+                    None,
                     domain_cache.as_mut(),
                     &mut dns_cache,
                     ptr_enabled,
@@ -7484,6 +7486,7 @@ fn socket_flow(key: &ConnKey) -> pcap_capture::FlowKey {
 
 fn resolve_observed_domain(
     key: &ConnKey,
+    previous: Option<&pcap_capture::DomainEvidence>,
     cache: Option<&mut pcap_capture::DomainCache>,
     dns: &mut Option<PtrResolver>,
     ptr_enabled: bool,
@@ -7499,6 +7502,15 @@ fn resolve_observed_domain(
         evidence.hostname = dns
             .as_mut()
             .and_then(|resolver| resolver.resolve(key.remote_ip));
+        if evidence.hostname.is_none() {
+            // Cache pressure/expiry must not erase a PTR name actually observed
+            // on this same held socket while its refresh is still unresolved.
+            // Preserve current DNS/SNI ambiguity; the old name remains reverse-IP
+            // evidence, never promoted to a captured flow hostname.
+            evidence.hostname = previous
+                .filter(|previous| previous.source == Some(pcap_capture::DomainSource::Ptr))
+                .and_then(|previous| previous.hostname.clone());
+        }
         if evidence.hostname.is_some() {
             evidence.source = Some(pcap_capture::DomainSource::Ptr);
             evidence.scope = "reverse-ip";
@@ -11226,7 +11238,7 @@ mod tests {
         });
         let mut key = create_test_event("2026-01-01T00:00:00Z", "connect", Provider::Unknown).key;
         key.remote_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
-        let initial = resolve_observed_domain(&key, None, &mut resolver, true, UNIX_EPOCH);
+        let initial = resolve_observed_domain(&key, None, None, &mut resolver, true, UNIX_EPOCH);
         assert!(initial.hostname.is_none());
         let (ip, requested_at) = receive_requests
             .recv_timeout(Duration::from_secs(1))
@@ -11239,7 +11251,7 @@ mod tests {
             })
             .unwrap();
         resolver.as_mut().unwrap().maintain();
-        let later = resolve_observed_domain(&key, None, &mut resolver, true, UNIX_EPOCH);
+        let later = resolve_observed_domain(&key, None, None, &mut resolver, true, UNIX_EPOCH);
         assert_eq!(later.hostname.as_deref(), Some("localhost"));
         assert_eq!(later.source, Some(pcap_capture::DomainSource::Ptr));
         assert_eq!(later.scope, "reverse-ip");
@@ -11248,6 +11260,22 @@ mod tests {
         let json = format_ptr_health_json(&resolver.as_ref().unwrap().health());
         assert!(json.contains("\"pending\":0"));
         assert!(json.contains("\"completed\":1"));
+        resolver.as_mut().unwrap().cache.clear();
+        let retained =
+            resolve_observed_domain(&key, Some(&later), None, &mut resolver, true, UNIX_EPOCH);
+        assert_eq!(
+            retained.hostname, later.hostname,
+            "scratch eviction erased observed held PTR"
+        );
+        assert_eq!(retained.source, Some(pcap_capture::DomainSource::Ptr));
+        assert_eq!(retained.scope, "reverse-ip");
+        assert!(retained.captured_at.is_none());
+        let fresh_unknown =
+            resolve_observed_domain(&key, None, None, &mut resolver, true, UNIX_EPOCH);
+        assert!(
+            fresh_unknown.hostname.is_none(),
+            "new observations must not invent a prior hostname"
+        );
     }
 
     #[test]

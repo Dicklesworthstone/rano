@@ -688,6 +688,12 @@ pub fn start_pcap_capture(options: PcapOptions) -> Result<PcapHandle, String> {
     let mut cap = Capture::from_device(device)
         .map_err(|e| format!("pcap device open failed: {e}"))?
         .promisc(true)
+        // Preserve the largest supported IPv6 payload plus Ethernet/two VLAN
+        // headers with an explicit, bounded snapshot size.
+        .snaplen(65_535 + 40 + 14 + 8)
+        // A bounded eight-MiB capture buffer absorbs short bursts while the
+        // nonblocking worker is idle. Loss still degrades health and exits1.
+        .buffer_size(8 * 1024 * 1024)
         .immediate_mode(true)
         .open()
         .map_err(|e| format!("pcap capture open failed: {e}"))?;

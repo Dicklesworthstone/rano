@@ -29,6 +29,13 @@ unexpired names for one IP remain ambiguous. Captured outer SNI does not expose
 an ECH inner hostname. Neither source proves connect-versus-accept direction or
 events lost between `/proc` polls.
 
+Live capture requests a 65,597-byte snapshot for the supported IPv6 payload,
+Ethernet and two VLAN headers, plus an 8 MiB capture buffer in immediate mode.
+The explicit buffer bounds capture storage and absorbs short bursts; packet
+loss remains a reported health failure and does not qualify as a successful
+capture. The progressing soak drives real DNS bursts inside its own network
+namespace and reconciles generated, received, delivered and drained mappings.
+
 ## Dataflow Diagram
 
 ```

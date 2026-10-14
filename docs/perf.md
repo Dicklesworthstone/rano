@@ -65,6 +65,19 @@ pending age, completions, unresolved/deferred work and cache occupancy. Held
 unknown endpoints receive later corrections using their existing observation
 IDs; `--once` can finish with unresolved/pending PTR work. Accurate lifetime
 IP/PID/domain statistics remain proportional to distinct observed values.
+Eviction or expiry of resolver scratch state does not erase a PTR hostname
+already observed on the same held socket while a refresh remains unresolved.
+
+Live capture explicitly requests a 65,597-byte snapshot (the supported maximum
+IPv6 payload plus IPv6, Ethernet and two VLAN headers) and an 8 MiB capture
+buffer. This adds bounded capture storage; it does not impose a universal RSS
+cap or guarantee lossless capture at arbitrary packet rates. Kernel/channel
+loss still degrades capture health and makes qualification fail. The PCAP soak
+runs in a private network namespace, sends and receives 60 real DNS responses
+per progress interval across 300 hostname/IP candidates, limits the domain
+cache to 100 entries, and requires every mapping to be delivered and drained.
+Its packet counts and zero-loss check supplement the unchanged TCP and durable
+row conservation requirements.
 
 The real delayed-resolver probe mounts a private resolver file inside a private
 Linux mount/network namespace and holds back an actual DNS reply. The current
@@ -97,9 +110,10 @@ SOAK_PTR_PROBE=1 SOAK_PTR_REPLY=failure \
   scripts/e2e/run.sh ptr-nxdomain scripts/e2e/soak-memory.sh
 SOAK_SECS=600 SOAK_SOURCE_REVISION="built-source-sha" \
   scripts/e2e/run.sh soak-memory scripts/e2e/soak-memory.sh
-# SOAK_DOMAIN_MODE=ptr exercises actual PTR; pcap requires a pcap-enabled
-# binary and live loopback capture privileges. Both require exact row/loss
-# accounting, and the pcap arm additionally requires nonzero captured packets.
+# SOAK_DOMAIN_MODE=ptr exercises actual PTR. The pcap arm requires a
+# pcap-enabled binary, noninteractive sudo, unshare and ip for its private
+# network namespace. Both require exact row/loss accounting; the pcap arm
+# also reconciles generated/received DNS responses with captured mappings.
 ```
 
 The CI source now makes default tests, strict checks, installer/real-PTR suites,
