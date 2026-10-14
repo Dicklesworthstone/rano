@@ -12,8 +12,11 @@ If I tell you to do something, even if it goes against what follows below, YOU M
 
 ## RULE 0.5 - SUITE-WIDE RULES LIVE IN /data/projects/AGENTS.md
 
-The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. Two sections
-are load-bearing for perf work and are NOT duplicated below, so they cannot drift out of sync:
+The suite-wide rules in **`/data/projects/AGENTS.md`** bind you here too. Read it. The two
+named sections below are absent from the currently provided suite file. The explicit
+performance and work-graph requirements summarized here still bind this repository;
+their absence upstream is not permission to waive them. Do not claim that the suite
+file contains those sections or invent additional requirements from missing text:
 
 - **`## Named Reward-Hacking Patterns (ALL FORBIDDEN)`** — 12 named patterns, several already
   observed in this suite: gate self-weakening (and the exact price of a legitimate gate fix),
