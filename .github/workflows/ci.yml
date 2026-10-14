@@ -23,8 +23,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
+          toolchain: nightly-2026-08-31
           components: rustfmt, clippy
 
       - name: Cache cargo registry and target
@@ -34,7 +35,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
@@ -44,8 +45,13 @@ jobs:
       - name: Run clippy
         run: cargo clippy --all-targets -- -D warnings
 
+      - name: Check all targets and run default tests
+        run: |
+          cargo check --all-targets
+          cargo test
+
       - name: Install sqlite3 (E2E dependency)
-        run: sudo apt-get update && sudo apt-get install -y sqlite3
+        run: sudo apt-get update && sudo apt-get install -y sqlite3 iproute2
 
       - name: Build debug profile for E2E
         run: cargo build --quiet
@@ -71,7 +77,8 @@ jobs:
             "presets scripts/e2e/presets.sh" \
             "process-ancestry scripts/e2e/process-ancestry.sh" \
             "sqlite-concurrency scripts/e2e/sqlite-concurrency.sh" \
-            "redact-cmdline scripts/e2e/redact-cmdline.sh"
+            "redact-cmdline scripts/e2e/redact-cmdline.sh" \
+            "installer-update tests/e2e/installer-update.sh"
           do
             name="${spec%% *}"
             script="${spec#* }"
@@ -89,6 +96,27 @@ jobs:
             echo "Failed suites:${failed}"
             exit 1
           fi
+
+      - name: Require progressing PTR workload and failing negative controls
+        env:
+          SOAK_DOMAIN_MODE: ptr
+          SOAK_SOURCE_REVISION: ${{ github.sha }}
+        run: |
+          SOAK_PTR_PROBE=1 scripts/e2e/run.sh ptr-system scripts/e2e/soak-memory.sh
+          SOAK_PTR_PROBE=1 SOAK_PTR_REPLY=failure scripts/e2e/run.sh ptr-nxdomain scripts/e2e/soak-memory.sh
+          SOAK_SECS=600 scripts/e2e/run.sh soak-ptr scripts/e2e/soak-memory.sh
+          if SOAK_SECS=20 SOAK_STALL_AFTER=7 scripts/e2e/run.sh soak-stalled scripts/e2e/soak-memory.sh > logs/e2e/stalled-control.stdout 2>&1; then
+            echo "Stalled generator was incorrectly accepted"
+            exit 1
+          fi
+          cat logs/e2e/stalled-control.stdout
+          grep -Fq "generator stopped making accepted progress" logs/e2e/stalled-control.stdout
+          if SOAK_SECS=15 SOAK_OMIT_SUMMARY=1 scripts/e2e/run.sh soak-no-summary scripts/e2e/soak-memory.sh > logs/e2e/summary-control.stdout 2>&1; then
+            echo "Missing final summary was incorrectly accepted"
+            exit 1
+          fi
+          cat logs/e2e/summary-control.stdout
+          grep -Fq "missing or duplicated final summary" logs/e2e/summary-control.stdout
 
       - name: Upload E2E logs on failure
         if: failure()
@@ -108,8 +136,9 @@ jobs:
       - uses: actions/checkout@v7
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f
         with:
+          toolchain: nightly-2026-08-31
           components: clippy
 
       - name: Install libpcap-dev
@@ -122,7 +151,7 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-pcap-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          key: ${{ runner.os }}-cargo-pcap-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', 'rust-toolchain.toml') }}
           restore-keys: |
             ${{ runner.os }}-cargo-pcap-
 
@@ -130,6 +159,7 @@ jobs:
         run: |
           echo "::group::Building with --features pcap"
           cargo build --features pcap
+          cargo check --all-targets --all-features
           echo "::endgroup::"
 
       - name: "[pcap] Run clippy with pcap feature"
@@ -153,3 +183,51 @@ jobs:
 
       - name: "[pcap] Run live privacy E2E"
         run: scripts/e2e/run.sh redact-cmdline scripts/e2e/redact-cmdline.sh
+
+      - name: "[pcap] Require the complete ordinary E2E matrix"
+        run: |
+          set -u
+          fail=0
+          for spec in \
+            "batching-under-load tests/e2e/batching-under-load.sh" \
+            "diff-command tests/e2e/diff-command.sh" \
+            "help-command tests/e2e/help-command.sh" \
+            "provider-config-override tests/e2e/provider-config-override.sh" \
+            "report-output tests/e2e/report-output.sh" \
+            "report-seeded-sqlite tests/e2e/report-seeded-sqlite.sh" \
+            "stats-views tests/e2e/stats-views.sh" \
+            "status-command tests/e2e/status-command.sh" \
+            "alert-thresholds scripts/e2e/alert-thresholds.sh" \
+            "config-validation scripts/e2e/config-validation.sh" \
+            "export-formats scripts/e2e/export-formats.sh" \
+            "presets scripts/e2e/presets.sh" \
+            "process-ancestry scripts/e2e/process-ancestry.sh" \
+            "sqlite-concurrency scripts/e2e/sqlite-concurrency.sh" \
+            "redact-cmdline scripts/e2e/redact-cmdline.sh" \
+            "installer-update tests/e2e/installer-update.sh"
+          do
+            name="${spec%% *}"
+            script="${spec#* }"
+            if scripts/e2e/run.sh "${name}" "${script}"; then
+              echo "PASS ${name}"
+            else
+              echo "FAIL ${name}"
+              fail=$((fail+1))
+            fi
+          done
+          test "${fail}" -eq 0
+
+      - name: "[pcap] Require progressing live capture and PTR workload"
+        run: |
+          SOAK_DOMAIN_MODE=disabled SOAK_SECS=600 SOAK_SOURCE_REVISION="${{ github.sha }}" \
+            scripts/e2e/run.sh soak-pcap-no-dns scripts/e2e/soak-memory.sh
+          sudo env PATH="$PATH" SOAK_DOMAIN_MODE=pcap SOAK_SECS=600 SOAK_SOURCE_REVISION="${{ github.sha }}" \
+            scripts/e2e/run.sh soak-pcap scripts/e2e/soak-memory.sh
+
+      - name: Upload PCAP E2E logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: e2e-pcap-logs
+          path: logs/e2e/
+          retention-days: 7

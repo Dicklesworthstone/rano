@@ -1,6 +1,6 @@
 # Preset System Design
 
-Status: design for bead bd-db8 (parent: bd-26d)
+Status: implemented preset contract; original design for bead bd-db8 (parent: bd-26d). Shared-resolution repairs are tracked by reality-check task .12; its independent verification remains open.
 
 ## Overview
 
@@ -50,7 +50,7 @@ rano --preset quiet --preset audit
 Built-in presets are compiled into the binary and are always available.
 User presets override built-in presets of the same name.
 
-| Preset | Purpose | Key settings (example) |
+| Preset | Purpose | Embedded settings |
 |--------|---------|------------------------|
 | `audit` | Security review / minimal noise | `summary_only=true`, `stats_interval_ms=0`, `include_udp=true`, `no_dns=false`, `log_format=json`, `redact_cmdline=secrets` |
 | `quiet` | Reduce terminal output | `summary_only=true`, `stats_interval_ms=0`, `no_banner=true` |
@@ -96,15 +96,15 @@ rano --list-presets
 
 ## Output Format for --list-presets
 
-Example output:
+Built-in output (user presets are listed additionally):
 
 ```
 Available presets:
-  audit    - Security review / minimal noise
-  quiet    - Reduce terminal output
-  live     - Real-time monitoring focus
-  verbose  - Maximum detail
-  team-default (user) - ~/.config/rano/presets/team-default.conf
+
+  audit        - Security review / minimal noise
+  live         - Real-time monitoring focus
+  quiet        - Reduce terminal output
+  verbose      - Maximum detail
 ```
 
 ## Implementation Notes
@@ -113,4 +113,8 @@ Available presets:
 - Merge order: config.conf -> preset(s) -> CLI flags.
 - Built-in presets can be stored as static strings keyed by name.
 - User presets are loaded from `~/.config/rano/presets/` and override built-ins of the same name.
+- Whitespace around keys/values is trimmed. Boolean values accept
+  `true`/`false`, `yes`/`no`, `on`/`off` and `1`/`0`.
+- `config show --no-config --json --preset <name>` exposes the effective
+  embedded settings and `builtin:<name>` origins without starting monitoring.
 

@@ -11,7 +11,7 @@
 
 # Pcap Domain Attribution Design
 
-Status: design for bead rust_agent_network_observer-35w.1.1
+Status: implemented capture contract with historical design sketches for bead rust_agent_network_observer-35w.1.1. Per-flow correlation and capture-health repairs are tracked by reality-check tasks .9/.10; independent verification remains open. Code blocks below illustrate the design and are not substitute source definitions.
 
 ## Problem Statement
 
@@ -181,7 +181,7 @@ TLS ClientHello (first packet of TLS handshake):
 
 ### What to Extract
 
-1. Filter: TCP packets to port 443 (or user-specified ports)
+1. Filter: TCP packets on port 443; other SNI-port selection remains deferred
 2. Match: Content Type = 0x16, Handshake Type = 0x01
 3. Parse: Find SNI extension (type 0x0000) in extensions
 4. Extract: Hostname from SNI
@@ -280,7 +280,7 @@ Pcap support is compile-time optional:
 # Cargo.toml
 [features]
 default = []
-pcap = ["pcap"]  # pcap crate dependency
+pcap = ["dep:pcap"]  # optional pcap crate dependency
 ```
 
 ```rust
@@ -296,22 +296,26 @@ fn start_pcap_capture(_args: &MonitorArgs) -> Option<PcapHandle> {
 }
 ```
 
-## Configuration Flags
+## Implemented Configuration Flags
 
 | Flag | Default | Description |
 |------|---------|-------------|
 | `--domain-mode pcap` | - | Enable pcap capture mode |
 | `--pcap-interface <if>` | auto | Network interface to capture |
-| `--pcap-dns-ttl <sec>` | 300 | TTL for DNS-derived mappings |
-| `--pcap-sni-ttl <sec>` | 600 | TTL for SNI-derived mappings |
-| `--pcap-cache-max <n>` | 10000 | Max entries in domain cache |
-| `--pcap-sni-ports <ports>` | 443 | Comma-separated ports for SNI capture |
+| `--pcap-cache-max <n>` | 10000 | Cache cap across DNS candidates and flow records; minimum 100 |
+
+The initial design proposed `--pcap-dns-ttl`, `--pcap-sni-ttl` and
+`--pcap-sni-ports`. They remain unimplemented and are not accepted CLI options.
+DNS TTL comes from captured answers with a 300-second cap; SNI cache TTL is
+600 seconds. The `pcap` feature must be enabled when building. Live capture
+uses Linux procfs socket observations and suitable capture privileges; an
+offline regular file needs neither root nor a live capture interface.
 
 ## Fallback Behavior
 
 1. **Build without pcap feature**: `--domain-mode pcap` warns and uses PTR
 2. **Insufficient privileges**: Warn and fall back to PTR
-3. **Interface not found**: Error with available interfaces list
+3. **Interface not found**: Startup warning naming the interface and available interfaces, then PTR fallback
 4. **Runtime capture errors/loss**: Typed health, stderr/file warning, PTR or
    unresolved fallback, preserved valid socket observations and nonzero exit
 5. **Offline EOF**: Successful `complete` state; original timestamps retained

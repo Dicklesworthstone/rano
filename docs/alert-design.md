@@ -1,8 +1,17 @@
-> **As-built note (2026-08-23):** The `alerts` table, its views, and `--alert-domain-regex`
+> **As-built note (updated 2026-10-14):** The `alerts` table, its views, and `--alert-domain-regex`
 > below were NOT implemented. Alerts denormalize onto `events.alert=1` (see README) and
 > domain matching uses the in-tree glob matcher only. Thresholds fire at `>=` the value.
-> JSON alerts go to stdout (interleaved with events); pretty alerts to stderr. The rest of
-> this document describes shipped behavior.
+> JSON alerts go to stdout (interleaved with events); pretty alerts to stderr.
+> Concurrent endpoint thresholds run after each complete poll reconciles opens
+> and closes, using `stats.active` and `stats.active_per_provider`. Lifetime
+> provider totals are separate. Local-only listeners/bound UDP do not count
+> toward connection thresholds. Ongoing breaches and re-crossings can emit
+> again after cooldown. Duration alerts evaluate a closing endpoint episode;
+> they do not periodically flag a still-open socket.
+> The remainder preserves the original design, including explicitly excluded
+> regex/schema/dependency proposals and illustrative code. The as-built notes
+> and compiled CLI define the implemented contract. Task .11's independent
+> verification and whole-project qualification remain open.
 
 # Alert System Design
 
@@ -15,10 +24,10 @@ The alert system transforms rano from a passive observer into an active monitori
 ## CLI Design
 
 ```bash
-# Domain pattern alerts (glob or regex)
+# Supported domain pattern alerts (glob)
 rano --alert-domain "*.evil.com"
 rano --alert-domain "malware*" --alert-domain "*.suspicious.io"
-rano --alert-domain-regex "^(api|www)\.attacker\.(com|net)$"
+# Historical proposal only, not accepted: --alert-domain-regex
 
 # Connection count thresholds
 rano --alert-max-connections 100
@@ -40,10 +49,10 @@ rano --alert-cooldown-ms 5000  # Suppress duplicate alerts within window
 | Flag | Description | Default |
 |------|-------------|---------|
 | `--alert-domain <pattern>` | Glob pattern for domains to alert on (repeatable) | - |
-| `--alert-domain-regex <regex>` | Regex pattern for domains (repeatable) | - |
-| `--alert-max-connections <n>` | Alert when total active connections exceed N | - |
-| `--alert-max-per-provider <n>` | Alert when any provider exceeds N connections | - |
-| `--alert-duration-ms <ms>` | Alert on connections lasting longer than N ms | - |
+| `--alert-domain-regex <regex>` | Historical proposal; unimplemented | - |
+| `--alert-max-connections <n>` | Alert when concurrently observed endpoints reach N (`>= N`) | - |
+| `--alert-max-per-provider <n>` | Alert when one provider reaches N concurrently observed endpoints (`>= N`) | - |
+| `--alert-duration-ms <ms>` | Alert when an endpoint closes with duration greater than N ms | - |
 | `--alert-unknown-domain` | Alert on connections to unresolved domains | false |
 | `--alert-bell` | Ring terminal bell on alerts | false |
 | `--alert-cooldown-ms <ms>` | Suppress duplicate alerts within window | 10000 |
@@ -54,7 +63,7 @@ rano --alert-cooldown-ms 5000  # Suppress duplicate alerts within window
 ```ini
 # ~/.config/rano/config.conf
 alert_domain=*.evil.com,malware*
-alert_domain_regex=^attacker\.(com|net)$
+# Historical proposal only, not a supported key: alert_domain_regex
 alert_max_connections=100
 alert_max_per_provider=50
 alert_duration_ms=30000
@@ -285,7 +294,7 @@ When `--json` is enabled, alerts are emitted as JSON lines to stdout (interleave
   - `malware*` matches `malware.io`, `malware-host.net`
   - `*.*.evil.com` matches `www.api.evil.com`
 
-### Regex Patterns (--alert-domain-regex)
+### Historical Regex Proposal (unimplemented)
 
 - Full regex support via the `regex` crate
 - Case-insensitive by default (use `(?-i)` to disable)
@@ -294,7 +303,7 @@ When `--json` is enabled, alerts are emitted as JSON lines to stdout (interleave
   - `(api|www)\.evil\.(com|net)` matches `api.evil.com`, `www.evil.net`
   - `.*\.ru$` matches any `.ru` domain
 
-### Implementation Decision: Regex vs Glob
+### Historical Recommendation: Regex vs Glob (not adopted)
 
 **Recommendation**: Support both glob and regex patterns.
 
@@ -306,7 +315,12 @@ When `--json` is enabled, alerts are emitted as JSON lines to stdout (interleave
 
 **Implementation**: Use the `glob` crate for glob matching and `regex` crate for regex patterns. Both are compiled once at startup for performance.
 
-## Alert Evaluation Flow
+## Historical Alert Evaluation Sketch
+
+The sketch below predates poll reconciliation. Production evaluates endpoint
+connection/duration alerts as episodes open/close, then evaluates global and
+per-provider thresholds once on the reconciled poll state. It uses
+`active_per_provider`, never lifetime `per_provider`, for those breaches.
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
@@ -391,7 +405,7 @@ fn should_emit_alert(state: &mut AlertState, sig: &AlertSignature, config: &Aler
 
 ## Performance Considerations
 
-1. **Pattern compilation**: Compile glob and regex patterns once at startup
+1. **Pattern matching**: Production uses the in-tree case-insensitive glob matcher; the regex compilation proposal was not adopted
 2. **Cooldown check**: O(1) HashMap lookup per potential alert
 3. **Threshold checks**: Run once per poll cycle, not per-connection
 4. **SQLite batching**: Alerts batched with connection events (same queue)
@@ -415,7 +429,7 @@ fn should_emit_alert(state: &mut AlertState, sig: &AlertSignature, config: &Aler
 5. Verify alerts don't fire for normal traffic
 6. Test --no-alerts flag
 
-## Dependencies
+## Historical Dependency Proposal (not adopted)
 
 New crate dependencies:
 
@@ -467,5 +481,8 @@ durable record stays in `events` to preserve single-table queryability.
   connection row; each emitted breach synthesizes an `events` row with
   `event='alert'`, `provider=<breaching provider|unknown>`, NULL `pid`,
   zeroed endpoint columns, and `alert=1`.
+- The synthetic row records its provider and alert flag, not the full alert
+  kind/threshold/actual payload shown in JSON output. The proposed separate
+  table would have stored those additional columns; it remains excluded.
 - The README workflow `SELECT * FROM events WHERE alert = 1` returns exactly
   the emitted alerts across all kinds, 1:1 with what the operator saw.

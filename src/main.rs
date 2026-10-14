@@ -34,6 +34,10 @@ const SQLITE_BATCH_SIZE: usize = 200;
 const SQLITE_FLUSH_INTERVAL_MS: u64 = 1000;
 const SQLITE_DROP_WARN_INTERVAL_SECS: u64 = 10;
 const ANCESTRY_CACHE_TTL_SECS: u64 = 30;
+const PTR_CACHE_MAX: usize = 1024;
+const PTR_QUEUE_CAPACITY: usize = 64;
+const PTR_WORKERS: usize = 2;
+const PTR_TTL: Duration = Duration::from_secs(600);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ColorMode {
@@ -750,6 +754,8 @@ impl RetryTracker {
             timestamps.retain(|ts| now.duration_since(*ts) < window);
             !timestamps.is_empty()
         });
+        self.last_warn
+            .retain(|_, timestamp| now.duration_since(*timestamp) < window);
     }
 }
 
@@ -1128,6 +1134,7 @@ struct Stats {
     log_failed: bool,
     observation_errors: u64,
     capture_health: Option<pcap_capture::CaptureHealth>,
+    ptr_health: Option<PtrHealth>,
     per_ip: BTreeMap<IpAddr, u64>,
     per_port: BTreeMap<u16, u64>,
     per_domain: BTreeMap<String, u64>,
@@ -1839,7 +1846,175 @@ impl SqliteWriter {
 
 struct DnsCacheEntry {
     value: Option<String>,
-    stored_at: SystemTime,
+    stored_at: Instant,
+}
+
+#[derive(Clone, Default)]
+struct PtrHealth {
+    requested: u64,
+    completed: u64,
+    unresolved: u64,
+    deferred: u64,
+    expired: u64,
+    evicted: u64,
+    pending: usize,
+    cached: usize,
+    oldest_pending_ms: u128,
+    failed: bool,
+}
+
+struct PtrResult {
+    ip: IpAddr,
+    requested_at: Instant,
+    value: Option<String>,
+}
+
+struct PtrResolver {
+    requests: SyncSender<(IpAddr, Instant)>,
+    results: Receiver<PtrResult>,
+    pending: HashMap<IpAddr, Instant>,
+    cache: HashMap<IpAddr, DnsCacheEntry>,
+    health: PtrHealth,
+}
+
+impl PtrResolver {
+    fn new() -> Self {
+        Self::with_lookup(reverse_dns)
+    }
+
+    fn with_lookup(lookup: impl Fn(IpAddr) -> Option<String> + Send + Sync + 'static) -> Self {
+        let (requests, receive_requests) =
+            mpsc::sync_channel::<(IpAddr, Instant)>(PTR_QUEUE_CAPACITY);
+        let (send_results, results) = mpsc::sync_channel(PTR_QUEUE_CAPACITY);
+        let receive_requests = Arc::new(Mutex::new(receive_requests));
+        let lookup = Arc::new(lookup);
+        for _ in 0..PTR_WORKERS {
+            let receive = Arc::clone(&receive_requests);
+            let send = send_results.clone();
+            let lookup = Arc::clone(&lookup);
+            std::thread::spawn(move || {
+                loop {
+                    // Hold the receiver lock only while receiving, never during
+                    // the potentially blocking system resolver call.
+                    let request = match receive.lock() {
+                        Ok(receiver) => receiver.recv(),
+                        Err(_) => break,
+                    };
+                    let Ok((ip, requested_at)) = request else {
+                        break;
+                    };
+                    let value = if requested_at.elapsed() < PTR_TTL {
+                        lookup(ip)
+                    } else {
+                        None
+                    };
+                    if send
+                        .send(PtrResult {
+                            ip,
+                            requested_at,
+                            value,
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            });
+        }
+        Self {
+            requests,
+            results,
+            pending: HashMap::new(),
+            cache: HashMap::new(),
+            health: PtrHealth::default(),
+        }
+    }
+
+    fn maintain(&mut self) {
+        let now = Instant::now();
+        let before = self.cache.len();
+        self.cache
+            .retain(|_, entry| now.duration_since(entry.stored_at) < PTR_TTL);
+        self.health.expired += (before - self.cache.len()) as u64;
+        loop {
+            match self.results.try_recv() {
+                Ok(result) => {
+                    if self.pending.remove(&result.ip) != Some(result.requested_at) {
+                        continue;
+                    }
+                    self.health.completed += 1;
+                    if now.duration_since(result.requested_at) >= PTR_TTL {
+                        self.health.expired += 1;
+                        continue;
+                    }
+                    if result.value.is_none() {
+                        self.health.unresolved += 1;
+                    }
+                    if self.cache.len() == PTR_CACHE_MAX {
+                        let oldest = self
+                            .cache
+                            .iter()
+                            .min_by_key(|(ip, entry)| (entry.stored_at, **ip))
+                            .map(|(ip, _)| *ip);
+                        if let Some(ip) = oldest {
+                            self.cache.remove(&ip);
+                            self.health.evicted += 1;
+                        }
+                    }
+                    self.cache.insert(
+                        result.ip,
+                        DnsCacheEntry {
+                            value: result.value,
+                            stored_at: now,
+                        },
+                    );
+                }
+                Err(mpsc::TryRecvError::Empty) => break,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    self.health.failed = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn resolve(&mut self, ip: IpAddr) -> Option<String> {
+        if let Some(entry) = self.cache.get(&ip) {
+            return entry.value.clone();
+        }
+        if self.pending.contains_key(&ip) || self.health.failed {
+            return None;
+        }
+        // Include the two running requests in the pending limit. A resolver
+        // stall cannot grow the queue, pending map or number of worker threads.
+        if self.pending.len() >= PTR_QUEUE_CAPACITY + PTR_WORKERS {
+            self.health.deferred += 1;
+            return None;
+        }
+        let now = Instant::now();
+        match self.requests.try_send((ip, now)) {
+            Ok(()) => {
+                self.pending.insert(ip, now);
+                self.health.requested += 1;
+            }
+            Err(TrySendError::Full(_)) => self.health.deferred += 1,
+            Err(TrySendError::Disconnected(_)) => self.health.failed = true,
+        }
+        None
+    }
+
+    fn health(&self) -> PtrHealth {
+        let mut health = self.health.clone();
+        health.pending = self.pending.len();
+        health.cached = self.cache.len();
+        health.oldest_pending_ms = self
+            .pending
+            .values()
+            .map(|start| start.elapsed().as_millis())
+            .max()
+            .unwrap_or(0);
+        health
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Hash, Ord, PartialOrd)]
@@ -2161,7 +2336,7 @@ fn main() {
         "disabled"
     };
 
-    let mut dns_cache: HashMap<IpAddr, DnsCacheEntry> = HashMap::new();
+    let mut dns_cache = ptr_enabled.then(PtrResolver::new);
     let mut domain_cache = pcap_handle.as_ref().map(|_| {
         pcap_capture::DomainCache::with_max_entries(
             args.pcap_cache_max
@@ -2292,6 +2467,10 @@ fn main() {
         }
 
         let poll_started = SystemTime::now();
+        if let Some(resolver) = &mut dns_cache {
+            resolver.maintain();
+        }
+        retry_tracker.prune_stale();
         let capture_floor = previous_poll_started;
         previous_poll_started = poll_started;
         let snapshot = collect_process_snapshot_for_scope(&provider_matcher, &args);
@@ -2388,7 +2567,10 @@ fn main() {
             seen_keys.insert(key.clone());
 
             let mut domain_evidence = match active.get(&key) {
-                Some(info) if domain_cache.is_none() || kind != SocketKind::Connection => {
+                Some(info)
+                    if kind != SocketKind::Connection
+                        || (domain_cache.is_none() && (!ptr_enabled || info.domain.is_some())) =>
+                {
                     info.domain_evidence.clone()
                 }
                 Some(info) => {
@@ -2864,6 +3046,10 @@ fn main() {
         std::thread::sleep(Duration::from_millis(args.interval_ms));
     }
 
+    if let Some(resolver) = &mut dns_cache {
+        resolver.maintain();
+        stats.ptr_health = Some(resolver.health());
+    }
     if let Some(writer) = sqlite_writer {
         stats.sqlite_outcome =
             writer.shutdown(run_ctx.run_id.clone(), stats.connects, stats.closes);
@@ -4424,8 +4610,8 @@ OPTIONS:\n\
   --no-banner               Suppress startup banner\n\n\
 ALERT OPTIONS:\n\
   --alert-domain <pattern>       Alert on domains matching glob pattern (repeatable)\n\
-  --alert-max-connections <n>    Alert when total active connections exceed N\n\
-  --alert-max-per-provider <n>   Alert when any provider exceeds N connections\n\
+  --alert-max-connections <n>    Alert when total active connections reach N\n\
+  --alert-max-per-provider <n>   Alert when any provider reaches N connections\n\
   --alert-duration-ms <ms>       Alert on connections lasting longer than N ms\n\
   --alert-unknown-domain         Alert on connections to unresolved domains\n\
   --alert-bell                   Ring terminal bell on alerts\n\
@@ -5655,7 +5841,7 @@ fn summary(
         writer.write_record(
             &format_json_summary(stats, domain_mode, alert_count, suppressed_count),
             &format!(
-                "summary connects={} closes={} active={} peak_active={} sqlite_dropped={} alerts={} suppressed={} sqlite_observed={} sqlite_persisted={} sqlite_queue_lost={} sqlite_write_lost={} sqlite_metadata_lost={} sqlite_failed={} log_failed={} listens={} binds={} observation_errors={} socket_active={} socket_closes={} capture_health={}",
+                "summary connects={} closes={} active={} peak_active={} sqlite_dropped={} alerts={} suppressed={} sqlite_observed={} sqlite_persisted={} sqlite_queue_lost={} sqlite_write_lost={} sqlite_metadata_lost={} sqlite_failed={} log_failed={} listens={} binds={} observation_errors={} socket_active={} socket_closes={} capture_health={} ptr_health={}",
                 stats.connects,
                 stats.closes,
                 stats.active,
@@ -5667,7 +5853,8 @@ fn summary(
                 stats.sqlite_outcome.queue_lost, stats.sqlite_outcome.write_lost,
                 stats.sqlite_outcome.metadata_lost,
                 stats.sqlite_outcome.failed, stats.log_failed, stats.listens, stats.binds, stats.observation_errors, stats.socket_active, stats.socket_closes,
-                stats.capture_health.as_ref().map(format_capture_health_json).unwrap_or_else(|| "null".to_string())
+                stats.capture_health.as_ref().map(format_capture_health_json).unwrap_or_else(|| "null".to_string()),
+                stats.ptr_health.as_ref().map(format_ptr_health_json).unwrap_or_else(|| "null".to_string())
             ),
         );
         writer.flush();
@@ -5770,6 +5957,9 @@ fn summary(
     }
     if let Some(health) = &stats.capture_health {
         println!("  pcap {}", format_capture_health_json(health));
+    }
+    if let Some(health) = &stats.ptr_health {
+        println!("  ptr {}", format_ptr_health_json(health));
     }
     println!(
         "  listens={} binds={} observation_errors={}",
@@ -5874,6 +6064,25 @@ fn summary(
     }
 }
 
+fn format_ptr_health_json(health: &PtrHealth) -> String {
+    format!(
+        "{{\"requested\":{},\"completed\":{},\"unresolved\":{},\"deferred\":{},\"expired\":{},\"evicted\":{},\"pending\":{},\"cached\":{},\"oldest_pending_ms\":{},\"failed\":{},\"cache_max\":{},\"queue_capacity\":{},\"workers\":{}}}",
+        health.requested,
+        health.completed,
+        health.unresolved,
+        health.deferred,
+        health.expired,
+        health.evicted,
+        health.pending,
+        health.cached,
+        health.oldest_pending_ms,
+        health.failed,
+        PTR_CACHE_MAX,
+        PTR_QUEUE_CAPACITY,
+        PTR_WORKERS
+    )
+}
+
 fn format_capture_health_json(health: &pcap_capture::CaptureHealth) -> String {
     let mut out = format!(
         "{{\"state\":\"{}\",\"offline\":{},\"packets\":{},\"rejected_frames\":{},\"mappings\":{},\"delivered\":{},\"drained\":{},\"mapping_lost\":{},\"kernel_dropped\":{},\"interface_dropped\":{},\"idle_polls\":{},\"unhealthy\":{}",
@@ -5938,6 +6147,10 @@ fn format_json_summary(
     if let Some(health) = &stats.capture_health {
         out.push_str(",\"pcap\":");
         out.push_str(&format_capture_health_json(health));
+    }
+    if let Some(health) = &stats.ptr_health {
+        out.push_str(",\"ptr\":");
+        out.push_str(&format_ptr_health_json(health));
     }
     push_json_num(&mut out, "alerts", alert_count as i64, false);
     push_json_num(
@@ -6686,26 +6899,6 @@ fn self_update_unix(
     Ok(())
 }
 
-fn resolve_domain(ip: IpAddr, cache: &mut HashMap<IpAddr, DnsCacheEntry>) -> Option<String> {
-    let now = SystemTime::now();
-    let ttl = Duration::from_secs(600);
-    if let Some(entry) = cache.get(&ip) {
-        if now.duration_since(entry.stored_at).unwrap_or_default() < ttl {
-            return entry.value.clone();
-        }
-    }
-
-    let result = reverse_dns(ip);
-    cache.insert(
-        ip,
-        DnsCacheEntry {
-            value: result.clone(),
-            stored_at: now,
-        },
-    );
-    result
-}
-
 fn reverse_dns(ip: IpAddr) -> Option<String> {
     unsafe {
         let mut host = [0 as libc::c_char; libc::NI_MAXHOST as usize];
@@ -7292,7 +7485,7 @@ fn socket_flow(key: &ConnKey) -> pcap_capture::FlowKey {
 fn resolve_observed_domain(
     key: &ConnKey,
     cache: Option<&mut pcap_capture::DomainCache>,
-    dns: &mut HashMap<IpAddr, DnsCacheEntry>,
+    dns: &mut Option<PtrResolver>,
     ptr_enabled: bool,
     not_before: SystemTime,
 ) -> pcap_capture::DomainEvidence {
@@ -7303,7 +7496,9 @@ fn resolve_observed_domain(
         .map(|cache| cache.lookup(socket_flow(key), key.inode, not_before))
         .unwrap_or_default();
     if evidence.hostname.is_none() && ptr_enabled {
-        evidence.hostname = resolve_domain(key.remote_ip, dns);
+        evidence.hostname = dns
+            .as_mut()
+            .and_then(|resolver| resolver.resolve(key.remote_ip));
         if evidence.hostname.is_some() {
             evidence.source = Some(pcap_capture::DomainSource::Ptr);
             evidence.scope = "reverse-ip";
@@ -10901,6 +11096,161 @@ fn push_json_map_provider(out: &mut String, key: &str, map: &BTreeMap<Provider, 
 #[cfg(test)]
 mod tests {
     #[test]
+    fn ptr_cache_expires_positive_and_negative_results_and_evicts_oldest() {
+        let (requests, _receive_requests) = mpsc::sync_channel(PTR_QUEUE_CAPACITY);
+        let (send_results, results) = mpsc::sync_channel(PTR_QUEUE_CAPACITY);
+        let mut resolver = PtrResolver {
+            requests,
+            results,
+            pending: HashMap::new(),
+            cache: HashMap::new(),
+            health: PtrHealth::default(),
+        };
+        let now = Instant::now();
+        for index in 0..PTR_CACHE_MAX {
+            let ip = IpAddr::V4(Ipv4Addr::from(index as u32));
+            resolver.cache.insert(
+                ip,
+                DnsCacheEntry {
+                    value: Some(format!("host-{index}")),
+                    stored_at: now - Duration::from_secs((PTR_CACHE_MAX - index) as u64 / 4),
+                },
+            );
+        }
+        let ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        resolver.pending.insert(ip, now);
+        send_results
+            .send(PtrResult {
+                ip,
+                requested_at: now,
+                value: None,
+            })
+            .unwrap();
+        resolver.maintain();
+        assert_eq!(resolver.cache.len(), PTR_CACHE_MAX);
+        assert!(
+            !resolver
+                .cache
+                .contains_key(&IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        );
+        assert_eq!(resolver.health.evicted, 1);
+        assert!(resolver.resolve(ip).is_none());
+        assert_eq!(
+            resolver.health.requested, 0,
+            "negative results must be cached"
+        );
+        for entry in resolver.cache.values_mut() {
+            entry.stored_at = Instant::now() - PTR_TTL;
+        }
+        resolver.maintain();
+        assert!(resolver.cache.is_empty());
+        assert_eq!(resolver.health.expired, PTR_CACHE_MAX as u64);
+        let expired = Instant::now() - PTR_TTL;
+        resolver.pending.insert(ip, expired);
+        send_results
+            .send(PtrResult {
+                ip,
+                requested_at: expired,
+                value: Some("stale".to_string()),
+            })
+            .unwrap();
+        resolver.maintain();
+        assert!(resolver.cache.is_empty());
+        assert!(resolver.pending.is_empty());
+        assert_eq!(resolver.health.expired, PTR_CACHE_MAX as u64 + 1);
+    }
+
+    #[test]
+    fn stalled_ptr_workers_leave_poll_requests_nonblocking_bounded_and_deduplicated() {
+        let (started, receive_started) = mpsc::channel();
+        let release = Arc::new((Mutex::new(false), std::sync::Condvar::new()));
+        let worker_release = Arc::clone(&release);
+        let mut resolver = PtrResolver::with_lookup(move |ip| {
+            started.send(ip).unwrap();
+            let (lock, condition) = &*worker_release;
+            let _guard = condition
+                .wait_while(lock.lock().unwrap(), |released| !*released)
+                .unwrap();
+            Some(format!("resolved-{ip}"))
+        });
+        let first = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        assert!(resolver.resolve(first).is_none());
+        receive_started
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let second = IpAddr::V4(Ipv4Addr::from(2));
+        resolver.resolve(second);
+        receive_started
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let timer = Instant::now();
+        for index in 3..10_000 {
+            resolver.resolve(IpAddr::V4(Ipv4Addr::from(index)));
+        }
+        // Release even before assertions so failed checks cannot leave a test worker blocked.
+        let elapsed = timer.elapsed();
+        *release.0.lock().unwrap() = true;
+        release.1.notify_all();
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "requests waited on stalled workers: {elapsed:?}"
+        );
+        assert!(resolver.pending.len() <= PTR_QUEUE_CAPACITY + PTR_WORKERS);
+        assert!(resolver.health.deferred > 0);
+        let requested = resolver.health.requested;
+        resolver.resolve(first);
+        assert_eq!(resolver.health.requested, requested);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !resolver.pending.is_empty() && Instant::now() < deadline {
+            resolver.maintain();
+            std::thread::yield_now();
+        }
+        assert!(resolver.pending.is_empty());
+        assert_eq!(
+            resolver.resolve(first),
+            Some("resolved-127.0.0.1".to_string())
+        );
+        assert_eq!(resolver.health.requested, resolver.health.completed);
+    }
+
+    #[test]
+    fn ptr_results_correct_unknown_held_flows_without_claiming_capture_provenance() {
+        let (requests, receive_requests) = mpsc::sync_channel(PTR_QUEUE_CAPACITY);
+        let (send_results, results) = mpsc::sync_channel(PTR_QUEUE_CAPACITY);
+        let mut resolver = Some(PtrResolver {
+            requests,
+            results,
+            pending: HashMap::new(),
+            cache: HashMap::new(),
+            health: PtrHealth::default(),
+        });
+        let mut key = create_test_event("2026-01-01T00:00:00Z", "connect", Provider::Unknown).key;
+        key.remote_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        let initial = resolve_observed_domain(&key, None, &mut resolver, true, UNIX_EPOCH);
+        assert!(initial.hostname.is_none());
+        let (ip, requested_at) = receive_requests
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap();
+        send_results
+            .send(PtrResult {
+                ip,
+                requested_at,
+                value: Some("localhost".to_string()),
+            })
+            .unwrap();
+        resolver.as_mut().unwrap().maintain();
+        let later = resolve_observed_domain(&key, None, &mut resolver, true, UNIX_EPOCH);
+        assert_eq!(later.hostname.as_deref(), Some("localhost"));
+        assert_eq!(later.source, Some(pcap_capture::DomainSource::Ptr));
+        assert_eq!(later.scope, "reverse-ip");
+        assert!(later.captured_at.is_none());
+        assert_eq!(resolver.as_ref().unwrap().health.requested, 1);
+        let json = format_ptr_health_json(&resolver.as_ref().unwrap().health());
+        assert!(json.contains("\"pending\":0"));
+        assert!(json.contains("\"completed\":1"));
+    }
+
+    #[test]
     fn updater_passes_literal_arguments_and_repo_environment_to_installer() {
         let destination = "/tmp/quoted '$PATH;\ninstaller";
         let update = UpdateCommand {
@@ -13037,6 +13387,7 @@ mod tests {
             log_failed: false,
             observation_errors: 0,
             capture_health: None,
+            ptr_health: None,
             per_ip: BTreeMap::new(),
             per_port: BTreeMap::new(),
             per_domain: BTreeMap::new(),
@@ -14619,6 +14970,11 @@ mod tests {
         assert!(
             tracker.recent.values().all(Vec::is_empty),
             "expired endpoints must not accumulate timestamps"
+        );
+        tracker.prune_stale();
+        assert!(
+            tracker.last_warn.is_empty(),
+            "expired warning cooldowns must not accumulate"
         );
 
         // Live entries are retained.

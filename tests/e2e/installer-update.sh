@@ -112,6 +112,20 @@ capture=root/'resolution-curl.jsonl'
 run('resolution-failure',[],False,extra={'CURL_CAPTURE':str(capture)},path=str(transport)+os.pathsep+os.environ['PATH'])
 calls=list(map(json.loads,capture.read_text().splitlines()))
 assert len(calls)==2 and all('OpenAI File Downloader, XaiImageApiFetch/1.0' in call for call in calls),'resolution transport/user-agent policy wrong'
+baseline=os.environ.get('RANO_INSTALLER_BASELINE')
+if baseline:
+    # The old installer reaches an unrequested source clone after inventing a
+    # release. Stop that controlled clone before any real Git/Cargo operation.
+    baseline_git=transport/'git'
+    baseline_git.write_text('#!/usr/bin/env python3\nimport json,os,sys\nopen(os.environ["BASELINE_GIT_CAPTURE"],"a").write(json.dumps(sys.argv[1:])+"\\n")\nsys.exit(128)\n');baseline_git.chmod(0o755)
+    baseline_calls=root/'baseline-git.jsonl';destination=root/'baseline-refused';destination.mkdir()
+    env=os.environ.copy();env.update({'PATH':str(transport)+os.pathsep+os.environ['PATH'],'VERSION':'','OWNER':'Dicklesworthstone','REPO':'rano','RUSTUP_INIT_SKIP':'1','CURL_CAPTURE':str(root/'baseline-curl.jsonl'),'BASELINE_GIT_CAPTURE':str(baseline_calls)})
+    old=subprocess.run(['bash',baseline,'--dest',str(destination),'--no-gum'],capture_output=True,text=True,env=env,timeout=30)
+    (root/'baseline-resolution.stdout').write_text(old.stdout);(root/'baseline-resolution.stderr').write_text(old.stderr)
+    assert old.returncode!=0 and 'defaulting to v0.2.1' in old.stdout and 'falling back to build-from-source' in old.stdout,'declared baseline no longer reproduces invented version/source fallback'
+    git_calls=list(map(json.loads,baseline_calls.read_text().splitlines()))
+    assert len(git_calls)==1 and git_calls[0][0]=='clone' and '--branch' not in git_calls[0],'baseline did not select uncontrolled default source'
+    print('PASS declared baseline invents unreleasedv0.2.1 and attempts unrequested default-source clone; candidate refuses before either',flush=True)
 
 # Controlled Git/Cargo protocol seams test ref selection and artifact-path
 # routing. They do not claim to compile Rust or qualify a source-built release.

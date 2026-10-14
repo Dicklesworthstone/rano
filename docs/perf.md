@@ -52,21 +52,58 @@ RSS plateaued within the first minute (~10.5 MB) and never grew — final
 with **2,031 events durably written and zero `sqlite_dropped`**.
 Full sample series: `logs/e2e/soak-memory-20260824T081800Z.log`.
 
-That producer never accepted its listener's backlog and stopped progressing. The RSS result applies to a finite stalled workload, not sustained churn. A repaired exact-`bc72781241cef39bcc4a2472ed93550b1ce0540a` default/no-DNS run requested600 seconds and completed626 seconds including startup/finalization:46,290 exact durable rows, generation=acceptance progressing every5 seconds, zero event loss, RSS20,888KB reference to21,072KB final/peak. That is scoped author evidence for that revision and workload; later revisions and broader endpoint/PID, PTR, ancestry and pcap/cache axes remain unqualified. Runs shorter than600 seconds are smoke tests. `SOAK_SOURCE_REVISION` must identify the binary's exact build receipt for a long run; workspace HEAD and the binary hash are recorded separately and are not substitutes for that binding.
+That producer never accepted its listener's backlog and stopped progressing. The RSS result applies to a finite stalled workload, not sustained churn. A repaired exact-`bc72781241cef39bcc4a2472ed93550b1ce0540a` default/no-DNS run requested 600 seconds and completed 626 seconds including startup/finalization: 46,290 exact durable rows, generation=acceptance progressing every 5 seconds, zero event loss, RSS 20,888 KB reference to 21,072 KB final/peak. That is scoped author evidence for that revision and workload; later revisions and broader endpoint/PID, PTR, ancestry and pcap/cache axes remain unqualified. Runs shorter than 600 seconds are smoke tests. `SOAK_SOURCE_REVISION` must identify the binary's exact build receipt for a long run; workspace HEAD and the binary hash are recorded separately and are not substitutes for that binding.
 
 The stats-view regression now waits for all four requested views against held real sockets, then checks durable observations and a healthy graceful summary. Its 20 s watchdog bounds failure; it makes no 1 s rendering or poll-latency claim. Missing-view, missing-summary and nonzero-exit controls must fail.
+
+PTR now uses two background workers, a 64-request queue, at most 66 pending IPs,
+and a 1,024-result positive/negative cache with a 600-second TTL. Expired results
+are pruned per poll; full caches evict their oldest result. A stalled resolver
+can consume worker capacity and leave hostnames unknown, but cannot block the
+poll or grow its scratch queue/cache indefinitely. Summary `ptr` counters expose
+pending age, completions, unresolved/deferred work and cache occupancy. Held
+unknown endpoints receive later corrections using their existing observation
+IDs; `--once` can finish with unresolved/pending PTR work. Accurate lifetime
+IP/PID/domain statistics remain proportional to distinct observed values.
+
+The real delayed-resolver probe mounts a private resolver file inside a private
+Linux mount/network namespace and holds back an actual DNS reply. The current
+author-tested candidate publishes advancing fresh polls while the exact
+`3406ad2` incumbent blocks its first poll, then corrects live/file/SQLite/export/
+report/statistics after the reply. A real NXDOMAIN case retains unknown
+hostname evidence and completes without inventing attribution. Injected inline
+worker stalls separately test queue bounds, deduplication and cache expiry;
+they are unit tests, not live-service proof. Current whole-session resource
+qualification and independent verification remain open.
 
 ## Reproducing
 
 ```bash
 cargo build --release
 scripts/bench.sh target/release/rano
-# Optional same-invocation incumbent; supplied SHAs must match build receipts:
-BENCH_SOURCE_REVISION="$(git rev-parse HEAD)" BENCH_INCUMBENT_REVISION=<incumbent-sha> \
+# Replace these quoted SHA placeholders with values from the build receipts.
+# Optional same-invocation incumbent:
+BENCH_SOURCE_REVISION="candidate-build-sha" BENCH_INCUMBENT_REVISION="incumbent-build-sha" \
   scripts/bench.sh target/release/rano /path/to/incumbent/rano
 # Fast harness smoke (no scaling or capacity qualification):
 BENCH_PASSES=2 BENCH_CONNECTIONS=5,15 BENCH_CHURN_SECS=1 \
   scripts/bench.sh target/release/rano
-SOAK_SECS=600 SOAK_SOURCE_REVISION="$(git rev-parse HEAD)" \
+BENCH_PASSES=2 BENCH_CONNECTIONS=5,15 BENCH_CHURN_SECS=1 \
+  BENCH_IP_COUNTS=8,128,1025 BENCH_PID_COUNTS=2,16 \
+  scripts/bench.sh target/release/rano /path/to/incumbent/rano
+SOAK_PTR_PROBE=1 RANO_PTR_BASELINE=/path/to/incumbent/rano \
+  scripts/e2e/run.sh ptr-system scripts/e2e/soak-memory.sh
+SOAK_PTR_PROBE=1 SOAK_PTR_REPLY=failure \
+  scripts/e2e/run.sh ptr-nxdomain scripts/e2e/soak-memory.sh
+SOAK_SECS=600 SOAK_SOURCE_REVISION="built-source-sha" \
   scripts/e2e/run.sh soak-memory scripts/e2e/soak-memory.sh
+# SOAK_DOMAIN_MODE=ptr exercises actual PTR; pcap requires a pcap-enabled
+# binary and live loopback capture privileges. Both require exact row/loss
+# accounting, and the pcap arm additionally requires nonzero captured packets.
 ```
+
+The CI source now makes default tests, strict checks, installer/real-PTR suites,
+progressing 600-second PTR and pcap/no-DNS workloads, and stalled/missing-summary
+controls blocking. It pins the same nightly date as `rust-toolchain.toml`.
+The manually disabled workflow state remains unchanged; source wiring is not
+an executed GitHub qualification.

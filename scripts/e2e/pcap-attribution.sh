@@ -46,10 +46,27 @@ def capture(name,packets,link=1,tail=b'',age=0):
 def run(label,arguments,fixture=None,success=True,live_target=True,ptr=False):
     env=dict(os.environ);env.pop('RANO_PCAP_FILE',None)
     if fixture is not None:env['RANO_PCAP_FILE']=str(fixture)
-    args=[binary,'--no-config','--no-descendants','--once','--json','--no-banner','--stats-interval-ms','0','--pcap',*arguments]
+    args=[binary,'--no-config','--no-descendants','--json','--no-banner','--stats-interval-ms','0','--pcap',*arguments]
+    if ptr:args+=['--interval-ms','50']
+    else:args.append('--once')
     if not ptr:args.append('--no-dns')
     args+=['--pid',str(ready['pid'])] if live_target else ['--pattern','nonexistent-pcap-fixture-root']
-    result=subprocess.run(args,capture_output=True,text=True,env=env,timeout=30)
+    if ptr:
+        with open(root/f'{label}.live.jsonl','w') as output,open(root/f'{label}.live.stderr','w') as errors:
+            process=subprocess.Popen(args,stdout=output,stderr=errors,env=env)
+            try:
+                deadline=time.monotonic()+10
+                while time.monotonic()<deadline:
+                    rows=[json.loads(line) for line in (root/f'{label}.live.jsonl').read_text().splitlines()]
+                    if len([row for row in rows if row.get('event')=='domain_update' and row.get('domain_source')=='ptr'])==2:break
+                    assert process.poll() is None,'PTR monitor exited before late attribution'
+                    time.sleep(.05)
+                else:raise AssertionError('both held endpoints never received late PTR attribution')
+            finally:
+                if process.poll() is None:process.send_signal(signal.SIGTERM)
+                process.wait(timeout=20)
+        result=subprocess.CompletedProcess(args,process.returncode,(root/f'{label}.live.jsonl').read_text(),(root/f'{label}.live.stderr').read_text())
+    else:result=subprocess.run(args,capture_output=True,text=True,env=env,timeout=30)
     (root/f'{label}.stdout.jsonl').write_text(result.stdout);(root/f'{label}.stderr').write_text(result.stderr)
     assert (result.returncode==0)==success,f'{label}: status={result.returncode}; stderr={result.stderr}'
     records=list(map(json.loads,result.stdout.splitlines()));summary=next(row['summary'] for row in records if 'summary' in row)
@@ -82,9 +99,12 @@ try:
     assert len(connects)==2 and all(row['domain']=='unknown' and 'domain_source' not in row for row in connects),'host-global ambiguity became a process-specific hostname'
     assert all(json.loads(row['ownership_json'])['domain_evidence']['dns_ambiguous'] and json.loads(row['ownership_json'])['domain_evidence']['dns_candidates']==['a.fixture.test','b.fixture.test'] for row in connects),'DNS candidates or scope lost'
     expected_ptr=socket.getnameinfo(('127.0.0.1',443),socket.NI_NAMEREQD)[0]
-    _,records,_=run('ambiguous-dns-ptr',['--no-sqlite'],ambiguous,ptr=True)
+    _,records,ptr_summary=run('ambiguous-dns-ptr',['--no-sqlite'],ambiguous,ptr=True)
     connects=[row for row in records if row.get('event')=='connect']
-    assert len(connects)==2 and all(row['domain']==expected_ptr and row['domain_source']=='ptr' and json.loads(row['ownership_json'])['domain_evidence']['scope']=='reverse-ip' and json.loads(row['ownership_json'])['domain_evidence']['dns_ambiguous'] for row in connects),'PTR fallback erased ambiguity or claimed DNS provenance'
+    updates=[row for row in records if row.get('event')=='domain_update']
+    assert len(connects)==2 and all(row['domain']=='unknown' and 'domain_source' not in row for row in connects),'initial poll waited on PTR'
+    assert len(updates)==2 and all(row['domain']==expected_ptr and row['domain_source']=='ptr' and json.loads(row['ownership_json'])['domain_evidence']['scope']=='reverse-ip' and json.loads(row['ownership_json'])['domain_evidence']['dns_ambiguous'] for row in updates),'late PTR fallback erased ambiguity or claimed DNS provenance'
+    assert ptr_summary['connects']==2 and ptr_summary['closes']==0 and ptr_summary['ptr']['requested']==ptr_summary['ptr']['completed']==1,'late resolution duplicated socket events or PTR requests'
     for label,fixture in [('expired-dns',capture('expired-dns.pcap',[dns_packet(ttl=1)],age=2)),('zero-ttl-dns',capture('zero-ttl-dns.pcap',[dns_packet(ttl=0)])),('future-dns',capture('future-dns.pcap',[dns_packet()],age=-60))]:
         _,records,_=run(label,['--no-sqlite'],fixture)
         connects=[row for row in records if row.get('event')=='connect']

@@ -3,8 +3,8 @@
 All notable changes to [rano](https://github.com/Dicklesworthstone/rano) are documented here.
 
 rano is a **network observer for AI CLI processes** (Claude Code, Codex CLI, Gemini CLI).
-It polls `/proc`, maps sockets to PIDs, and prints connection events with provider tags
-while logging a complete history to SQLite.
+It polls Linux `/proc`, maps observed sockets to PIDs, and prints observation events
+with provider tags while optionally logging the sampled history to SQLite.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -13,20 +13,72 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+The development source is `0.2.1`; the latest published release checked on
+2026-10-14 is [v0.2.0](https://github.com/Dicklesworthstone/rano/releases/tag/v0.2.0).
+These changes are not present in that published artifact. Independent companion
+verification and the final exact-revision qualification remain open.
+
+### Changed
+
+- Sampled process/socket records preserve PID kernel start time, monitored root,
+  shared holders, provider-match origin and observation identity. Listeners and
+  bound UDP are distinct from peer endpoint episodes; accepted TCP direction is
+  explicitly unknown. Visibility failures are surfaced instead of silently
+  producing a successful empty observation.
+- Durable SQLite/file failures now affect the exit status. Final counters separate
+  observed/persisted events, queue/write losses and metadata correction failures;
+  shutdown reconciles persisted rows rather than treating a zero queue-drop count
+  as complete history.
+- Redaction preserves argv boundaries, including multiword credential values;
+  session metadata and durable logs share the masking policy. Machine-readable
+  event/report/export output escapes hostile metadata.
+- Report/export/diff resolve session references and normalize time boundaries;
+  status separates historical totals from fresh observer-validated activity.
+  Reports include filtered close-duration aggregates, provider diversity, UTC
+  activity and an explicitly scoped stored-event peak under JSON schema `2.0`.
+- Pcap SNI attribution uses full socket tuples, capture time and observed inode
+  binding. DNS candidate ambiguity and original TTLs remain explicit. Late
+  evidence updates the original SQLite connection; capture health/loss is visible.
+- Count alerts use reconciled concurrent endpoint/provider counts. Configuration
+  check/show and monitoring share ordered source/preset resolution, with invalid
+  selected sources failing explicitly and inspection reporting effective values.
+- Benchmarks and the soak require accepted workload progress, exact observations,
+  durable-row reconciliation and a final healthy summary. Historical timings and
+  a stalled-workload RSS plateau are retained with their limits, not as current
+  resource qualification.
+- PTR resolution runs on two background workers with bounded queued/pending
+  requests and an expiring positive/negative cache. Held unknown endpoints can
+  receive late corrections in live/file/SQLite/report/export statistics;
+  one-poll runs can finish unresolved. Resolver health exposes pending work and
+  cache/queue limits. Retry warning cooldown entries expire alongside their
+  detection window.
+- Installer/update preserves selected release/source provenance, validates the
+  actual Cargo executable path and portable checksum/version results, and
+  propagates transport/install failures. Unsupported monitoring backends refuse
+  before capture or output sinks; history/config dispatch stays available.
+- Public documentation separates Linux monitoring from Darwin packaging, corrects
+  preset/default/export contracts, and links the existing LICENSE including its
+  rider. General CI/distribution/release workflows remain disabled manually; the
+  active nonblocking perf workflow does not qualify the complete product.
+
+Installer/update and native command execution are still undergoing their
+required verification. Publishing `0.2.1`, native Darwin current-source execution,
+all-mode sustained resource limits and whole-project qualification are not
+claimed here.
+
 ## [v0.2.1] -- PREPARED, NOT YET RELEASED
 
-> **There is no `v0.2.1` tag and no GitHub release.** The version in `Cargo.toml`
-> is `0.2.1` and this entry is written, but the release itself has not been cut:
-> rano has no `dsr` build recipe (`repos.d/rano.yaml` does not exist), and dsr is
-> the release authority for this fleet. Cutting a tag without the accompanying
-> release would produce a tag pointing at no artifacts, so neither was done.
-> Gate at `82ce51f`: fmt clean, clippy clean, 197 tests, zero failures.
-> To finish: author `repos.d/rano.yaml`, build the platforms v0.2.0 shipped
-> (darwin arm64 + x86_64, linux arm64 + amd64), then tag and release together.
+> Historical maintenance preparation, not a published release. At `82ce51f`,
+> preparation lacked a `dsr` recipe and recorded fmt/clippy and a 197-test check.
+> Those historical checks do not qualify the later functional repairs. The
+> release requires current artifact/runtime evidence and publication through
+> the approved release authority. A Darwin build never establishes native
+> monitoring support; that backend remains Linux-only.
 
-Maintenance release. **No functional change to rano itself** — `git diff v0.2.0..HEAD -- src/`
-is empty, so every line of program source is identical to v0.2.0. What this release
-carries is one installer fix and a dependency refresh.
+The initial preparation was maintenance-only: an installer fix and dependency
+refresh without observer source changes at that preparation point. The current
+unreleased source has the functional changes listed above. The notes below
+preserve the original maintenance scope rather than describe today's HEAD.
 
 ### Fixed
 
@@ -35,7 +87,8 @@ carries is one installer fix and a dependency refresh.
   `releases/latest` redirect) can fail on a rate limit or a transient API error,
   and the last-resort constant had not been updated since v0.1.0 shipped in March.
   A user hitting that path silently received a six-month-old binary with only a
-  warning. The fallback now matches the release it ships with.
+  warning. That preparation changed the fallback constant; the current
+  installer instead fails when it cannot resolve the requested release.
 
 ### Changed
 
@@ -49,8 +102,9 @@ carries is one installer fix and a dependency refresh.
   `observer.sqlite` was removed from the repository and ignored; the bench harness
   in `scripts/bench.sh` was corrected.
 
-Gate at `14de4c7c`: `cargo fmt --check` clean, `cargo clippy --all-targets -- -D warnings`
-clean, `cargo test` 197 tests with zero failures.
+Historical gate recorded at `14de4c7c`: `cargo fmt --check` clean,
+`cargo clippy --all-targets -- -D warnings` clean, `cargo test` 197 tests with
+zero failures. This is not a current exact-revision qualification.
 
 ## [v0.2.0] -- 2026-08-25 (GitHub Release)
 
@@ -58,7 +112,11 @@ clean, `cargo test` 197 tests with zero failures.
 connection alerting, pcap capture, and a substantially reworked CLI — alongside the removal
 of the vestigial Windows build.
 
-**Platform support is now stated plainly: Linux and macOS only.** Windows was already
+**Packaging targets: Linux and macOS; native monitoring: Linux only.** The original
+release described both as supported, but a Darwin binary does not supply the
+Linux `/proc` observer backend. A physically executed published v0.2.0 Darwin
+binary can exit successfully with zero observations; that is not native
+monitoring capability. Windows was already
 unsupported in practice (rano reads Linux-only `/proc` and Unix libc APIs) and the dead
 `self_update_windows` code and stale install-path references are gone. This release ships
 exactly the four targets `install.sh` can request — `x86_64-unknown-linux-gnu`,

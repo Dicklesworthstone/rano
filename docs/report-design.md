@@ -44,7 +44,8 @@ rano report --sqlite /path/to/rano.sqlite --latest
 ### Mutual Exclusivity
 
 - `--latest` and `--run-id` are mutually exclusive
-- `--since`/`--until` can combine with neither (aggregate mode) or `--run-id` (filter within session)
+- `--since`/`--until` can combine with neither (aggregate mode), `--run-id`, or
+  `--latest` (filter within the selected session)
 
 ## Time Range Semantics
 
@@ -125,6 +126,11 @@ Top Domains:
 
 The actual output is one ranked list of domain/provider pairs, with observed attribution provenance and its event count. It orders by count descending, then domain and provider names, and applies one global `--top` limit.
 
+Unresolved endpoint rows remain visible as the `unknown` domain group. They do
+not increase the provider breakdown's distinct-known-domain count. Groups
+with several provenance kinds are labeled `mixed`; an SNI observation does
+not promote the other rows in the group to SNI evidence.
+
 ### Top IPs
 
 ```
@@ -198,6 +204,8 @@ Future: add `schema_version` to sessions or separate metadata table. For now, as
 ## JSON Output Format
 
 ### Stable Keys (schema version 2.0)
+
+Shape outline; ellipses stand for data objects, not literal JSON values.
 
 ```json
 {
@@ -299,6 +307,22 @@ Future: add `schema_version` to sessions or separate metadata table. For now, as
 - Top domains/IPs: by event count DESC, then alphabetically
 - Hourly activity: chronological (ASC by hour)
 - JSON section keys: fixed schema order; hourly provider keys: alphabetical
+
+## Disposition of the Initial Insight Promises
+
+Close-duration average/maximum and sample counts, provider domain/IP diversity,
+UTC hourly activity and stored-event peaks are implemented in the current
+source. Their filtered/snapshot semantics and unavailable cases are described
+above. Reality-check task .8's author evidence is separate from its open
+independent companion .25; implementation presence is not qualification.
+
+Report `summary.active` is the selected connect-minus-close ledger balance,
+which may be negative in a close-only window. A held socket can remain in that
+history after the observer exits; `status` uses separately validated freshness
+and returns zero current activity for an ended session. No report infers
+network episodes missing from polling or supplies packet/TLS payload analysis.
+The initial alert design's proposed `report --alerts` remains a future
+enhancement, not an accepted report option.
 
 ## Error Cases
 

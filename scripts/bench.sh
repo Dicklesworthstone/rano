@@ -21,7 +21,7 @@ if [ ! -x "${RANO}" ]; then
 fi
 
 python3 - "${RANO}" "${2:-${BENCH_INCUMBENT:-}}" "${SCRIPT_DIR}/.." <<'PY'
-import hashlib,json,math,os,pathlib,platform,signal,socket,sqlite3,statistics,subprocess,sys,tempfile,time
+import hashlib,json,math,os,pathlib,platform,select,signal,socket,sqlite3,statistics,subprocess,sys,tempfile,time
 root=pathlib.Path(tempfile.mkdtemp(prefix='rano-bench.'));print(f'Retained benchmark artifacts: {root}',flush=True)
 passes=int(os.environ.get('BENCH_PASSES','30'));duration=float(os.environ.get('BENCH_CHURN_SECS','8'))
 counts=[int(value) for value in os.environ.get('BENCH_CONNECTIONS','500,2000').split(',')]
@@ -96,6 +96,50 @@ try:
             for label,values in samples.items():
                 print(f'| {label} | {mode}; {count} accepted TCP pairs | {passes} | {statistics.mean(values):.3f} | {statistics.median(values):.3f} | {sorted(values)[math.ceil(.95*len(values))-1]:.3f} | {max(values):.3f} |',flush=True)
         close_pairs()
+    diversity=[int(value) for value in os.environ.get('BENCH_IP_COUNTS','').split(',') if value]
+    pid_counts=[int(value) for value in os.environ.get('BENCH_PID_COUNTS','').split(',') if value]
+    assert all(0<count<2**24 for count in diversity) and all(count>0 for count in pid_counts),'invalid diversity axis'
+    for count in diversity:
+        try:
+            for index in range(1,count+1):
+                address=socket.inet_ntoa((0x7f000001+index).to_bytes(4,'big'))
+                endpoint=socket.socket();endpoint.bind((address,0));endpoint.listen()
+                try:
+                    client=socket.create_connection(endpoint.getsockname(),timeout=5);server,_=endpoint.accept();pairs.append((client,server))
+                finally:endpoint.close()
+            for label,binary,_ in binaries:
+                elapsed,flags=observe(label,binary,'no-dns-no-sqlite',count,'ip-diversity')
+                final,_=summary(root/f'{label}-no-dns-no-sqlite-{count}-ip-diversity.stdout')
+                assert len(final['per_ip'])==count+1 and sum(final['per_ip'].values())==2*count,'lifetime IP statistics lost distinct actual peers'
+                measurements.append({'label':label,'mode':'ip-diversity','peer_ips':count+1,'endpoint_count':2*count,'elapsed_ms':elapsed,'flags':flags})
+                print(f'{label} IP diversity={count+1}: {2*count} exact held endpoints, all lifetime peer counts retained, {elapsed:.3f}ms invocation',flush=True)
+        finally:close_pairs()
+    holder_code="import json,os,socket,sys;listener=socket.socket();listener.bind(('127.0.0.1',0));listener.listen();client=socket.create_connection(listener.getsockname());server,_=listener.accept();print(json.dumps({'pid':os.getpid()}),flush=True);sys.stdin.read(1)"
+    for count in pid_counts:
+        holders=[]
+        try:
+            pids=[]
+            for _ in range(count):
+                holder=subprocess.Popen([sys.executable,'-u','-c',holder_code],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True);holders.append(holder)
+                assert select.select([holder.stdout],[],[],10)[0],'PID fixture did not become ready'
+                pids.append(json.loads(holder.stdout.readline())['pid'])
+            for ancestry in [False,True]:
+                for label,binary,_ in binaries:
+                    flags=['--no-config','--no-descendants','--no-dns','--no-sqlite','--once','--json','--no-banner','--stats-interval-ms','0']
+                    for pid in pids:flags+=['--pid',str(pid)]
+                    if ancestry:flags.append('--show-ancestry')
+                    started=time.monotonic_ns();result=subprocess.run([str(binary),*flags],capture_output=True,text=True,timeout=60);elapsed=(time.monotonic_ns()-started)/1e6
+                    output=root/f'{label}-pids-{count}-ancestry-{ancestry}.stdout';output.write_text(result.stdout);output.with_suffix('.stderr').write_text(result.stderr)
+                    assert result.returncode==0,result.stderr
+                    final,rows=summary(output);opens=[row for row in rows if row.get('event')=='connect']
+                    assert final['connects']==final['active']==len(opens)==2*count and final['closes']==0 and set(final['per_pid'])==set(map(str,pids)) and all(value==2 for value in final['per_pid'].values()),'physical PID endpoints/lifetime identities lost'
+                    if ancestry:assert all(any(item.endswith('('+str(os.getpid())+')') for item in row['ancestry']) for row in opens),'actual parent missing from ancestry'
+                    else:assert all('ancestry' not in row for row in opens),'ancestry disabled path still emitted it'
+                    measurements.append({'label':label,'mode':'pid-diversity','pids':count,'ancestry':ancestry,'endpoint_count':2*count,'elapsed_ms':elapsed,'flags':flags})
+                    print(f'{label} PID diversity={count}, ancestry={ancestry}: {2*count} exact endpoints/identities, {elapsed:.3f}ms invocation',flush=True)
+        finally:
+            for holder in holders:
+                if holder.poll() is None:holder.stdin.write('x');holder.stdin.flush();holder.wait(timeout=5)
     for label,binary,_ in binaries:
         for batch in [200,1000]:
             database=root/f'{label}-churn-{batch}.sqlite';output=root/f'{label}-churn-{batch}.stdout';operations=[]

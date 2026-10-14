@@ -1,6 +1,6 @@
 # Export Subcommand Design
 
-Status: design for bead bd-2a6 (parent: bd-1vz)
+Status: implemented export interface with historical implementation sketches for bead bd-2a6 (parent: bd-1vz). The field table and format rules below describe the current source; sketches are illustrative, not source definitions. Independent all-sink/query verification remains open.
 
 ## Overview
 
@@ -52,13 +52,13 @@ rano export --format jsonl -o /tmp/events.jsonl
 | `--format <csv\|jsonl>` | Output format (required) | - |
 | `--sqlite <path>` | SQLite database path | observer.sqlite |
 | `--since <ts>` | Start of time range (UTC or relative) | - |
-| `--until <ts>` | End of time range (UTC, exclusive) | now |
+| `--until <ts>` | End of time range (UTC, exclusive) | no upper bound |
 | `--run-id <id>` | Export specific session | - |
 | `--provider <name>` | Filter by provider (repeatable) | all |
 | `--domain <pattern>` | Filter by domain glob pattern (repeatable) | all |
 | `--fields <list>` | Comma-separated field list | all fields |
 | `--no-header` | Omit header row (CSV only) | false |
-| `--output <path>` / `-o` | Output file path | stdout |
+| `--output <path>` / `-o` | Output file path; replaces an existing destination | stdout |
 
 ### Time Filter Formats
 
@@ -74,27 +74,41 @@ Consistent with `rano report`:
 
 - `--run-id` and `--since`/`--until` can be combined (filter within session)
 - `--no-header` is ignored for JSONL format
+- Explicit run IDs and unambiguous session names resolve before export; missing
+  or ambiguous references fail. Time boundaries use strict normalized UTC,
+  with inclusive start and exclusive end, and invalid/reversed ranges fail.
 
 ## Field Order and Names
 
-### Default Field List (14 fields)
+### Default Field List (19 fields)
 
 | # | Field | Type | Description |
 |---|-------|------|-------------|
 | 1 | `ts` | string | RFC3339 UTC timestamp |
 | 2 | `run_id` | string | Session identifier |
-| 3 | `event` | string | `connect` or `close` |
+| 3 | `event` | string | `connect`, `close`, `listen`, `bind`, or synthesized threshold `alert` |
 | 4 | `provider` | string | `anthropic`, `openai`, `google`, `unknown` |
-| 5 | `pid` | integer | Process ID |
+| 5 | `pid` | integer | Process ID; null on synthesized threshold alerts |
 | 6 | `comm` | string | Process command name |
-| 7 | `cmdline` | string | Full command line |
+| 7 | `cmdline` | string | Stored command line, subject to the monitor's redaction mode |
 | 8 | `proto` | string | `tcp` or `udp` |
 | 9 | `local_ip` | string | Local IP address |
 | 10 | `local_port` | integer | Local port number |
 | 11 | `remote_ip` | string | Remote IP address |
 | 12 | `remote_port` | integer | Remote port number |
 | 13 | `domain` | string | Resolved domain (may be empty) |
-| 14 | `duration_ms` | integer | Connection duration (close events only) |
+| 14 | `domain_source` | string | `sni`, `dns` or `ptr` when attributed |
+| 15 | `ancestry_path` | string | Percent-escaped root-to-owner path; null unless ancestry was captured |
+| 16 | `duration_ms` | integer | Observed episode duration (close events only) |
+| 17 | `alert` | integer | `1` when an alert emitted for this event; cooldown-suppressed rows remain `0` |
+| 18 | `retry_count` | integer | Endpoint closes in the retry window when a warning triggers |
+| 19 | `ownership_json` | string | Encoded JSON with observation, owner/root/provider-origin identity and socket/hostname evidence |
+
+Decode `ownership_json` separately to read `socket_kind`, `remote_present`,
+`direction`, shared holders and `domain_evidence`. A local-only bind/listener
+has no observed peer even though the SQLite endpoint columns preserve kernel
+zero-address/port values. A late `domain_update` corrects the original SQLite
+connect row; export does not manufacture another connection for that update.
 
 ### Field Selection
 
@@ -130,6 +144,9 @@ The CSV output follows [RFC 4180](https://datatracker.ietf.org/doc/html/rfc4180)
 6. **Encoding**: UTF-8
 
 ### Example CSV Output
+
+This example selects the original 14 fields with `--fields`; default output
+also includes the five additional fields listed above.
 
 ```csv
 ts,run_id,event,provider,pid,comm,cmdline,proto,local_ip,local_port,remote_ip,remote_port,domain,duration_ms
@@ -183,8 +200,8 @@ fn csv_escape(value: &str) -> String {
 ### Example JSONL Output
 
 ```jsonl
-{"comm":"claude","cmdline":"/usr/bin/claude","domain":"api.anthropic.com","event":"connect","local_ip":"127.0.0.1","local_port":54321,"pid":1234,"proto":"tcp","provider":"anthropic","remote_ip":"34.149.66.137","remote_port":443,"run_id":"12345-1705512345000","ts":"2026-01-17T12:34:56Z"}
-{"comm":"claude","cmdline":"/usr/bin/claude","domain":"api.anthropic.com","duration_ms":5000,"event":"close","local_ip":"127.0.0.1","local_port":54321,"pid":1234,"proto":"tcp","provider":"anthropic","remote_ip":"34.149.66.137","remote_port":443,"run_id":"12345-1705512345000","ts":"2026-01-17T12:35:01Z"}
+{"cmdline":"/usr/bin/claude","comm":"claude","domain":"api.anthropic.com","event":"connect","local_ip":"127.0.0.1","local_port":54321,"pid":1234,"proto":"tcp","provider":"anthropic","remote_ip":"34.149.66.137","remote_port":443,"run_id":"12345-1705512345000","ts":"2026-01-17T12:34:56Z"}
+{"cmdline":"/usr/bin/claude","comm":"claude","domain":"api.anthropic.com","duration_ms":5000,"event":"close","local_ip":"127.0.0.1","local_port":54321,"pid":1234,"proto":"tcp","provider":"anthropic","remote_ip":"34.149.66.137","remote_port":443,"run_id":"12345-1705512345000","ts":"2026-01-17T12:35:01Z"}
 ```
 
 ### Field Selection with JSONL
@@ -252,8 +269,8 @@ rano export --format csv --domain "*.anthropic.com" --domain "*.openai.com"
 ```sql
 SELECT * FROM events
 WHERE (
-    domain LIKE '%anthropic.com'  -- converted from *.anthropic.com
-    OR domain LIKE 'api.%'        -- converted from api.*
+    LOWER(domain) LIKE '%.anthropic.com' ESCAPE '\'  -- *.anthropic.com
+    OR LOWER(domain) LIKE 'api.%' ESCAPE '\'         -- api.*
 )
 ```
 
@@ -334,19 +351,20 @@ struct ExportFilter {
 ### Field Constants
 
 ```rust
-const ALL_FIELDS: &[&str] = &[
+const EXPORT_FIELDS: &[&str] = &[
     "ts", "run_id", "event", "provider", "pid", "comm", "cmdline",
     "proto", "local_ip", "local_port", "remote_ip", "remote_port",
-    "domain", "duration_ms"
+    "domain", "domain_source", "ancestry_path", "duration_ms", "alert",
+    "retry_count", "ownership_json"
 ];
 
 fn validate_fields(fields: &[String]) -> Result<(), String> {
     for field in fields {
-        if !ALL_FIELDS.contains(&field.as_str()) {
+        if !EXPORT_FIELDS.contains(&field.as_str()) {
             return Err(format!(
                 "Unknown field '{}'. Valid fields: {}",
                 field,
-                ALL_FIELDS.join(", ")
+                EXPORT_FIELDS.join(", ")
             ));
         }
     }
@@ -361,7 +379,8 @@ fn validate_fields(fields: &[String]) -> Result<(), String> {
 ```sql
 SELECT ts, run_id, event, provider, pid, comm, cmdline,
        proto, local_ip, local_port, remote_ip, remote_port,
-       domain, duration_ms
+       domain, domain_source, ancestry_path, duration_ms, alert,
+       retry_count, ownership_json
 FROM events
 WHERE 1=1
 ```
@@ -371,7 +390,7 @@ WHERE 1=1
 ```rust
 fn build_export_query(filter: &ExportFilter, fields: &[String]) -> (String, Vec<String>) {
     let field_list = if fields.is_empty() {
-        ALL_FIELDS.join(", ")
+        EXPORT_FIELDS.join(", ")
     } else {
         fields.join(", ")
     };
@@ -385,18 +404,18 @@ fn build_export_query(filter: &ExportFilter, fields: &[String]) -> (String, Vec<
         params.push(run_id.clone());
     }
     if let Some(ref since) = filter.since {
-        sql.push_str(" AND ts >= ?");
+        sql.push_str(" AND rano_utc(ts) >= rano_utc(?)");
         params.push(since.clone());
     }
     if let Some(ref until) = filter.until {
-        sql.push_str(" AND ts < ?");
+        sql.push_str(" AND rano_utc(ts) < rano_utc(?)");
         params.push(until.clone());
     }
 
     // Provider filter (OR'd)
     if !filter.providers.is_empty() {
         let placeholders: Vec<&str> = filter.providers.iter().map(|_| "?").collect();
-        sql.push_str(&format!(" AND provider IN ({})", placeholders.join(",")));
+        sql.push_str(&format!(" AND LOWER(provider) IN ({})", placeholders.join(",")));
         params.extend(filter.providers.clone());
     }
 
@@ -404,7 +423,7 @@ fn build_export_query(filter: &ExportFilter, fields: &[String]) -> (String, Vec<
     if !filter.domain_patterns.is_empty() {
         let conditions: Vec<String> = filter.domain_patterns
             .iter()
-            .map(|_| "domain LIKE ?")
+            .map(|_| "LOWER(domain) LIKE ? ESCAPE '\\'".to_string())
             .collect();
         sql.push_str(&format!(" AND ({})", conditions.join(" OR ")));
         for pattern in &filter.domain_patterns {
@@ -413,7 +432,7 @@ fn build_export_query(filter: &ExportFilter, fields: &[String]) -> (String, Vec<
     }
 
     // Deterministic ordering
-    sql.push_str(" ORDER BY ts ASC");
+    sql.push_str(" ORDER BY rano_utc(ts) ASC, id ASC");
 
     (sql, params)
 }
@@ -422,8 +441,9 @@ fn glob_to_sql_like(pattern: &str) -> String {
     // Convert glob wildcards to SQL LIKE:
     // * -> %
     // ? -> _
-    // Escape existing % and _ characters
+    // Escape existing %, _ and backslash characters
     pattern
+        .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_")
         .replace('*', "%")
@@ -472,7 +492,7 @@ fn run_export(args: &ExportArgs) -> Result<(), String> {
 
     // Validate fields
     let fields = args.fields.clone().unwrap_or_else(|| {
-        ALL_FIELDS.iter().map(|s| s.to_string()).collect()
+        EXPORT_FIELDS.iter().map(|s| s.to_string()).collect()
     });
     validate_fields(&fields)?;
 
@@ -533,8 +553,8 @@ fn run_export(args: &ExportArgs) -> Result<(), String> {
 
 ## Performance Considerations
 
-1. **Streaming**: No limit on export size; memory usage is constant
-2. **Indexing**: Queries use existing indexes on `ts`, `run_id`, `provider`, `domain`
+1. **Streaming**: Rust formats and writes rows incrementally; SQLite sorting/query memory and large individual rows are not a qualified constant-memory guarantee
+2. **Indexing**: Indexes exist on `ts`, `run_id`, `provider`, `domain`; normalized expressions may require additional query work
 3. **Buffered I/O**: Use `BufWriter` for file output to reduce syscalls
 4. **Field selection**: Only query selected fields (reduces data transfer)
 
