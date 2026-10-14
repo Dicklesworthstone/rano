@@ -228,16 +228,46 @@ rano can resolve domains in two modes:
 Every resolved domain carries a **provenance source** so you can weigh
 attribution confidence:
 
-| `domain_source` | Meaning | Confidence |
+| `domain_source` | Meaning | Observation scope |
 |-----------------|---------|------------|
-| `sni` | Observed in the TLS ClientHello handshake | Highest — what the process actually dialed |
-| `dns` | Answer from a captured DNS response | High — name the process looked up |
-| `ptr` | Reverse DNS on the remote IP | Indicative — CDN/shared hosts may be misleading |
+| `sni` | Visible hostname in a captured TLS ClientHello | Full local/remote socket tuple; observed inode and capture time checked |
+| `dns` | One unexpired hostname candidate from captured DNS answers | Host-global answer IP; does not prove this process queried that name |
+| `ptr` | Reverse DNS on the remote IP | IP-level fallback; CDN/shared hosts may be misleading |
 | *(absent)* | Unresolved or attribution unavailable | — |
 
 The source appears as `"domain_source"` in `--json` events, in SQLite
 (`events.domain_source`), in exports, and as a `[sni]`-style suffix on report
 Top Domains rows.
+Socket ownership metadata includes `domain_evidence`: observation scope, `capture_kind`
+(`live`, `offline`, or `none`), the original capture timestamp, ambiguity flags,
+the number of valid DNS candidates, and a sorted sample of up to eight names.
+Multiple DNS candidates remain ambiguous; PTR can still provide a separately labeled
+fallback. DNS records expire at their observed TTL, capped at five minutes; SNI
+cache entries expire after ten minutes. Expired/future captures, older reordered
+SNI messages, known inode changes and retired tuples cannot supply an old association.
+A hostname already observed on the same held inode remains historical evidence
+after cache expiry. Sockets that disappear entirely between polls remain outside
+the observer's coverage.
+Report domain/provider groups containing multiple provenance kinds are labeled
+`mixed`; a single SNI row does not promote other DNS/PTR/unresolved observations
+in that group to SNI evidence.
+
+Late associations emit `domain_update` records to live output and file logs, linked
+by the observation ID inside decoded `ownership_json`. SQLite corrects that
+original connect row rather than inserting another connection. Exports and reports see the corrected
+provenance with unchanged connect/close/provider counts; metadata-write failure is
+reported separately and makes the run unsuccessful.
+
+Pcap capture supports Ethernet frames with up to two VLAN tags; the capture filter
+admits untagged, single-tagged and double-tagged DNS/TLS traffic. Other datalink
+types produce an actionable startup warning and fallback. Live idle timeouts keep
+the capture worker running. Final summaries expose `pcap` packet/mapping/delivery/
+drain/loss counters, kernel/interface drop snapshots, state and errors. Mapping
+loss or a runtime capture failure warns, falls back to PTR (or unresolved names
+with `--no-dns`) and ends with a nonzero status while preserving valid socket
+observations. Offline EOF is successful completion; truncated-file read errors
+are failures. Queue delivery/drain counters describe parsed messages, not a
+guarantee that every message contains unexpired hostname evidence.
 Examples:
 
 ```bash
@@ -249,12 +279,21 @@ rano --pcap --pattern claude
 rano --domain-mode ptr
 ```
 
-Offline verification (no root) is supported via a pcap file:
+Offline replay requires a pcap-enabled build and a regular capture file; it does
+not require root. It preserves original capture timestamps and streams all
+messages through a bounded queue, including with `--once`. Old fixture records
+may be expired and never become fresh evidence simply because they are replayed:
 
 ```bash
 RANO_PCAP_FILE=tests/fixtures/pcap/dns-fixture.pcap \
   rano --pcap --once --json --no-banner
 ```
+
+The pcap E2E script generates current packet fixtures for real held sockets and
+also tests real live capture inside a private Linux network namespace. TLS
+extraction requires a complete visible ClientHello in one captured transport
+payload. Segmented handshakes, encrypted ClientHello inner names and encrypted
+DNS are not reconstructed; an outer SNI name is not proof of an ECH inner name.
 
 ### `rano update`
 

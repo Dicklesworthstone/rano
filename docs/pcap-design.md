@@ -1,8 +1,13 @@
-> **As-built note (2026-08-23):** Implemented as designed except: no port 80 in the BPF
-> filter; the "background sweep" is lazy cleanup inside cache lookups (idle caches persist);
-> TTLs and the 10k cap are compile-time constants — the tuning-flag table below was not
-> implemented (`--pcap-interface` / `--pcap-cache-max` are tracked separately). DomainSource
-> currently has Dns/Sni variants only; provenance surfacing is tracked separately.
+> **As-built note (2026-10-13):** Capture filters UDP/TCP 53 and TCP 443. Ethernet
+> with up to two VLAN tags is supported; other datalink types refuse with fallback.
+> `--pcap-interface` and `--pcap-cache-max` work. DNS uses observed answer TTL,
+> capped at 300 seconds; SNI cache TTL remains 600 seconds. Lazy cleanup and the
+> configured cap bound DNS candidates plus flow records. DNS ambiguity is
+> explicit host-IP evidence; SNI uses the complete tuple, observed inode and
+> original capture time. Late associations correct the original SQLite row and
+> emit separate live/file metadata updates. Unused TTL/SNI-port tuning flags,
+> unbounded stream reassembly, encrypted DNS and ECH inner names remain outside
+> the implemented scope. The implementation graph's independent proofs stay open.
 
 # Pcap Domain Attribution Design
 
@@ -15,9 +20,14 @@ PTR (reverse DNS) lookups are unreliable for domain attribution:
 - Multiple domains can share the same IP (virtual hosting)
 - PTR records often don't exist or return generic provider names
 
-True domain attribution requires capturing the **original destination hostname** from either:
+Hostname evidence comes from either:
 1. DNS query/response packets
-2. TLS SNI (Server Name Indication) extension in ClientHello
+2. Visible TLS SNI (Server Name Indication) in ClientHello for a socket tuple
+
+DNS does not establish which monitored process issued a query. Multiple
+unexpired names for one IP remain ambiguous. Captured outer SNI does not expose
+an ECH inner hostname. Neither source proves connect-versus-accept direction or
+events lost between `/proc` polls.
 
 ## Dataflow Diagram
 
@@ -29,8 +39,7 @@ True domain attribution requires capturing the **original destination hostname**
                                   ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │                    libpcap Capture Thread                            │
-│  Filter: "port 53 or port 443 or port 80"                           │
-│  (Or more specific: "udp port 53 or tcp port 443 or tcp port 80")   │
+│  Filter: "udp port 53 or tcp port 53 or tcp port 443"                │
 └─────────────────────────────────────────────────────────────────────┘
                                   │
                     ┌─────────────┴─────────────┐
@@ -42,22 +51,22 @@ True domain attribution requires capturing the **original destination hostname**
                     │                           │
                     │   Extract:                │   Extract:
                     │   - Query name            │   - SNI hostname
-                    │   - Response IP(s)        │   - Dest IP:port
+                    │   - Response IP(s)/TTL    │   - Full tuple/time
                     │                           │
                     ▼                           ▼
          ┌─────────────────────────────────────────────────┐
          │              Domain Mapping Cache                │
-         │  Key: (remote_ip, remote_port) or (remote_ip)   │
-         │  Value: { hostname, source: dns|sni, ttl }      │
+         │  SNI: full tuple + observed inode binding      │
+         │  DNS: IP -> timestamped candidate names/TTLs   │
          └─────────────────────────────────────────────────┘
                                   │
                                   ▼
          ┌─────────────────────────────────────────────────┐
          │              Main Polling Thread                 │
-         │  When new connection detected:                   │
-         │  1. Lookup (remote_ip, remote_port) in cache    │
-         │  2. If miss, lookup (remote_ip) only            │
-         │  3. If miss, fall back to PTR                   │
+         │  Initial and later observed socket polls:      │
+         │  1. Check tuple, inode and capture timestamp    │
+         │  2. Use DNS for one unexpired candidate         │
+         │  3. Preserve ambiguity with labeled PTR fallback│
          └─────────────────────────────────────────────────┘
                                   │
                                   ▼
@@ -85,15 +94,12 @@ enum DomainSource {
     Ptr,    // Fallback reverse lookup
 }
 
-// Cache keyed by (IP, Option<Port>)
-// - SNI mappings use (IP, Port) for precision
-// - DNS mappings use (IP, None) since response applies to all ports
+// SNI maps complete tuples; DNS remains host-global IP evidence.
 struct DomainCache {
-    // Primary lookup: (ip, port) -> mapping
-    by_ip_port: HashMap<(IpAddr, u16), DomainMapping>,
+    by_flow: HashMap<FlowKey, FlowMapping>,
 
     // Fallback lookup: ip -> mapping (for DNS-only entries)
-    by_ip: HashMap<IpAddr, DomainMapping>,
+    by_ip: HashMap<IpAddr, BTreeMap<String, DomainMapping>>,
 }
 ```
 
@@ -101,15 +107,19 @@ struct DomainCache {
 
 | Source | Default TTL | Rationale |
 |--------|-------------|-----------|
-| DNS | 5 minutes | DNS TTLs vary; 5m balances freshness vs. memory |
-| SNI | 10 minutes | Connection-specific; longer TTL safe |
+| DNS | Observed TTL capped at 5 minutes | Never extends a short TTL; zero TTL is not cached |
+| SNI | 10 minutes in cache | Tuple, capture-time and known inode/retirement checks |
 | PTR | 10 minutes | Fallback; matches existing behavior |
 
 ### Eviction
 
 - Lazy eviction on lookup (check TTL, remove if expired)
-- Background sweep every 60 seconds to bound memory
+- Lazy sweep during lookups every 60 seconds
 - Max cache size: 10,000 entries (configurable via `--pcap-cache-max`)
+- Evict entire DNS candidate groups so pruning cannot turn ambiguity into false
+  uniqueness. Emitted name samples are sorted and capped at eight, with the full
+  candidate count retained. The same held inode retains its earlier observed SNI
+  after cache expiry; known inode changes/retired tuples require fresh capture.
 
 ## DNS Parsing
 
@@ -131,7 +141,7 @@ DNS Response:
 2. For each A/AAAA record in Answer section:
    - Query name (the original hostname)
    - Resolved IP address
-3. Insert into cache: `by_ip[resolved_ip] = hostname`
+3. Preserve hostname candidates, answer TTLs and original packet capture time.
 
 ### Minimal Parsing Approach
 
@@ -175,7 +185,8 @@ TLS ClientHello (first packet of TLS handshake):
 2. Match: Content Type = 0x16, Handshake Type = 0x01
 3. Parse: Find SNI extension (type 0x0000) in extensions
 4. Extract: Hostname from SNI
-5. Insert: `by_ip_port[(dest_ip, dest_port)] = hostname`
+5. Insert by complete local/remote tuple and capture time. Older reordered
+   messages cannot replace newer evidence; equal-time conflicts stay ambiguous.
 
 ### Minimal Parsing Approach
 
@@ -211,12 +222,12 @@ Both are stored in the same cache; `IpAddr` enum handles distinction.
 ### DNS
 - **UDP port 53**: Most DNS queries (single packet)
 - **TCP port 53**: Large responses, zone transfers (uncommon for lookup)
-- Implementation: Parse UDP only initially; TCP DNS is rare for client queries
+- Implementation: UDP and complete length-prefixed TCP DNS messages are parsed
 
 ### TLS SNI
 - **TCP port 443**: Standard HTTPS
-- **TCP other ports**: Custom TLS ports (user can specify `--pcap-sni-ports`)
-- Implementation: Track TCP stream state minimally; SNI is in first packet
+- **TCP other ports**: Not selected; `--pcap-sni-ports` is not implemented
+- Implementation: Complete visible ClientHello transport payload; no stream reassembly
 
 ## Integration with Main Loop
 
@@ -238,26 +249,11 @@ if args.domain_mode == DomainMode::Pcap {
 ### Connection Detection
 
 ```rust
-fn resolve_domain(ip: IpAddr, port: u16, cache: &DomainCache, dns_cache: &DnsCache) -> (String, DomainSource) {
-    // 1. Check pcap cache (IP + port)
-    if let Some(mapping) = cache.get(ip, port) {
-        if !mapping.is_expired() {
-            return (mapping.hostname.clone(), mapping.source);
-        }
-    }
-
-    // 2. Check pcap cache (IP only, for DNS)
-    if let Some(mapping) = cache.get_ip_only(ip) {
-        if !mapping.is_expired() {
-            return (mapping.hostname.clone(), mapping.source);
-        }
-    }
-
-    // 3. Fall back to PTR
-    match reverse_dns(ip) {
-        Some(hostname) => (hostname, DomainSource::Ptr),
-        None => ("unknown".to_string(), DomainSource::Ptr),
-    }
+// Conceptual lookup; production resolve_observed_domain supplies these fields
+// from ConnKey and its observation window, preserving DNS ambiguity for PTR.
+fn connection_evidence(cache: &mut DomainCache, flow: FlowKey,
+                       inode: u64, not_before: SystemTime) -> DomainEvidence {
+    cache.lookup(flow, inode, not_before)
 }
 ```
 
@@ -266,21 +262,14 @@ fn resolve_domain(ip: IpAddr, port: u16, cache: &DomainCache, dns_cache: &DnsCac
 ```rust
 // Pcap thread sends mappings via channel
 enum PcapMsg {
-    DnsMapping { ip: IpAddr, hostname: String },
-    SniMapping { ip: IpAddr, port: u16, hostname: String },
+    DnsMapping { ip: IpAddr, hostname: String, captured_at: SystemTime,
+                 ttl_seconds: u32, offline: bool },
+    SniMapping { flow: FlowKey, hostname: String, captured_at: SystemTime,
+                 offline: bool },
 }
 
-// Main thread receives and updates cache
-fn update_domain_cache(cache: &mut DomainCache, msg: PcapMsg) {
-    match msg {
-        PcapMsg::DnsMapping { ip, hostname } => {
-            cache.insert_dns(ip, hostname);
-        }
-        PcapMsg::SniMapping { ip, port, hostname } => {
-            cache.insert_sni(ip, port, hostname);
-        }
-    }
-}
+// Main consumes messages with DomainCache::apply_msg. SQLite DomainUpdate
+// targets the original run_id/observation_id and adds no connection/event row.
 ```
 
 ## Feature Gating
@@ -323,12 +312,25 @@ fn start_pcap_capture(_args: &MonitorArgs) -> Option<PcapHandle> {
 1. **Build without pcap feature**: `--domain-mode pcap` warns and uses PTR
 2. **Insufficient privileges**: Warn and fall back to PTR
 3. **Interface not found**: Error with available interfaces list
-4. **Capture errors**: Log to stderr, continue with PTR fallback
+4. **Runtime capture errors/loss**: Typed health, stderr/file warning, PTR or
+   unresolved fallback, preserved valid socket observations and nonzero exit
+5. **Offline EOF**: Successful `complete` state; original timestamps retained
+
+Regular-file replay streams through bounded backpressure before the first socket
+poll, including `--once`; fixtures larger than the 1000-message queue retain their
+tail. Live drains are bounded per poll and idle timeouts continue capture. Final
+JSON/pretty/file summaries expose packets, rejected frames, mappings, delivery,
+drain, loss, kernel/interface drop snapshots, state and error. These counters
+describe parser messages; expired evidence can remain unresolved after draining.
+Malformed lengths and unsupported fragments cannot supply DNS/SNI, and TLS
+extraction requires a complete visible ClientHello transport payload.
 
 ## Performance Considerations
 
-1. **BPF filter**: Use `port 53 or port 443` to minimize packets processed
-2. **Minimal parsing**: Only extract what's needed (hostname + IP)
+1. **BPF filter**: DNS/TLS transport filters have separate untagged, one-VLAN
+   and two-VLAN branches; a port-only filter would hide supported tagged frames.
+2. **Minimal parsing**: Extract hostname, full tuple, capture time and DNS TTL
 3. **Bounded cache**: Prevent unbounded memory growth
 4. **Lazy eviction**: Amortize cleanup cost
-5. **Channel buffer**: Use bounded channel (1000 messages) with try_send
+5. **Channel buffer**: A bounded 1000-message channel reports live mapping loss;
+   finite offline replay retries with backpressure until consumed or stopped.

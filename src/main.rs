@@ -935,6 +935,9 @@ struct ConnInfo {
     cmdline: String,
     log_cmdline: String,
     ownership_json: String,
+    observation_id: String,
+    capture_floor: SystemTime,
+    domain_evidence: pcap_capture::DomainEvidence,
     provider: Provider,
     domain: Option<String>,
     domain_source: Option<String>,
@@ -1035,6 +1038,7 @@ struct Stats {
     sqlite_outcome: SqliteOutcome,
     log_failed: bool,
     observation_errors: u64,
+    capture_health: Option<pcap_capture::CaptureHealth>,
     per_ip: BTreeMap<IpAddr, u64>,
     per_port: BTreeMap<u16, u64>,
     per_domain: BTreeMap<String, u64>,
@@ -1042,7 +1046,7 @@ struct Stats {
     per_comm: BTreeMap<String, u64>,
     per_provider: BTreeMap<Provider, u64>,
     active_per_provider: BTreeMap<Provider, u64>,
-    per_provider_domains: BTreeMap<Provider, HashSet<String>>,
+    per_provider_domains: BTreeMap<Provider, BTreeMap<String, u64>>,
     per_provider_ips: BTreeMap<Provider, HashSet<IpAddr>>,
     duration_ms_total: u64,
     duration_ms_max: u64,
@@ -1513,11 +1517,13 @@ struct SqliteEvent {
     alert: bool,
     retry_count: Option<usize>,
     ownership_json: Option<String>,
+    observation_id: Option<String>,
 }
 
 enum SqliteMsg {
     Event(SqliteEvent),
     Poll(SessionPoll),
+    DomainUpdate(SqliteDomainUpdate),
     Shutdown {
         run_id: String,
         connects: u64,
@@ -1525,11 +1531,21 @@ enum SqliteMsg {
     },
 }
 
+struct SqliteDomainUpdate {
+    run_id: String,
+    observation_id: String,
+    domain: Option<String>,
+    domain_source: Option<String>,
+    ownership_json: String,
+    alert: bool,
+}
+
 struct SessionPoll {
     run_id: String,
     ts: String,
     active: u64,
     valid: bool,
+    domain_mode: String,
 }
 
 struct DropState {
@@ -1623,12 +1639,30 @@ struct SqliteWriter {
 }
 
 impl SqliteWriter {
-    fn publish_poll(&self, run_id: &str, active: u64, valid: bool, observed_at: SystemTime) {
+    fn correct_domain(&self, update: SqliteDomainUpdate) {
+        if let Err(error) = self.sender.try_send(SqliteMsg::DomainUpdate(update)) {
+            self.counters.metadata_lost.fetch_add(1, Ordering::Relaxed);
+            self.counters.failure(
+                format!("sqlite hostname correction publication failed: {}", error),
+                self.log_writer.as_ref(),
+            );
+        }
+    }
+
+    fn publish_poll(
+        &self,
+        run_id: &str,
+        active: u64,
+        valid: bool,
+        observed_at: SystemTime,
+        domain_mode: &str,
+    ) {
         let poll = SessionPoll {
             run_id: run_id.to_string(),
             ts: system_time_to_rfc3339(observed_at),
             active,
             valid: valid && !self.counters.failed.load(Ordering::Relaxed),
+            domain_mode: domain_mode.to_string(),
         };
         if let Err(error) = self.sender.try_send(SqliteMsg::Poll(poll)) {
             self.counters.metadata_lost.fetch_add(1, Ordering::Relaxed);
@@ -1968,7 +2002,7 @@ fn main() {
         domain_notes.push("PTR lookups disabled (--no-dns); PTR fallback disabled.".to_string());
     }
     domain_notes.append(&mut config_notes);
-    let domain_label = if domain_mode == DomainMode::Pcap {
+    let mut domain_label = if domain_mode == DomainMode::Pcap {
         "pcap"
     } else if ptr_enabled {
         "ptr"
@@ -2056,6 +2090,7 @@ fn main() {
     let mut stats_view_index: usize = 0;
     let mut reported_observation_errors = HashSet::new();
     let mut first_poll = true;
+    let mut previous_poll_started = UNIX_EPOCH;
 
     loop {
         if !RUNNING.load(Ordering::SeqCst) {
@@ -2065,8 +2100,49 @@ fn main() {
         if let (Some(handle), Some(cache)) = (pcap_handle.as_ref(), domain_cache.as_mut()) {
             handle.drain_into(cache);
         }
+        if let Some(handle) = &pcap_handle {
+            let health = handle.health();
+            if health.unhealthy()
+                && stats.capture_health.as_ref().is_none_or(|previous| {
+                    previous.mapping_lost != health.mapping_lost
+                        || previous.kernel_dropped != health.kernel_dropped
+                        || previous.interface_dropped != health.interface_dropped
+                        || previous.error != health.error
+                })
+            {
+                let message = format!(
+                    "pcap capture degraded: mapping_lost={} kernel_dropped={} interface_dropped={} error={}; falling back to {}",
+                    health.mapping_lost,
+                    health.kernel_dropped,
+                    health.interface_dropped,
+                    health.error.as_deref().unwrap_or("none"),
+                    if ptr_enabled {
+                        "PTR"
+                    } else {
+                        "unresolved hostnames"
+                    }
+                );
+                if args.json {
+                    eprintln!(
+                        "{{\"type\":\"warning\",\"message\":\"{}\"}}",
+                        escape_json(&message)
+                    );
+                } else {
+                    eprintln!("warning: {}", message);
+                }
+                if let Some(writer) = &log_writer {
+                    writer.warning(&message);
+                }
+                handle.stop_capture();
+                domain_cache = None;
+                domain_label = if ptr_enabled { "ptr" } else { "disabled" };
+            }
+            stats.capture_health = Some(health);
+        }
 
         let poll_started = SystemTime::now();
+        let capture_floor = previous_poll_started;
+        previous_poll_started = poll_started;
         let snapshot = collect_process_snapshot(&provider_matcher);
         ancestry_cache.retain_live(&snapshot);
         let excluded = excluded_processes(&args.exclude_patterns, &snapshot);
@@ -2160,24 +2236,52 @@ fn main() {
 
             seen_keys.insert(key.clone());
 
-            if !active.contains_key(&key) {
-                let (domain, domain_source) = if kind != SocketKind::Connection {
-                    (None, None)
-                } else if let Some(cache) = domain_cache.as_mut() {
-                    match cache.lookup(entry.remote_ip, entry.remote_port) {
-                        Some((host, source)) => (Some(host), Some(source.label())),
-                        None if ptr_enabled => resolve_domain(entry.remote_ip, &mut dns_cache)
-                            .map(|d| (Some(d), Some(pcap_capture::DomainSource::Ptr.label())))
-                            .unwrap_or((None, None)),
-                        _ => (None, None),
+            let mut domain_evidence = match active.get(&key) {
+                Some(info) if domain_cache.is_none() || kind != SocketKind::Connection => {
+                    info.domain_evidence.clone()
+                }
+                Some(info) => {
+                    let evidence = resolve_observed_domain(
+                        &key,
+                        domain_cache.as_mut(),
+                        &mut dns_cache,
+                        ptr_enabled,
+                        info.capture_floor,
+                    );
+                    if info.domain_evidence.source == Some(pcap_capture::DomainSource::Sni)
+                        && evidence.source != Some(pcap_capture::DomainSource::Sni)
+                        && !evidence.sni_ambiguous
+                    {
+                        // The same held inode retains its actual earlier SNI even
+                        // after that mapping's cache TTL expires.
+                        info.domain_evidence.clone()
+                    } else {
+                        evidence
                     }
-                } else if ptr_enabled {
-                    resolve_domain(entry.remote_ip, &mut dns_cache)
-                        .map(|d| (Some(d), Some(pcap_capture::DomainSource::Ptr.label())))
-                        .unwrap_or((None, None))
-                } else {
-                    (None, None)
-                };
+                }
+                None => resolve_observed_domain(
+                    &key,
+                    domain_cache.as_mut(),
+                    &mut dns_cache,
+                    ptr_enabled,
+                    capture_floor,
+                ),
+            };
+            if kind != SocketKind::Connection {
+                domain_evidence.scope = "not-applicable";
+            }
+            let domain = domain_evidence.hostname.clone();
+            let domain_source = domain_evidence
+                .source
+                .map(pcap_capture::DomainSource::label);
+            let evidence_json = format_domain_evidence_json(&domain_evidence);
+
+            if !active.contains_key(&key) {
+                let observation_id = format!(
+                    "{}:{}",
+                    run_ctx.run_id,
+                    stats.connects + stats.listens + stats.binds
+                );
                 let (ancestry, ancestry_path) = if args.show_ancestry {
                     let chain = ancestry_cache.get_or_compute(pid, &snapshot);
                     (
@@ -2198,6 +2302,8 @@ fn main() {
                     meta.provider_origin,
                     kind,
                     &entry.state,
+                    Some(&evidence_json),
+                    Some(&observation_id),
                 );
 
                 let info = ConnInfo {
@@ -2206,6 +2312,9 @@ fn main() {
                     cmdline: meta.cmdline.clone(),
                     log_cmdline: log_cmdline.clone(),
                     ownership_json: ownership_json.clone(),
+                    observation_id: observation_id.clone(),
+                    capture_floor,
+                    domain_evidence,
                     provider: meta.provider,
                     domain: domain.clone(),
                     domain_source: domain_source.map(str::to_string),
@@ -2249,11 +2358,14 @@ fn main() {
                 }
                 *stats.per_pid.entry(pid).or_insert(0) += 1;
                 *stats.per_comm.entry(meta.comm.clone()).or_insert(0) += 1;
-                stats
-                    .per_provider_domains
-                    .entry(meta.provider)
-                    .or_default()
-                    .extend(domain.iter().cloned());
+                if let Some(name) = &domain {
+                    *stats
+                        .per_provider_domains
+                        .entry(meta.provider)
+                        .or_default()
+                        .entry(name.clone())
+                        .or_default() += 1;
+                }
                 if kind == SocketKind::Connection {
                     stats
                         .per_provider_ips
@@ -2301,10 +2413,47 @@ fn main() {
                         alert: conn_alert_emitted,
                         retry_count: None,
                         ownership_json: Some(ownership_json),
+                        observation_id: Some(observation_id),
                     });
                 }
             } else if let Some(info) = active.get_mut(&key) {
                 info.last_seen = now;
+                let association_changed = info.domain != domain
+                    || info.domain_source.as_deref() != domain_source
+                    || info.domain_evidence.dns_candidates != domain_evidence.dns_candidates
+                    || info.domain_evidence.dns_candidate_count
+                        != domain_evidence.dns_candidate_count
+                    || info.domain_evidence.sni_ambiguous != domain_evidence.sni_ambiguous;
+                if association_changed {
+                    if let Some(previous) = &info.domain {
+                        if let Some(count) = stats.per_domain.get_mut(previous) {
+                            *count = count.saturating_sub(1);
+                            if *count == 0 {
+                                stats.per_domain.remove(previous);
+                            }
+                        }
+                        if let Some(names) = stats.per_provider_domains.get_mut(&info.provider) {
+                            if let Some(count) = names.get_mut(previous) {
+                                *count = count.saturating_sub(1);
+                                if *count == 0 {
+                                    names.remove(previous);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(current) = &domain {
+                        *stats.per_domain.entry(current.clone()).or_default() += 1;
+                        *stats
+                            .per_provider_domains
+                            .entry(info.provider)
+                            .or_default()
+                            .entry(current.clone())
+                            .or_default() += 1;
+                    }
+                    info.domain = domain.clone();
+                    info.domain_source = domain_source.map(str::to_string);
+                    info.domain_evidence = domain_evidence;
+                }
                 info.ownership_json = format_socket_ownership_json(
                     entry.inode,
                     identity,
@@ -2313,11 +2462,58 @@ fn main() {
                     meta.provider_origin,
                     kind,
                     &entry.state,
+                    Some(&evidence_json),
+                    Some(&info.observation_id),
                 );
                 if args.show_ancestry {
                     let chain = ancestry_cache.get_or_compute(pid, &snapshot);
                     info.ancestry = Some(format_ancestry_list(&chain));
                     info.ancestry_path = Some(ancestry_chain_to_path(&chain));
+                }
+                if association_changed {
+                    let ts = now_rfc3339();
+                    if !args.summary_only {
+                        emit_event(
+                            &ts,
+                            "domain_update",
+                            &run_ctx.run_id,
+                            &key,
+                            info.pid,
+                            &info.comm,
+                            &info.cmdline,
+                            Some(&info.log_cmdline),
+                            info.provider,
+                            info.domain.as_deref(),
+                            info.domain_source.as_deref(),
+                            info.ancestry.as_deref(),
+                            None,
+                            Some(&info.ownership_json),
+                            domain_label,
+                            args.json,
+                            style,
+                            resolved_log_format,
+                            log_writer.as_ref(),
+                        );
+                    }
+                    let alert = check_connection_alerts(
+                        &args.alert,
+                        &mut alert_state,
+                        &key,
+                        info,
+                        args.json,
+                        style,
+                        log_writer.as_ref(),
+                    );
+                    if let Some(writer) = &sqlite_writer {
+                        writer.correct_domain(SqliteDomainUpdate {
+                            run_id: run_ctx.run_id.clone(),
+                            observation_id: info.observation_id.clone(),
+                            domain: info.domain.clone(),
+                            domain_source: info.domain_source.clone(),
+                            ownership_json: info.ownership_json.clone(),
+                            alert,
+                        });
+                    }
                 }
             }
         }
@@ -2329,6 +2525,13 @@ fn main() {
             .collect();
         for key in stale_keys {
             if let Some(info) = active.remove(&key) {
+                if !active.keys().any(|other| {
+                    other.inode == key.inode && socket_flow(other) == socket_flow(&key)
+                }) {
+                    if let Some(cache) = &mut domain_cache {
+                        cache.retire_flow(socket_flow(&key), key.inode, now);
+                    }
+                }
                 let duration_ms = now
                     .duration_since(info.opened_at)
                     .map(|d| d.as_millis() as u64)
@@ -2440,6 +2643,7 @@ fn main() {
                         alert: close_alert_emitted,
                         retry_count,
                         ownership_json: Some(info.ownership_json.clone()),
+                        observation_id: Some(info.observation_id.clone()),
                     });
                 }
             }
@@ -2473,6 +2677,7 @@ fn main() {
                 stats.active,
                 stats.observation_errors == 0,
                 poll_started,
+                domain_label,
             );
         }
 
@@ -2518,7 +2723,7 @@ fn main() {
     }
 
     if let Some(handle) = pcap_handle.take() {
-        handle.shutdown();
+        stats.capture_health = Some(handle.shutdown(domain_cache.as_mut()));
     }
 
     summary(
@@ -2531,7 +2736,14 @@ fn main() {
         alert_state.alert_count,
         alert_state.suppressed_count,
     );
-    if stats.sqlite_outcome.failed || stats.log_failed || stats.observation_errors > 0 {
+    if stats.sqlite_outcome.failed
+        || stats.log_failed
+        || stats.observation_errors > 0
+        || stats
+            .capture_health
+            .as_ref()
+            .is_some_and(pcap_capture::CaptureHealth::unhealthy)
+    {
         std::process::exit(1);
     }
 }
@@ -4889,6 +5101,7 @@ fn synthesized_alert_event(ts: &str, run_id: &str, provider: Provider) -> Sqlite
         alert: true,
         retry_count: None,
         ownership_json: None,
+        observation_id: None,
     }
 }
 
@@ -5251,7 +5464,7 @@ fn summary(
         writer.write_record(
             &format_json_summary(stats, domain_mode, alert_count, suppressed_count),
             &format!(
-                "summary connects={} closes={} active={} peak_active={} sqlite_dropped={} alerts={} suppressed={} sqlite_observed={} sqlite_persisted={} sqlite_queue_lost={} sqlite_write_lost={} sqlite_metadata_lost={} sqlite_failed={} log_failed={} listens={} binds={} observation_errors={} socket_active={} socket_closes={}",
+                "summary connects={} closes={} active={} peak_active={} sqlite_dropped={} alerts={} suppressed={} sqlite_observed={} sqlite_persisted={} sqlite_queue_lost={} sqlite_write_lost={} sqlite_metadata_lost={} sqlite_failed={} log_failed={} listens={} binds={} observation_errors={} socket_active={} socket_closes={} capture_health={}",
                 stats.connects,
                 stats.closes,
                 stats.active,
@@ -5262,7 +5475,8 @@ fn summary(
                 stats.sqlite_outcome.observed, stats.sqlite_outcome.persisted,
                 stats.sqlite_outcome.queue_lost, stats.sqlite_outcome.write_lost,
                 stats.sqlite_outcome.metadata_lost,
-                stats.sqlite_outcome.failed, stats.log_failed, stats.listens, stats.binds, stats.observation_errors, stats.socket_active, stats.socket_closes
+                stats.sqlite_outcome.failed, stats.log_failed, stats.listens, stats.binds, stats.observation_errors, stats.socket_active, stats.socket_closes,
+                stats.capture_health.as_ref().map(format_capture_health_json).unwrap_or_else(|| "null".to_string())
             ),
         );
         writer.flush();
@@ -5362,6 +5576,9 @@ fn summary(
     }
     if stats.log_failed {
         println!("  file log failed");
+    }
+    if let Some(health) = &stats.capture_health {
+        println!("  pcap {}", format_capture_health_json(health));
     }
     println!(
         "  listens={} binds={} observation_errors={}",
@@ -5466,6 +5683,29 @@ fn summary(
     }
 }
 
+fn format_capture_health_json(health: &pcap_capture::CaptureHealth) -> String {
+    let mut out = format!(
+        "{{\"state\":\"{}\",\"offline\":{},\"packets\":{},\"rejected_frames\":{},\"mappings\":{},\"delivered\":{},\"drained\":{},\"mapping_lost\":{},\"kernel_dropped\":{},\"interface_dropped\":{},\"idle_polls\":{},\"unhealthy\":{}",
+        health.state,
+        health.offline,
+        health.packets,
+        health.rejected_frames,
+        health.mappings,
+        health.delivered,
+        health.drained,
+        health.mapping_lost,
+        health.kernel_dropped,
+        health.interface_dropped,
+        health.idle_polls,
+        health.unhealthy()
+    );
+    if let Some(error) = &health.error {
+        push_json_str(&mut out, "error", error, false);
+    }
+    out.push('}');
+    out
+}
+
 fn format_json_summary(
     stats: &Stats,
     domain_mode: &str,
@@ -5504,6 +5744,10 @@ fn format_json_summary(
     }
     out.push('}');
     out.push_str(&format!(",\"log_failed\":{}", stats.log_failed));
+    if let Some(health) = &stats.capture_health {
+        out.push_str(",\"pcap\":");
+        out.push_str(&format_capture_health_json(health));
+    }
     push_json_num(&mut out, "alerts", alert_count as i64, false);
     push_json_num(
         &mut out,
@@ -5875,6 +6119,12 @@ fn sqlite_writer_loop(
                 publish_session_poll(&mut conn, &poll, &counters, log_writer.as_ref());
                 last_flush = SystemTime::now();
             }
+            Ok(SqliteMsg::DomainUpdate(update)) => {
+                flush_sqlite_batch(&mut conn, &batch, &counters, log_writer.as_ref());
+                batch.clear();
+                write_domain_update(&mut conn, &update, &counters, log_writer.as_ref());
+                last_flush = SystemTime::now();
+            }
             Ok(SqliteMsg::Shutdown {
                 run_id,
                 connects,
@@ -5908,6 +6158,11 @@ fn sqlite_writer_loop(
                 batch.clear();
                 publish_session_poll(&mut conn, &poll, &counters, log_writer.as_ref());
             }
+            SqliteMsg::DomainUpdate(update) => {
+                flush_sqlite_batch(&mut conn, &batch, &counters, log_writer.as_ref());
+                batch.clear();
+                write_domain_update(&mut conn, &update, &counters, log_writer.as_ref());
+            }
             SqliteMsg::Shutdown {
                 run_id,
                 connects,
@@ -5930,6 +6185,43 @@ fn sqlite_writer_loop(
     }
 }
 
+fn write_domain_update(
+    conn: &mut Connection,
+    update: &SqliteDomainUpdate,
+    counters: &SqliteCounters,
+    log_writer: Option<&Arc<LogWriter>>,
+) {
+    let mut failure = String::new();
+    for attempt in 0..3 {
+        let result = conn.execute("UPDATE events SET domain=?1,domain_source=?2,ownership_json=?3,alert=CASE WHEN ?4 THEN 1 ELSE alert END WHERE run_id=?5 AND observation_id=?6 AND event='connect'",
+            params![update.domain.as_deref().unwrap_or("unknown"), update.domain_source, update.ownership_json,
+                update.alert, update.run_id, update.observation_id]);
+        match result {
+            Ok(1) => return,
+            Ok(count) => {
+                failure = format!(
+                    "hostname correction expected one socket observation, found {}",
+                    count
+                );
+                break;
+            }
+            Err(error) => {
+                let retryable = matches!(&error, rusqlite::Error::SqliteFailure(code, _) if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked));
+                failure = error.to_string();
+                if !retryable || attempt == 2 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(25 * (attempt + 1)));
+            }
+        }
+    }
+    counters.metadata_lost.fetch_add(1, Ordering::Relaxed);
+    counters.failure(
+        format!("sqlite hostname correction failed: {}", failure),
+        log_writer,
+    );
+}
+
 fn publish_session_poll(
     conn: &mut Connection,
     poll: &SessionPoll,
@@ -5939,12 +6231,13 @@ fn publish_session_poll(
     let mut failure = None;
     for attempt in 0..3 {
         let result = conn.execute(
-            "UPDATE sessions SET last_poll_ts=?1, active_at_poll=?2, poll_valid=?3 WHERE run_id=?4",
+            "UPDATE sessions SET last_poll_ts=?1, active_at_poll=?2, poll_valid=?3, domain_mode=?5 WHERE run_id=?4",
             params![
                 poll.ts,
                 poll.active as i64,
                 poll.valid && !counters.failed.load(Ordering::Relaxed),
-                poll.run_id
+                poll.run_id,
+                poll.domain_mode
             ],
         );
         match result {
@@ -6766,6 +7059,80 @@ fn format_ownership_json(
     )
 }
 
+fn socket_flow(key: &ConnKey) -> pcap_capture::FlowKey {
+    pcap_capture::FlowKey {
+        local_ip: key.local_ip,
+        local_port: key.local_port,
+        remote_ip: key.remote_ip,
+        remote_port: key.remote_port,
+    }
+}
+
+fn resolve_observed_domain(
+    key: &ConnKey,
+    cache: Option<&mut pcap_capture::DomainCache>,
+    dns: &mut HashMap<IpAddr, DnsCacheEntry>,
+    ptr_enabled: bool,
+    not_before: SystemTime,
+) -> pcap_capture::DomainEvidence {
+    if key.socket_kind != SocketKind::Connection {
+        return pcap_capture::DomainEvidence::default();
+    }
+    let mut evidence = cache
+        .map(|cache| cache.lookup(socket_flow(key), key.inode, not_before))
+        .unwrap_or_default();
+    if evidence.hostname.is_none() && ptr_enabled {
+        evidence.hostname = resolve_domain(key.remote_ip, dns);
+        if evidence.hostname.is_some() {
+            evidence.source = Some(pcap_capture::DomainSource::Ptr);
+            evidence.scope = "reverse-ip";
+            evidence.captured_at = None;
+            evidence.offline = false;
+        }
+    }
+    evidence
+}
+
+fn format_domain_evidence_json(evidence: &pcap_capture::DomainEvidence) -> String {
+    let mut json = String::from("{");
+    push_json_str(&mut json, "scope", evidence.scope, true);
+    push_json_str(
+        &mut json,
+        "capture_kind",
+        if evidence.captured_at.is_none() {
+            "none"
+        } else if evidence.offline {
+            "offline"
+        } else {
+            "live"
+        },
+        false,
+    );
+    if let Some(time) = evidence
+        .captured_at
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+    {
+        if let Ok(seconds) = i64::try_from(time.as_secs()) {
+            if let Ok(timestamp) = format_utc_seconds(seconds, time.subsec_nanos()) {
+                push_json_str(&mut json, "captured_at", &timestamp, false);
+            }
+        }
+    }
+    json.push_str(&format!(
+        ",\"dns_ambiguous\":{},\"sni_ambiguous\":{},\"dns_candidate_count\":{},\"dns_candidates\":[{}]}}",
+        evidence.dns_candidate_count > 1,
+        evidence.sni_ambiguous,
+        evidence.dns_candidate_count,
+        evidence
+            .dns_candidates
+            .iter()
+            .map(|name| format!("\"{}\"", escape_json(name)))
+            .collect::<Vec<_>>()
+            .join(",")
+    ));
+    json
+}
+
 fn format_socket_ownership_json(
     inode: u64,
     process: ProcessIdentity,
@@ -6774,11 +7141,22 @@ fn format_socket_ownership_json(
     provider_origin: Option<ProcessIdentity>,
     kind: SocketKind,
     state: &str,
+    domain_evidence: Option<&str>,
+    observation_id: Option<&str>,
 ) -> String {
     let mut json = format_ownership_json(inode, process, root, owners, provider_origin);
     json.pop();
     json.push_str(&format!(",\"socket_kind\":\"{}\",\"kernel_state\":\"{}\",\"direction\":\"unknown\",\"remote_present\":{}}}",
         kind.label(), escape_json(state), kind == SocketKind::Connection));
+    json.pop();
+    if let Some(evidence) = domain_evidence {
+        json.push_str(",\"domain_evidence\":");
+        json.push_str(evidence);
+    }
+    if let Some(id) = observation_id {
+        push_json_str(&mut json, "observation_id", id, false);
+    }
+    json.push('}');
     json
 }
 
@@ -9368,14 +9746,13 @@ fn query_top_domains(
 }
 
 fn build_domains_query(filter: &ReportFilter, top: usize) -> (String, Vec<String>) {
-    // Prefer the highest-confidence provenance per domain: sni > dns > ptr.
+    // A mixed group must not promote every event to its strongest source.
     let mut sql = String::from(
         "SELECT COALESCE(domain, 'unknown') as domain,
                 COUNT(*) as events,
                 provider,
-                CASE MIN(CASE COALESCE(domain_source, 'none')
-                         WHEN 'sni' THEN 1 WHEN 'dns' THEN 2 WHEN 'ptr' THEN 3 ELSE 9 END)
-                     WHEN 1 THEN 'sni' WHEN 2 THEN 'dns' WHEN 3 THEN 'ptr' END as source
+                CASE WHEN COUNT(DISTINCT CASE WHEN domain_source IN ('sni','dns','ptr') THEN domain_source ELSE 'none' END)>1 THEN 'mixed'
+                     ELSE MAX(CASE WHEN domain_source IN ('sni','dns','ptr') THEN domain_source END) END as source
          FROM events WHERE domain IS NOT NULL AND domain != ''",
     );
     let mut params: Vec<String> = Vec::new();
@@ -9394,7 +9771,7 @@ fn build_domains_query(filter: &ReportFilter, top: usize) -> (String, Vec<String
     }
 
     sql.push_str(&format!(
-        " GROUP BY domain, provider ORDER BY events DESC LIMIT {}",
+        " GROUP BY domain, provider ORDER BY events DESC, domain ASC, provider ASC LIMIT {}",
         top
     ));
     (sql, params)
@@ -9519,6 +9896,7 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
     ensure_column(conn, "events", "ip_version", "INTEGER")?;
     ensure_column(conn, "events", "retry_count", "INTEGER")?;
     ensure_column(conn, "events", "ownership_json", "TEXT")?;
+    ensure_column(conn, "events", "observation_id", "TEXT")?;
     ensure_column(conn, "sessions", "session_name", "TEXT")?;
 
     // Phase 3: indexes and views (safe now that all columns exist).
@@ -9531,6 +9909,7 @@ fn init_sqlite(conn: &mut Connection) -> rusqlite::Result<()> {
         "
         CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts);
         CREATE INDEX IF NOT EXISTS idx_events_run_id ON events(run_id);
+        CREATE INDEX IF NOT EXISTS idx_events_observation_id ON events(run_id, observation_id, event);
         CREATE INDEX IF NOT EXISTS idx_events_provider ON events(provider);
         CREATE INDEX IF NOT EXISTS idx_events_remote_ip ON events(remote_ip);
         CREATE INDEX IF NOT EXISTS idx_events_domain ON events(domain);
@@ -9674,8 +10053,8 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
     let domain = (event.key.socket_kind == SocketKind::Connection)
         .then(|| event.domain.as_deref().unwrap_or("unknown"));
     conn.execute(
-        "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, domain_source, ancestry_path, remote_is_private, ip_version, duration_ms, alert, retry_count, ownership_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
+        "INSERT INTO events (ts, run_id, event, provider, pid, comm, cmdline, proto, local_ip, local_port, remote_ip, remote_port, domain, domain_source, ancestry_path, remote_is_private, ip_version, duration_ms, alert, retry_count, ownership_json, observation_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22)",
         params![
             &event.ts,
             &event.run_id,
@@ -9698,6 +10077,7 @@ fn log_sqlite_event(conn: &mut Connection, event: &SqliteEvent) -> rusqlite::Res
             if event.alert { 1 } else { 0 },
             event.retry_count.map(|v| v as i64),
             event.ownership_json.as_deref(),
+            event.observation_id.as_deref(),
         ],
     )?;
     Ok(())
@@ -9960,6 +10340,8 @@ mod tests {
             None,
             SocketKind::BoundUdp,
             "07",
+            None,
+            None,
         );
         assert!(json.contains("\"socket_kind\":\"bound_udp\""));
         assert!(json.contains("\"remote_present\":false"));
@@ -10585,6 +10967,7 @@ mod tests {
             ts: now_rfc3339(),
             active: 7,
             valid: true,
+            domain_mode: "off".to_string(),
         };
         publish_session_poll(&mut conn, &poll, &counters, None);
         let status = get_status_data(&conn).unwrap();
@@ -10636,6 +11019,7 @@ mod tests {
                 ts: now_rfc3339(),
                 active: 1,
                 valid: true,
+                domain_mode: "off".to_string(),
             },
             &counters,
             None,
@@ -10673,8 +11057,8 @@ mod tests {
             log_writer: None,
         };
         let observed = UNIX_EPOCH + Duration::from_secs(1);
-        writer.publish_poll("test", 2, true, observed);
-        writer.publish_poll("test", 3, true, observed);
+        writer.publish_poll("test", 2, true, observed, "off");
+        writer.publish_poll("test", 3, true, observed, "off");
         let outcome = counters.outcome();
         assert_eq!(
             (
@@ -10710,6 +11094,124 @@ mod tests {
             expand_status_template("{state}|{session_name}", &data),
             "fresh|{state}:{active}"
         );
+    }
+
+    #[test]
+    fn hostname_corrections_update_one_observation_without_extra_connections() {
+        let mut conn = setup_test_db();
+        let mut first = create_test_event("2026-01-01T00:00:00Z", "connect", Provider::Anthropic);
+        first.observation_id = Some("socket-old".to_string());
+        let mut second = first.clone();
+        second.observation_id = Some("socket-new".to_string());
+        write_sqlite_batch(&mut conn, &[first, second]).unwrap();
+        let counters = SqliteCounters::default();
+        write_domain_update(
+            &mut conn,
+            &SqliteDomainUpdate {
+                run_id: "test-run".to_string(),
+                observation_id: "socket-old".to_string(),
+                domain: Some("late.test".to_string()),
+                domain_source: Some("sni".to_string()),
+                ownership_json: "{\"proof\":\"late\"}".to_string(),
+                alert: true,
+            },
+            &counters,
+            None,
+        );
+        let counts: (i64, i64, i64) = conn
+            .query_row(
+                "SELECT COUNT(*),SUM(event='connect'),SUM(provider='anthropic') FROM events",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(counts, (2, 2, 2));
+        assert!(!counters.outcome().failed);
+        let corrected: (String, String, bool) = conn
+            .query_row(
+                "SELECT domain,domain_source,alert FROM events WHERE observation_id='socket-old'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            corrected,
+            ("late.test".to_string(), "sni".to_string(), true)
+        );
+        let unaffected: String = conn
+            .query_row(
+                "SELECT domain FROM events WHERE observation_id='socket-new'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(unaffected, "test.example.com");
+    }
+
+    #[test]
+    fn hostname_correction_failure_and_missing_identity_are_visible_without_event_loss() {
+        let mut conn = setup_test_db();
+        let mut event = create_test_event("2026-01-01T00:00:00Z", "connect", Provider::Anthropic);
+        event.observation_id = Some("held".to_string());
+        write_sqlite_batch(&mut conn, &[event]).unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_hostname BEFORE UPDATE OF domain ON events BEGIN SELECT RAISE(ABORT,'forced hostname write failure'); END;").unwrap();
+        for observation_id in ["held", "missing"] {
+            let counters = SqliteCounters::default();
+            write_domain_update(
+                &mut conn,
+                &SqliteDomainUpdate {
+                    run_id: "test-run".to_string(),
+                    observation_id: observation_id.to_string(),
+                    domain: Some("late.test".to_string()),
+                    domain_source: Some("sni".to_string()),
+                    ownership_json: "{}".to_string(),
+                    alert: false,
+                },
+                &counters,
+                None,
+            );
+            let outcome = counters.outcome();
+            assert!(outcome.failed);
+            assert_eq!(
+                (
+                    outcome.observed,
+                    outcome.persisted,
+                    outcome.queue_lost,
+                    outcome.write_lost,
+                    outcome.metadata_lost
+                ),
+                (0, 0, 0, 0, 1)
+            );
+            assert!(outcome.error.is_some());
+        }
+        assert_eq!(
+            conn.query_row(
+                "SELECT COUNT(*) FROM events WHERE domain='test.example.com'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn report_mixed_sources_never_promote_weaker_observations_to_sni() {
+        let mut conn = setup_test_db();
+        let mut first = create_test_event("2026-01-01T00:00:00Z", "connect", Provider::Anthropic);
+        first.domain_source = Some("sni".to_string());
+        let mut second = first.clone();
+        second.domain_source = Some("dns".to_string());
+        write_sqlite_batch(&mut conn, &[first, second]).unwrap();
+        let filter = ReportFilter {
+            run_id: Some("test-run".to_string()),
+            since: None,
+            until: None,
+        };
+        let domains = query_top_domains(&conn, &filter, 10).unwrap();
+        assert_eq!(domains.len(), 1);
+        assert_eq!(domains[0].source.as_deref(), Some("mixed"));
+        assert_eq!(domains[0].events, 2);
     }
 
     // Batching unit tests
@@ -10749,6 +11251,7 @@ mod tests {
             alert: false,
             retry_count: None,
             ownership_json: None,
+            observation_id: None,
         }
     }
 
@@ -11422,6 +11925,9 @@ mod tests {
             cmdline: "claude".to_string(),
             log_cmdline: "claude".to_string(),
             ownership_json: String::new(),
+            observation_id: "test-observation".to_string(),
+            capture_floor: UNIX_EPOCH,
+            domain_evidence: pcap_capture::DomainEvidence::default(),
             provider: Provider::Anthropic,
             domain: Some("evil.malicious.com".to_string()),
             domain_source: Some("dns".to_string()),
@@ -11509,6 +12015,7 @@ mod tests {
             sqlite_outcome: SqliteOutcome::default(),
             log_failed: false,
             observation_errors: 0,
+            capture_health: None,
             per_ip: BTreeMap::new(),
             per_port: BTreeMap::new(),
             per_domain: BTreeMap::new(),
@@ -13805,11 +14312,24 @@ mod tests {
             cache.apply_msg(pcap_capture::PcapMsg::DnsMapping {
                 ip,
                 hostname: format!("host{i}.example.com"),
+                captured_at: SystemTime::now(),
+                ttl_seconds: 300,
+                offline: false,
             });
         }
         assert!(
             cache
-                .lookup(std::net::IpAddr::V4(std::net::Ipv4Addr::from_bits(149)), 0)
+                .lookup(
+                    pcap_capture::FlowKey {
+                        local_ip: "127.0.0.1".parse().unwrap(),
+                        local_port: 12345,
+                        remote_ip: std::net::IpAddr::V4(std::net::Ipv4Addr::from_bits(149)),
+                        remote_port: 0
+                    },
+                    1,
+                    UNIX_EPOCH
+                )
+                .hostname
                 .is_some(),
             "newest entry survives pruning"
         );

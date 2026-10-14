@@ -28,8 +28,7 @@ trap cleanup EXIT
 # Ensure binary is built before test
 RANO_BIN="${RANO_BIN:-${E2E_RANO_RELEASE}}"
 if [ ! -x "${RANO_BIN}" ]; then
-  e2e_section "Building rano"
-  cargo build --release --quiet
+  e2e_fail "Compiled rano binary not found: ${RANO_BIN}"
 fi
 
 SQLITE_PATH="${TMP_DIR}/batch-test.sqlite"
@@ -44,12 +43,14 @@ CONNECTION_COUNT=50
 BATCH_SIZE=10
 FLUSH_MS=100
 QUEUE_MAX=1000
+BATCH_MARKER="rano-batch-${TMP_DIR##*/}"
 
 e2e_section "Test Configuration"
 e2e_info "connection_count=${CONNECTION_COUNT}"
 e2e_info "db_batch_size=${BATCH_SIZE}"
 e2e_info "db_flush_ms=${FLUSH_MS}"
 e2e_info "db_queue_max=${QUEUE_MAX}"
+e2e_info "fixture_marker=${BATCH_MARKER}"
 
 # =============================================================================
 # Start a test server that accepts connections
@@ -129,9 +130,10 @@ e2e_info "server_port=${SERVER_PORT}"
 e2e_section "Starting rano observer"
 
 # Use small batch size and fast flush to exercise batching
-HOME="${TMP_DIR}/home" XDG_CONFIG_HOME="${TMP_DIR}/xdg" \
+XDG_CONFIG_HOME="${TMP_DIR}/xdg" \
 "${RANO_BIN}" \
-  --pattern batchtest \
+  --no-config \
+  --pattern "${BATCH_MARKER}" \
   --no-descendants \
   --interval-ms 50 \
   --sqlite "${SQLITE_PATH}" \
@@ -156,7 +158,7 @@ sleep 0.5
 e2e_section "Creating ${CONNECTION_COUNT} connections"
 
 CLIENT_LOG="${TMP_DIR}/client.log"
-python3 - "${SERVER_PORT}" "${CONNECTION_COUNT}" batchtest "${TMP_DIR}/close-clients" > "${CLIENT_LOG}" 2>&1 <<'PY' &
+python3 - "${SERVER_PORT}" "${CONNECTION_COUNT}" "${BATCH_MARKER}" "${TMP_DIR}/close-clients" > "${CLIENT_LOG}" 2>&1 <<'PY' &
 import socket
 import sys
 import time
@@ -164,7 +166,7 @@ from pathlib import Path
 
 port = int(sys.argv[1])
 count = int(sys.argv[2])
-# argv[3] is "batchtest" which helps rano pattern match this process
+# argv[3] is this run's unique marker so concurrent fixtures stay separate.
 
 connections = []
 errors = 0

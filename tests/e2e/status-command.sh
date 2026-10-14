@@ -314,6 +314,14 @@ sys.stdin.read(1)
 holder=subprocess.Popen([sys.executable,'-u','-c',code,'claude'],stdin=subprocess.PIPE,stdout=subprocess.PIPE,text=True)
 ready=json.loads(holder.stdout.readline());monitor=None;stdout=open(root/'monitor.jsonl','w');stderr=open(root/'monitor.stderr','w')
 name='held-{state}:{active}'
+with sqlite3.connect(pathlib.Path(sys.argv[2])/'test-status.sqlite') as source:
+    definitions=[row[0] for row in source.execute("SELECT sql FROM sqlite_master WHERE type IN ('table','index') AND sql IS NOT NULL AND name NOT LIKE 'sqlite_%' ORDER BY type DESC,name")]
+with sqlite3.connect(database) as conn:
+    # Existing large history is seeded before the live observer starts. Prompt
+    # reads still run alongside its actual poll publications below.
+    conn.executescript(';'.join(definitions)+';')
+    conn.execute("INSERT INTO sessions(run_id,start_ts,end_ts,session_name) VALUES('history-100k','2020-01-01T00:00:00Z','2020-01-01T01:00:00Z','historical')")
+    conn.executemany("INSERT INTO events(ts,run_id,event,provider) VALUES('2020-01-01T00:00:00Z','history-100k','connect','unknown')",[() for _ in range(100000)])
 def status(label):
     result=subprocess.run([binary,'status','--sqlite',str(database),'--format','{active}|{total}|{anthropic}|{session_name}|{state}'],capture_output=True,text=True,timeout=10)
     (root/f'{label}.stdout').write_text(result.stdout);(root/f'{label}.stderr').write_text(result.stderr)
@@ -332,11 +340,6 @@ try:
     monitor=subprocess.Popen([binary,'--no-config','--pid',str(ready['pid']),'--no-descendants','--no-dns','--no-banner','--json',
         '--interval-ms','50','--sqlite',str(database),'--session-name',name],stdout=stdout,stderr=stderr)
     expected=['2','2','2',name,'fresh'];await_state(expected,'fresh')
-    # Seeded history is explicit; the two current endpoints above are real.
-    with sqlite3.connect(database,timeout=10) as conn:
-        conn.execute("INSERT INTO sessions(run_id,start_ts,end_ts,session_name) VALUES('history-100k','2020-01-01T00:00:00Z','2020-01-01T01:00:00Z','historical')")
-        conn.executemany("INSERT INTO events(ts,run_id,event,provider) VALUES('2020-01-01T00:00:00Z','history-100k','connect','unknown')",[() for _ in range(100000)])
-    await_state(expected,'after-history-seed')
     with sqlite3.connect(database) as conn:before_poll=conn.execute("SELECT last_poll_ts FROM sessions WHERE run_id!='history-100k'").fetchone()[0]
     latencies=[]
     for index in range(25):
@@ -364,6 +367,27 @@ try:
     summary=next(row['summary'] for row in map(json.loads,(root/'monitor.jsonl').read_text().splitlines()) if 'summary' in row)
     assert summary['sqlite']['persisted']==summary['sqlite']['observed']==2 and not summary['sqlite']['failed'],'durable summary unhealthy'
     print('PASS live fresh2 -> stopped stale0 -> resumed fresh2 -> finalized ended0; history2 and physical sockets retained',flush=True)
+
+    # Keep the pressure case explicit instead of depending on how long100k
+    # inserts happen to hold a write lock on this host.
+    database=root/'metadata-busy.sqlite';name='metadata-busy';stdout=open(root/'metadata-busy.jsonl','w');stderr=open(root/'metadata-busy.stderr','w')
+    monitor=subprocess.Popen([binary,'--no-config','--pid',str(ready['pid']),'--no-descendants','--no-dns','--no-banner','--json','--interval-ms','50','--sqlite',str(database),'--session-name',name],stdout=stdout,stderr=stderr)
+    await_state(['2','2','2',name,'fresh'],'before-write-lock')
+    lock=sqlite3.connect(database,timeout=5);lock.execute('BEGIN IMMEDIATE')
+    try:
+        deadline=time.monotonic()+20
+        while time.monotonic()<deadline:
+            assert monitor.poll() is None,'observer exited before pressure accounting'
+            if 'sqlite poll-state write failed' in (root/'metadata-busy.stderr').read_text():break
+            time.sleep(.05)
+        else:raise AssertionError('persistent writer lock did not produce the declared metadata failure')
+    finally:lock.rollback();lock.close()
+    await_state(['0','2','2',name,'degraded'],'after-write-lock')
+    monitor.send_signal(signal.SIGTERM);assert monitor.wait(timeout=15)==1,'lost poll publication returned success'
+    stdout.close();stderr.close()
+    summary=next(row['summary'] for row in map(json.loads,(root/'metadata-busy.jsonl').read_text().splitlines()) if 'summary' in row)
+    outcome=summary['sqlite'];assert outcome['observed']==outcome['persisted']==2 and outcome['queue_lost']==outcome['write_lost']==0 and outcome['metadata_lost']>=1 and outcome['failed'],'metadata failure changed or hid event loss'
+    print('PASS real persistent write lock: degraded0 current activity, preserved2 durable observations, explicit metadata loss and nonzero exit',flush=True)
 finally:
     if monitor is not None and monitor.poll() is None:
         monitor.send_signal(signal.SIGCONT);monitor.send_signal(signal.SIGTERM)
