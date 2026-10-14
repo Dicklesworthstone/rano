@@ -15,8 +15,14 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::ffi::CStr;
 use std::fs::{self, OpenOptions};
-use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+#[cfg(not(target_os = "macos"))]
+use std::io::Read;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::net::IpAddr;
+#[cfg(any(test, not(target_os = "macos")))]
+use std::net::Ipv4Addr;
+#[cfg(not(target_os = "macos"))]
+use std::net::Ipv6Addr;
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -2167,10 +2173,15 @@ fn check_monitor_backend(
     proc_root: &Path,
     include_udp: bool,
 ) -> Result<(), String> {
-    if platform != "linux" {
-        return Err(format!(
-            "Native monitoring requires Linux /proc; platform '{platform}' has no observation backend. Use Linux, WSL2 or a Linux VM. History and configuration commands do not require this backend."
-        ));
+    match platform {
+        "linux" => {}
+        #[cfg(target_os = "macos")]
+        "macos" => return darwin_backend::check_backend(),
+        _ => {
+            return Err(format!(
+                "Native monitoring requires Linux /proc or macOS libproc; platform '{platform}' has no observation backend. Use Linux, macOS, WSL2 or a Linux VM. History and configuration commands do not require this backend."
+            ));
+        }
     }
     let unavailable = |path: &Path, detail: String| {
         format!(
@@ -2479,17 +2490,18 @@ fn main() {
         let roots = find_root_pids(&args.patterns, &excluded, &args.pids, &snapshot);
         let monitored_roots = monitored_roots(&roots, args.no_descendants, &snapshot, &excluded);
         let targets: HashSet<_> = monitored_roots.keys().copied().collect();
-        let InodeScan {
+        let SocketScan {
             owners: inode_owners,
             errors: inode_errors,
-        } = map_inodes(&targets, &snapshot);
+            entries,
+        } = scan_sockets(&targets, &snapshot, args.include_udp);
         let mut unobservable: HashSet<_> = inode_errors.iter().map(|(pid, _)| *pid).collect();
         let mut observation_errors: Vec<_> =
             inode_errors.into_iter().map(|(_, error)| error).collect();
         for pid in &args.pids {
             if !snapshot.stat.contains_key(pid)
                 && !excluded.contains(pid)
-                && (first_poll || Path::new(&format!("/proc/{}", pid)).exists())
+                && (first_poll || process_exists(*pid))
             {
                 unobservable.insert(*pid);
                 observation_errors.push(format!("cannot observe requested PID {}: process absent, unreadable or changed during poll", pid));
@@ -2499,7 +2511,7 @@ fn main() {
 
         let mut seen_keys = preserve_unobservable_keys(active.keys(), &unobservable, &snapshot);
         let mut table_failed = false;
-        let entries = match gather_net_entries(args.include_udp) {
+        let entries = match entries {
             Ok(entries) => entries,
             Err(error) => {
                 table_failed = true;
@@ -4912,6 +4924,18 @@ fn hostname() -> String {
             return trimmed.to_string();
         }
     }
+    // macOS has no /etc/hostname.
+    let mut name = [0u8; 256];
+    // SAFETY: `name` provides `name.len()` writable bytes; gethostname NUL-terminates
+    // a name that fits.
+    if unsafe { libc::gethostname(name.as_mut_ptr().cast(), name.len()) } == 0 {
+        if let Ok(name) = CStr::from_bytes_until_nul(&name) {
+            let name = name.to_string_lossy();
+            if !name.trim().is_empty() {
+                return name.trim().to_string();
+            }
+        }
+    }
     "unknown".to_string()
 }
 
@@ -7137,11 +7161,41 @@ fn preserve_unobservable_keys<'a>(
     .collect()
 }
 
+/// One poll's socket evidence for the target processes: which processes own each
+/// socket, the TCP/UDP endpoints (an `Err` means the endpoint evidence is missing, so
+/// earlier sockets cannot be closed), and per-PID visibility failures.
+struct SocketScan {
+    owners: HashMap<u64, Vec<ProcessIdentity>>,
+    entries: Result<Vec<(Proto, NetEntry)>, String>,
+    errors: Vec<(u32, String)>,
+}
+
+#[cfg(not(target_os = "macos"))]
+fn scan_sockets(
+    targets: &HashSet<u32>,
+    snapshot: &ProcessSnapshot,
+    include_udp: bool,
+) -> SocketScan {
+    let InodeScan { owners, errors } = map_inodes(targets, snapshot);
+    SocketScan {
+        owners,
+        entries: gather_net_entries(include_udp),
+        errors,
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+fn process_exists(pid: u32) -> bool {
+    Path::new(&format!("/proc/{}", pid)).exists()
+}
+
+#[cfg(not(target_os = "macos"))]
 struct InodeScan {
     owners: HashMap<u64, Vec<ProcessIdentity>>,
     errors: Vec<(u32, String)>,
 }
 
+#[cfg(not(target_os = "macos"))]
 fn map_inodes(targets: &HashSet<u32>, snapshot: &ProcessSnapshot) -> InodeScan {
     let mut map: HashMap<u64, Vec<ProcessIdentity>> = HashMap::new();
     let mut errors = Vec::new();
@@ -7246,6 +7300,7 @@ fn canonicalize_inode_owners(map: &mut HashMap<u64, Vec<ProcessIdentity>>) {
     }
 }
 
+#[cfg(not(target_os = "macos"))]
 fn collect_process_snapshot(matcher: &ProviderMatcher) -> ProcessSnapshot {
     let mut snapshot = ProcessSnapshot::default();
     for pid in list_pids() {
@@ -7288,12 +7343,24 @@ fn snapshot_process(
     if before != after {
         return None;
     }
-    let comm = after.comm.clone();
+    Some(record_process(after, argv, matcher, snapshot))
+}
+
+/// Adds a process whose identity did not change while its arguments were read;
+/// returns its parent PID.
+fn record_process(
+    stat: ProcStat,
+    argv: Vec<String>,
+    matcher: &ProviderMatcher,
+    snapshot: &mut ProcessSnapshot,
+) -> u32 {
+    let pid = stat.identity.pid;
+    let comm = stat.comm.clone();
     let cmdline = argv.join(" ");
     let provider = provider_from_text(&comm, &cmdline, matcher);
-    let provider_origin = (provider != Provider::Unknown).then_some(after.identity);
-    let parent = after.ppid;
-    snapshot.stat.insert(pid, after);
+    let provider_origin = (provider != Provider::Unknown).then_some(stat.identity);
+    let parent = stat.ppid;
+    snapshot.stat.insert(pid, stat);
     snapshot.meta.insert(
         pid,
         PidMeta {
@@ -7304,7 +7371,7 @@ fn snapshot_process(
             provider_origin,
         },
     );
-    Some(parent)
+    parent
 }
 
 fn provider_from_text(comm: &str, cmdline: &str, matcher: &ProviderMatcher) -> Provider {
@@ -7361,6 +7428,7 @@ fn resolve_provider_meta(
     resolved
 }
 
+#[cfg(not(target_os = "macos"))]
 fn parse_socket_inode(link: &str) -> Option<u64> {
     let inode = link.strip_prefix("socket:[")?.strip_suffix(']')?;
     if !inode.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -7369,6 +7437,7 @@ fn parse_socket_inode(link: &str) -> Option<u64> {
     inode.parse().ok()
 }
 
+#[cfg(not(target_os = "macos"))]
 fn list_pids() -> Vec<u32> {
     let mut pids = Vec::new();
     if let Ok(entries) = fs::read_dir("/proc") {
@@ -7393,6 +7462,7 @@ fn decode_argv(data: &[u8]) -> Vec<String> {
         .collect()
 }
 
+#[cfg(not(target_os = "macos"))]
 fn read_argv(pid: u32) -> Option<Vec<String>> {
     let path = format!("/proc/{}/cmdline", pid);
     let mut data = Vec::new();
@@ -7404,6 +7474,7 @@ fn read_argv(pid: u32) -> Option<Vec<String>> {
     None
 }
 
+#[cfg(not(target_os = "macos"))]
 fn read_proc_stat(pid: u32) -> Option<ProcStat> {
     let path = format!("/proc/{}/stat", pid);
     let content = fs::read(path).ok()?;
@@ -7588,6 +7659,7 @@ fn format_socket_ownership_json(
     json
 }
 
+#[cfg(not(target_os = "macos"))]
 fn gather_net_entries(include_udp: bool) -> Result<Vec<(Proto, NetEntry)>, String> {
     let mut entries = Vec::new();
     entries.extend(read_net_file("/proc/net/tcp", Proto::Tcp, false)?);
@@ -7599,6 +7671,7 @@ fn gather_net_entries(include_udp: bool) -> Result<Vec<(Proto, NetEntry)>, Strin
     Ok(entries)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn read_net_file(path: &str, proto: Proto, ipv6: bool) -> Result<Vec<(Proto, NetEntry)>, String> {
     let mut result = Vec::new();
     let file =
@@ -7617,6 +7690,7 @@ fn read_net_file(path: &str, proto: Proto, ipv6: bool) -> Result<Vec<(Proto, Net
     Ok(result)
 }
 
+#[cfg(not(target_os = "macos"))]
 fn parse_net_entry(line: &str, ipv6: bool) -> Option<NetEntry> {
     let parts: Vec<_> = line.split_ascii_whitespace().collect();
     if parts.len() < 10
@@ -7637,6 +7711,7 @@ fn parse_net_entry(line: &str, ipv6: bool) -> Option<NetEntry> {
     })
 }
 
+#[cfg(not(target_os = "macos"))]
 fn parse_addr_port(s: &str, ipv6: bool) -> Option<(IpAddr, u16)> {
     let mut iter = s.split(':');
     let addr_hex = iter.next()?;
@@ -7653,6 +7728,7 @@ fn parse_addr_port(s: &str, ipv6: bool) -> Option<(IpAddr, u16)> {
     Some((ip, port))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn parse_ipv4(hex: &str) -> Option<Ipv4Addr> {
     if hex.len() != 8 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -7662,6 +7738,7 @@ fn parse_ipv4(hex: &str) -> Option<Ipv4Addr> {
     Some(Ipv4Addr::new(bytes[0], bytes[1], bytes[2], bytes[3]))
 }
 
+#[cfg(not(target_os = "macos"))]
 fn parse_ipv6(hex: &str) -> Option<Ipv6Addr> {
     if hex.len() != 32 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
@@ -7674,6 +7751,868 @@ fn parse_ipv6(hex: &str) -> Option<Ipv6Addr> {
         bytes[i * 4..i * 4 + 4].copy_from_slice(&chunk);
     }
     Some(Ipv6Addr::from(bytes))
+}
+
+// ============================================================================
+// macOS Observation Backend
+// ============================================================================
+
+#[cfg(target_os = "macos")]
+use darwin_backend::{
+    collect_process_snapshot, process_exists, read_argv, read_proc_stat, scan_sockets,
+};
+
+/// Native macOS observer (#45). Processes come from `proc_listallpids` and
+/// `sysctl(KERN_PROC_PID)`, arguments from `KERN_PROCARGS2`, and each target's
+/// TCP/UDP sockets from `proc_pidinfo(PROC_PIDLISTFDS)` plus
+/// `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`. Sockets become the same `NetEntry` rows the
+/// Linux tables produce: the kernel's opaque socket handle stands in for the inode,
+/// and TCP states use the Linux codes. Process start times are microseconds since
+/// the Unix epoch.
+#[cfg(target_os = "macos")]
+mod darwin_backend {
+    use super::{
+        NetEntry, ProcStat, ProcessIdentity, ProcessSnapshot, Proto, ProviderMatcher, SocketScan,
+        canonicalize_inode_owners, decode_argv, record_process,
+    };
+    use std::collections::{HashMap, HashSet};
+    use std::ffi::c_int;
+    use std::io;
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+    use std::os::fd::AsRawFd;
+    use std::ptr;
+
+    // libc declares proc_pidfdinfo but neither this flavor, `struct socket_fdinfo` nor
+    // `struct kinfo_proc`, so both records are decoded at their xnu offsets
+    // (`sys/proc_info.h`, `sys/sysctl.h`). `check_backend` proves the socket offsets on
+    // the running kernel before a monitor starts: a changed layout fails closed
+    // instead of reporting zero sockets.
+    const PROC_PIDFDSOCKETINFO: c_int = 3;
+    /// `struct socket_fdinfo`: a 24-byte `proc_fileinfo`, then `struct socket_info`.
+    const SOCKET_INFO: usize = 24;
+    const SOI_SO: usize = SOCKET_INFO + 136;
+    const SOI_PROTOCOL: usize = SOCKET_INFO + 156;
+    const SOI_FAMILY: usize = SOCKET_INFO + 160;
+    const SOI_KIND: usize = SOCKET_INFO + 232;
+    /// `soi_proto`: an `in_sockinfo`, or a `tcp_sockinfo` that starts with one.
+    const SOI_PROTO: usize = SOCKET_INFO + 240;
+    const INSI_FPORT: usize = SOI_PROTO;
+    const INSI_LPORT: usize = SOI_PROTO + 4;
+    const INSI_VFLAG: usize = SOI_PROTO + 24;
+    const INSI_FADDR: usize = SOI_PROTO + 32;
+    const INSI_LADDR: usize = SOI_PROTO + 48;
+    const TCPSI_STATE: usize = SOI_PROTO + 80;
+    /// Every field above lies in this prefix (`tcp_sockinfo` is 120 bytes).
+    const SOCKET_RECORD_MIN: usize = SOI_PROTO + 120;
+    /// Larger than any `socket_fdinfo` (792 bytes on macOS 14 to 27).
+    const SOCKET_RECORD_CAPACITY: usize = 2048;
+    const SOCKINFO_IN: c_int = 1;
+    const SOCKINFO_TCP: c_int = 2;
+    const INI_IPV4: u8 = 0x1;
+    const INI_IPV6: u8 = 0x2;
+    /// `struct kinfo_proc` (64-bit): `kp_proc` (`extern_proc`), then `kp_eproc` at 296.
+    const KINFO_PROC_SIZE: usize = 648;
+    const KP_START_SEC: usize = 0;
+    const KP_START_USEC: usize = 8;
+    const KP_PID: usize = 40;
+    const KP_COMM: usize = 243;
+    const KP_COMM_LEN: usize = 17;
+    const KP_PPID: usize = 296 + 264;
+
+    fn ne_i32(record: &[u8], at: usize) -> Option<i32> {
+        Some(i32::from_ne_bytes(record.get(at..at + 4)?.try_into().ok()?))
+    }
+
+    fn ne_u64(record: &[u8], at: usize) -> Option<u64> {
+        Some(u64::from_ne_bytes(record.get(at..at + 8)?.try_into().ok()?))
+    }
+
+    fn os_pid(pid: u32) -> Option<c_int> {
+        c_int::try_from(pid).ok().filter(|pid| *pid > 0)
+    }
+
+    /// Runs a libproc call that returns 0 both on failure (errno set) and for an
+    /// empty result (errno untouched).
+    fn libproc_call(call: impl FnOnce() -> c_int) -> io::Result<usize> {
+        // SAFETY: __error returns this thread's errno slot.
+        unsafe { *libc::__error() = 0 };
+        let result = call();
+        let error = io::Error::last_os_error();
+        match usize::try_from(result) {
+            Ok(bytes) if bytes > 0 || error.raw_os_error() == Some(0) => Ok(bytes),
+            _ => Err(error),
+        }
+    }
+
+    /// Every process except the kernel (PID 0), from one `sysctl(KERN_PROC_ALL)`.
+    /// A `KERN_PROC_PID` lookup walks the whole process list, so per-PID records
+    /// would make a full snapshot quadratic (about 1 s for 2,500 processes).
+    pub(super) fn process_table() -> HashMap<u32, ProcStat> {
+        let mut mib = [libc::CTL_KERN, libc::KERN_PROC, libc::KERN_PROC_ALL];
+        // The table can grow between the size query and the read.
+        for _ in 0..4 {
+            let mut size = 0;
+            // SAFETY: a null buffer only asks for the table size in bytes.
+            let status = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    3,
+                    ptr::null_mut(),
+                    &mut size,
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+            if status != 0 {
+                return HashMap::new();
+            }
+            size += size / 8 + 64 * KINFO_PROC_SIZE;
+            let mut table = vec![0u8; size];
+            // SAFETY: `table` provides `size` writable bytes, and sysctl stores the
+            // number it wrote back into `size`.
+            let status = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    3,
+                    table.as_mut_ptr().cast(),
+                    &mut size,
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+            if status != 0 {
+                if io::Error::last_os_error().raw_os_error() == Some(libc::ENOMEM) {
+                    continue;
+                }
+                return HashMap::new();
+            }
+            return table[..size]
+                .as_chunks::<KINFO_PROC_SIZE>()
+                .0
+                .iter()
+                .filter_map(|record| {
+                    let pid = u32::try_from(ne_i32(record, KP_PID)?)
+                        .ok()
+                        .filter(|pid| *pid != 0)?;
+                    Some((pid, decode_kinfo_proc(record, pid)?))
+                })
+                .collect();
+        }
+        HashMap::new()
+    }
+
+    /// Every process whose identity was the same before and after its arguments
+    /// were read, as the Linux snapshot requires per process.
+    pub(super) fn collect_process_snapshot(matcher: &ProviderMatcher) -> ProcessSnapshot {
+        let before = process_table();
+        let mut reader = ArgumentReader::new();
+        let arguments: Vec<_> = before
+            .keys()
+            .map(|pid| (*pid, reader.read(*pid).unwrap_or_default()))
+            .collect();
+        let after = process_table();
+        let mut snapshot = ProcessSnapshot::default();
+        for (pid, argv) in arguments {
+            if let Some(stat) = before
+                .get(&pid)
+                .filter(|stat| after.get(&pid) == Some(stat))
+            {
+                record_process(stat.clone(), argv, matcher, &mut snapshot);
+            }
+        }
+        snapshot
+    }
+
+    pub(super) fn process_exists(pid: u32) -> bool {
+        let Some(pid) = os_pid(pid) else {
+            return false;
+        };
+        // SAFETY: signal 0 performs only the existence and permission checks.
+        let status = unsafe { libc::kill(pid, 0) };
+        status == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+
+    pub(super) fn read_proc_stat(pid: u32) -> Option<ProcStat> {
+        let mut mib = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            os_pid(pid)?,
+        ];
+        let mut record = [0u8; KINFO_PROC_SIZE];
+        let mut size = record.len();
+        // SAFETY: `record` provides `size` writable bytes, and sysctl stores the
+        // number it wrote back into `size`.
+        let status = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                4,
+                record.as_mut_ptr().cast(),
+                &mut size,
+                ptr::null_mut(),
+                0,
+            )
+        };
+        // An absent PID succeeds with zero bytes.
+        if status != 0 || size != KINFO_PROC_SIZE {
+            return None;
+        }
+        decode_kinfo_proc(&record, pid)
+    }
+
+    fn decode_kinfo_proc(record: &[u8], pid: u32) -> Option<ProcStat> {
+        if u32::try_from(ne_i32(record, KP_PID)?).ok()? != pid {
+            return None;
+        }
+        let seconds = u64::try_from(ne_u64(record, KP_START_SEC)? as i64).ok()?;
+        let micros = u64::try_from(ne_i32(record, KP_START_USEC)?).ok()?;
+        let comm = record.get(KP_COMM..KP_COMM + KP_COMM_LEN)?;
+        let comm = &comm[..comm
+            .iter()
+            .position(|byte| *byte == 0)
+            .unwrap_or(comm.len())];
+        Some(ProcStat {
+            identity: ProcessIdentity {
+                pid,
+                start_time: seconds.checked_mul(1_000_000)?.checked_add(micros)?,
+            },
+            ppid: u32::try_from(ne_i32(record, KP_PPID)?).ok()?,
+            comm: String::from_utf8_lossy(comm).into_owned(),
+        })
+    }
+
+    pub(super) fn read_argv(pid: u32) -> Option<Vec<String>> {
+        ArgumentReader::new().read(pid)
+    }
+
+    /// Reads `KERN_PROCARGS2` with one sysctl per process into a reused buffer of
+    /// `kern.argmax` bytes, the exec limit: it holds any argument area, and the
+    /// kernel rejects larger buffers with EINVAL.
+    struct ArgumentReader {
+        buffer: Vec<u8>,
+    }
+
+    impl ArgumentReader {
+        fn new() -> Self {
+            let mut mib = [libc::CTL_KERN, libc::KERN_ARGMAX];
+            let mut argmax: c_int = 0;
+            let mut size = size_of::<c_int>();
+            // SAFETY: `argmax` provides `size` writable bytes.
+            let status = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    2,
+                    (&raw mut argmax).cast(),
+                    &mut size,
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+            let argmax = usize::try_from(argmax)
+                .ok()
+                .filter(|_| status == 0)
+                .unwrap_or(1 << 20);
+            Self {
+                buffer: vec![0; argmax],
+            }
+        }
+
+        fn read(&mut self, pid: u32) -> Option<Vec<String>> {
+            let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, os_pid(pid)?];
+            let mut size = self.buffer.len();
+            // SAFETY: `buffer` provides `size` writable bytes, and sysctl stores the
+            // number it wrote back into `size`.
+            let status = unsafe {
+                libc::sysctl(
+                    mib.as_mut_ptr(),
+                    3,
+                    self.buffer.as_mut_ptr().cast(),
+                    &mut size,
+                    ptr::null_mut(),
+                    0,
+                )
+            };
+            if status != 0 {
+                return None;
+            }
+            parse_procargs2(self.buffer.get(..size)?)
+        }
+    }
+
+    /// `KERN_PROCARGS2`: native-endian `argc`, the executable path, NUL padding, then
+    /// `argc` NUL-terminated arguments followed by the environment.
+    fn parse_procargs2(data: &[u8]) -> Option<Vec<String>> {
+        let argc = usize::try_from(ne_i32(data, 0)?).ok()?;
+        if argc == 0 {
+            return Some(Vec::new());
+        }
+        let strings = data.get(4..)?;
+        let path_end = strings.iter().position(|byte| *byte == 0)?;
+        let args_start = path_end + strings[path_end..].iter().position(|byte| *byte != 0)?;
+        let args = &strings[args_start..];
+        let mut end = 0;
+        for _ in 0..argc {
+            end += args.get(end..)?.iter().position(|byte| *byte == 0)? + 1;
+        }
+        Some(decode_argv(&args[..end]))
+    }
+
+    /// The descriptors of `pid` that are sockets.
+    fn socket_descriptors(pid: c_int) -> io::Result<Vec<i32>> {
+        let record = size_of::<libc::proc_fdinfo>();
+        // SAFETY: a null buffer only asks for the descriptor table size in bytes.
+        let estimate = libproc_call(|| unsafe {
+            libc::proc_pidinfo(pid, libc::PROC_PIDLISTFDS, 0, ptr::null_mut(), 0)
+        })?;
+        let mut capacity = estimate / record + 32;
+        loop {
+            let mut fds = vec![
+                libc::proc_fdinfo {
+                    proc_fd: 0,
+                    proc_fdtype: 0,
+                };
+                capacity
+            ];
+            let bytes = c_int::try_from(capacity * record)
+                .map_err(|_| io::Error::from(io::ErrorKind::OutOfMemory))?;
+            // SAFETY: `fds` owns `bytes` writable bytes of `proc_fdinfo` records.
+            let written = libproc_call(|| unsafe {
+                libc::proc_pidinfo(
+                    pid,
+                    libc::PROC_PIDLISTFDS,
+                    0,
+                    fds.as_mut_ptr().cast(),
+                    bytes,
+                )
+            })?;
+            let count = written / record;
+            // A full buffer may have truncated the table.
+            if count < capacity {
+                fds.truncate(count);
+                return Ok(fds
+                    .into_iter()
+                    .filter(|fd| fd.proc_fdtype == libc::PROX_FDTYPE_SOCKET as u32)
+                    .map(|fd| fd.proc_fd)
+                    .collect());
+            }
+            capacity *= 2;
+        }
+    }
+
+    /// The TCP or UDP endpoint behind socket descriptor `fd` of `pid`; `None` for other
+    /// socket families/protocols, closed TCP sockets and descriptors closed since
+    /// they were listed.
+    fn socket_entry(pid: c_int, fd: i32) -> io::Result<Option<(Proto, NetEntry)>> {
+        let mut record = [0u8; SOCKET_RECORD_CAPACITY];
+        // SAFETY: `record` provides SOCKET_RECORD_CAPACITY writable bytes.
+        let received = match libproc_call(|| unsafe {
+            libc::proc_pidfdinfo(
+                pid,
+                fd,
+                PROC_PIDFDSOCKETINFO,
+                record.as_mut_ptr().cast(),
+                SOCKET_RECORD_CAPACITY as c_int,
+            )
+        }) {
+            Ok(0) => return Ok(None),
+            Ok(received) => received,
+            // Closed, or reused by a non-socket, since the descriptor list was read.
+            Err(error) if matches!(error.raw_os_error(), Some(libc::EBADF | libc::ENOTSOCK)) => {
+                return Ok(None);
+            }
+            Err(error) => return Err(error),
+        };
+        if received < SOCKET_RECORD_MIN {
+            return Err(io::Error::other(format!(
+                "{received}-byte socket record is shorter than the {SOCKET_RECORD_MIN}-byte xnu layout"
+            )));
+        }
+        Ok(decode_socket_record(&record[..received]))
+    }
+
+    fn decode_socket_record(record: &[u8]) -> Option<(Proto, NetEntry)> {
+        let family = ne_i32(record, SOI_FAMILY)?;
+        if family != libc::AF_INET && family != libc::AF_INET6 {
+            return None;
+        }
+        let proto = match (ne_i32(record, SOI_KIND)?, ne_i32(record, SOI_PROTOCOL)?) {
+            (SOCKINFO_TCP, libc::IPPROTO_TCP) => Proto::Tcp,
+            (SOCKINFO_IN, libc::IPPROTO_UDP) => Proto::Udp,
+            _ => return None,
+        };
+        let vflag = *record.get(INSI_VFLAG)?;
+        let remote_port = network_port(ne_i32(record, INSI_FPORT)?);
+        let state = match proto {
+            Proto::Tcp => linux_tcp_state(ne_i32(record, TCPSI_STATE)?)?,
+            // /proc/net/udp reports connected UDP as ESTABLISHED and the rest as CLOSE.
+            Proto::Udp if remote_port != 0 => "01",
+            Proto::Udp => "07",
+        };
+        Some((
+            proto,
+            NetEntry {
+                local_ip: socket_address(record, INSI_LADDR, family, vflag)?,
+                local_port: network_port(ne_i32(record, INSI_LPORT)?),
+                remote_ip: socket_address(record, INSI_FADDR, family, vflag)?,
+                remote_port,
+                inode: ne_u64(record, SOI_SO)?,
+                state: state.to_string(),
+            },
+        ))
+    }
+
+    /// `in_sockinfo` keeps a port in network byte order in the low 16 bits of an int.
+    fn network_port(raw: i32) -> u16 {
+        u16::from_be(raw as u16)
+    }
+
+    /// An `in4in6_addr`/`in6_addr` union. An AF_INET6 socket carrying IPv4 traffic
+    /// (only INI_IPV4 set) is reported as IPv4-mapped IPv6, as Linux tcp6/udp6 do.
+    fn socket_address(record: &[u8], at: usize, family: c_int, vflag: u8) -> Option<IpAddr> {
+        let bytes: [u8; 16] = record.get(at..at + 16)?.try_into().ok()?;
+        let ipv4 = Ipv4Addr::new(bytes[12], bytes[13], bytes[14], bytes[15]);
+        Some(
+            if vflag & INI_IPV6 != 0 || (vflag & INI_IPV4 == 0 && family == libc::AF_INET6) {
+                IpAddr::V6(Ipv6Addr::from(bytes))
+            } else if family == libc::AF_INET6 {
+                IpAddr::V6(ipv4.to_ipv6_mapped())
+            } else {
+                IpAddr::V4(ipv4)
+            },
+        )
+    }
+
+    /// xnu `TSI_S_*` to the Linux `tcp_states.h` code used in /proc/net/tcp. A CLOSED
+    /// socket is not an endpoint (Linux lists none).
+    fn linux_tcp_state(state: c_int) -> Option<&'static str> {
+        Some(match state {
+            1 => "0A",  // LISTEN
+            2 => "02",  // SYN_SENT
+            3 => "03",  // SYN_RECEIVED
+            4 => "01",  // ESTABLISHED
+            5 => "08",  // CLOSE_WAIT
+            6 => "04",  // FIN_WAIT_1
+            7 => "0B",  // CLOSING
+            8 => "09",  // LAST_ACK
+            9 => "05",  // FIN_WAIT_2
+            10 => "06", // TIME_WAIT
+            _ => return None,
+        })
+    }
+
+    pub(super) fn scan_sockets(
+        targets: &HashSet<u32>,
+        snapshot: &ProcessSnapshot,
+        include_udp: bool,
+    ) -> SocketScan {
+        let mut owners: HashMap<u64, Vec<ProcessIdentity>> = HashMap::new();
+        let mut entries: HashMap<u64, (Proto, NetEntry)> = HashMap::new();
+        let mut errors = Vec::new();
+        // Each target's identity must match the poll snapshot before and after its
+        // descriptors are read; one process table on each side covers every target.
+        let before = if targets.is_empty() {
+            HashMap::new()
+        } else {
+            process_table()
+        };
+        let mut scanned = Vec::new();
+        for pid in targets {
+            let (Some(stat), Some(os_pid)) = (snapshot.stat.get(pid), os_pid(*pid)) else {
+                continue;
+            };
+            if before.get(pid) != Some(stat) {
+                if process_exists(*pid) {
+                    errors.push((*pid, format!("PID {} identity/topology changed or became unreadable before socket scan; poll snapshot rejected", pid)));
+                }
+                continue;
+            }
+            let descriptors = match socket_descriptors(os_pid) {
+                Ok(descriptors) => descriptors,
+                Err(error) if error.raw_os_error() == Some(libc::ESRCH) => continue,
+                Err(error) => {
+                    errors.push((
+                        *pid,
+                        format!("cannot list descriptors of PID {}: {}", pid, error),
+                    ));
+                    continue;
+                }
+            };
+            let mut process_sockets = Vec::new();
+            for fd in descriptors {
+                match socket_entry(os_pid, fd) {
+                    Ok(Some(socket)) => process_sockets.push(socket),
+                    Ok(None) => {}
+                    // The process exited; the identity check below rejects it.
+                    Err(error) if error.raw_os_error() == Some(libc::ESRCH) => {}
+                    Err(error) => errors.push((
+                        *pid,
+                        format!(
+                            "cannot inspect socket descriptor {} of PID {}: {}",
+                            fd, pid, error
+                        ),
+                    )),
+                }
+            }
+            scanned.push((*pid, stat, process_sockets));
+        }
+        let after = if scanned.is_empty() {
+            HashMap::new()
+        } else {
+            process_table()
+        };
+        for (pid, stat, process_sockets) in scanned {
+            if after.get(&pid) != Some(stat) {
+                if process_exists(pid) {
+                    errors.push((pid, format!("PID {} identity/topology changed or became unreadable during socket scan; socket ownership rejected", pid)));
+                }
+                continue;
+            }
+            for (proto, entry) in process_sockets {
+                if proto == Proto::Udp && !include_udp {
+                    continue;
+                }
+                owners.entry(entry.inode).or_default().push(stat.identity);
+                entries.entry(entry.inode).or_insert((proto, entry));
+            }
+        }
+        canonicalize_inode_owners(&mut owners);
+        let mut entries: Vec<_> = entries.into_values().collect();
+        entries.sort_unstable_by_key(|(_, entry)| entry.inode);
+        SocketScan {
+            owners,
+            entries: Ok(entries),
+            errors,
+        }
+    }
+
+    /// Proves on the running kernel, before a monitor starts, that this observer's
+    /// process record decodes (PID and parent) and that a loopback UDP socket
+    /// connected to 127.0.0.1:9 decodes with its family, kind, protocol, addresses,
+    /// ports and handle. No datagram is sent.
+    pub(super) fn check_backend() -> Result<(), String> {
+        let unavailable = |detail: String| {
+            format!(
+                "macOS libproc monitoring unavailable: {detail}. History and configuration commands do not require this backend."
+            )
+        };
+        let pid = std::process::id();
+        let own = read_proc_stat(pid).ok_or_else(|| {
+            unavailable("cannot read this observer's sysctl KERN_PROC_PID record".to_string())
+        })?;
+        // SAFETY: getppid has no preconditions.
+        let parent = unsafe { libc::getppid() };
+        if u32::try_from(parent).ok() != Some(own.ppid) {
+            return Err(unavailable(format!(
+                "process record reports parent {} but getppid() returned {}",
+                own.ppid, parent
+            )));
+        }
+        let probe = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|socket| socket.connect((Ipv4Addr::LOCALHOST, 9)).map(|()| socket))
+            .map_err(|error| {
+                unavailable(format!("cannot create the loopback probe socket: {error}"))
+            })?;
+        let local_port = probe
+            .local_addr()
+            .map_err(|error| unavailable(format!("cannot read the probe socket address: {error}")))?
+            .port();
+        let os_pid = os_pid(pid).ok_or_else(|| unavailable(format!("PID {pid} out of range")))?;
+        let fd = probe.as_raw_fd();
+        let descriptors = socket_descriptors(os_pid).map_err(|error| {
+            unavailable(format!("cannot list this observer's descriptors: {error}"))
+        })?;
+        if !descriptors.contains(&fd) {
+            return Err(unavailable(format!(
+                "the descriptor list omits probe socket {fd}"
+            )));
+        }
+        let observed = socket_entry(os_pid, fd)
+            .map_err(|error| unavailable(format!("cannot read probe socket {fd}: {error}")))?;
+        let loopback = IpAddr::V4(Ipv4Addr::LOCALHOST);
+        match &observed {
+            Some((Proto::Udp, entry))
+                if entry.local_ip == loopback
+                    && entry.local_port == local_port
+                    && entry.remote_ip == loopback
+                    && entry.remote_port == 9
+                    && entry.inode != 0
+                    && entry.state == "01" =>
+            {
+                Ok(())
+            }
+            _ => Err(unavailable(format!(
+                "probe socket 127.0.0.1:{local_port}->127.0.0.1:9 decoded as {observed:?}; this kernel's socket_fdinfo layout differs from the one rano was built for"
+            ))),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::{MonitorArgs, SocketKind, socket_kind};
+        use std::net::{SocketAddr, TcpListener, TcpStream, UdpSocket};
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        fn own_snapshot() -> (ProcessSnapshot, HashSet<u32>, ProcStat) {
+            let pid = std::process::id();
+            let stat = read_proc_stat(pid).unwrap();
+            let mut snapshot = ProcessSnapshot::default();
+            snapshot.stat.insert(pid, stat.clone());
+            (snapshot, HashSet::from([pid]), stat)
+        }
+
+        /// This process's rows touching `port`; other tests' sockets share the process.
+        fn rows_on_port(scan: &SocketScan, port: u16) -> Vec<(Proto, NetEntry)> {
+            scan.entries
+                .as_ref()
+                .unwrap()
+                .iter()
+                .filter(|(_, entry)| entry.local_port == port || entry.remote_port == port)
+                .cloned()
+                .collect()
+        }
+
+        fn endpoints(rows: &[(Proto, NetEntry)], state: &str) -> Vec<(SocketAddr, SocketAddr)> {
+            let mut endpoints: Vec<_> = rows
+                .iter()
+                .filter(|(proto, entry)| *proto == Proto::Tcp && entry.state == state)
+                .map(|(_, entry)| {
+                    (
+                        SocketAddr::new(entry.local_ip, entry.local_port),
+                        SocketAddr::new(entry.remote_ip, entry.remote_port),
+                    )
+                })
+                .collect();
+            endpoints.sort();
+            endpoints
+        }
+
+        /// Issue #45's fixture in-process: a listener, a client connected to it and
+        /// the accepted peer are one LISTEN and two ESTABLISHED endpoints owned by
+        /// this process, with the kernel's own addresses and ports.
+        #[test]
+        fn issue_45_fixture_reports_the_listener_and_both_established_endpoints() {
+            let server = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let server_addr = server.local_addr().unwrap();
+            let client = TcpStream::connect(server_addr).unwrap();
+            let (peer, client_addr) = server.accept().unwrap();
+            assert_eq!(client.local_addr().unwrap(), client_addr);
+            let (snapshot, targets, stat) = own_snapshot();
+            let scan = scan_sockets(&targets, &snapshot, true);
+            assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+            let rows = rows_on_port(&scan, server_addr.port());
+            let unspecified = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+            assert_eq!(endpoints(&rows, "0A"), [(server_addr, unspecified)]);
+            let mut established = vec![(client_addr, server_addr), (server_addr, client_addr)];
+            established.sort();
+            assert_eq!(endpoints(&rows, "01"), established);
+            assert_eq!(rows.len(), 3, "{rows:?}");
+            for (_, entry) in &rows {
+                assert_ne!(entry.inode, 0);
+                assert_eq!(scan.owners[&entry.inode], [stat.identity]);
+            }
+            let args = MonitorArgs {
+                include_listening: true,
+                ..MonitorArgs::default()
+            };
+            let mut kinds: Vec<_> = rows
+                .iter()
+                .filter_map(|(proto, entry)| socket_kind(*proto, entry, &args))
+                .map(SocketKind::event)
+                .collect();
+            kinds.sort_unstable();
+            assert_eq!(kinds, ["connect", "connect", "listen"]);
+            drop((client, peer, server));
+        }
+
+        #[test]
+        fn ipv6_and_ipv4_mapped_endpoints_keep_their_addresses() {
+            let server6 = TcpListener::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
+            let server6_addr = server6.local_addr().unwrap();
+            let client6 = TcpStream::connect(server6_addr).unwrap();
+            let (peer6, client6_addr) = server6.accept().unwrap();
+            // An AF_INET6 client of an IPv4 listener, through the IPv4-mapped address.
+            let server4 = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port4 = server4.local_addr().unwrap().port();
+            let mapped = IpAddr::V6(Ipv4Addr::LOCALHOST.to_ipv6_mapped());
+            let client_mapped = TcpStream::connect((mapped, port4)).unwrap();
+            let (peer4, _) = server4.accept().unwrap();
+            let mapped_local = client_mapped.local_addr().unwrap();
+            assert_eq!(mapped_local.ip(), mapped);
+            let (snapshot, targets, _) = own_snapshot();
+            let scan = scan_sockets(&targets, &snapshot, true);
+            assert!(scan.errors.is_empty(), "{:?}", scan.errors);
+            let rows6 = rows_on_port(&scan, server6_addr.port());
+            let unspecified6 = SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0);
+            assert_eq!(endpoints(&rows6, "0A"), [(server6_addr, unspecified6)]);
+            let mut established6 = vec![(client6_addr, server6_addr), (server6_addr, client6_addr)];
+            established6.sort();
+            assert_eq!(endpoints(&rows6, "01"), established6);
+            let rows4 = rows_on_port(&scan, port4);
+            assert!(
+                endpoints(&rows4, "01").contains(&(mapped_local, SocketAddr::new(mapped, port4))),
+                "{rows4:?}"
+            );
+            drop((client6, peer6, server6, client_mapped, peer4, server4));
+        }
+
+        #[test]
+        fn udp_sockets_use_linux_state_codes_and_follow_include_udp() {
+            let bound = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let connected = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            connected.connect((Ipv4Addr::LOCALHOST, 9)).unwrap();
+            let bound_addr = bound.local_addr().unwrap();
+            let connected_addr = connected.local_addr().unwrap();
+            let (snapshot, targets, _) = own_snapshot();
+            let scan = scan_sockets(&targets, &snapshot, true);
+            let udp = |addr: SocketAddr| {
+                scan.entries
+                    .as_ref()
+                    .unwrap()
+                    .iter()
+                    .find(|(proto, entry)| {
+                        *proto == Proto::Udp
+                            && SocketAddr::new(entry.local_ip, entry.local_port) == addr
+                    })
+                    .map(|(_, entry)| (entry.remote_ip, entry.remote_port, entry.state.clone()))
+            };
+            assert_eq!(
+                udp(bound_addr),
+                Some((IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0, "07".to_string()))
+            );
+            assert_eq!(
+                udp(connected_addr),
+                Some((IpAddr::V4(Ipv4Addr::LOCALHOST), 9, "01".to_string()))
+            );
+            let without = scan_sockets(&targets, &snapshot, false);
+            assert!(
+                !without
+                    .entries
+                    .unwrap()
+                    .iter()
+                    .any(|(proto, _)| *proto == Proto::Udp)
+            );
+            drop((bound, connected));
+        }
+
+        #[test]
+        fn socket_scan_rejects_stale_process_generation_and_topology() {
+            let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+            let port = listener.local_addr().unwrap().port();
+            let (mut snapshot, targets, actual) = own_snapshot();
+            assert_eq!(
+                rows_on_port(&scan_sockets(&targets, &snapshot, true), port).len(),
+                1
+            );
+            let mut stale_generation = actual.clone();
+            stale_generation.identity.start_time += 1;
+            let mut stale_parent = actual.clone();
+            stale_parent.ppid = stale_parent.ppid.saturating_add(1);
+            let mut stale_comm = actual;
+            stale_comm.comm.push_str("-changed");
+            for stale in [stale_generation, stale_parent, stale_comm] {
+                snapshot.stat.insert(std::process::id(), stale);
+                let rejected = scan_sockets(&targets, &snapshot, true);
+                assert!(rejected.owners.is_empty());
+                assert!(rejected.entries.unwrap().is_empty());
+                assert!(!rejected.errors.is_empty());
+            }
+            drop(listener);
+        }
+
+        #[test]
+        fn another_users_process_is_an_observation_error_not_an_empty_result() {
+            // SAFETY: geteuid has no preconditions.
+            if unsafe { libc::geteuid() } == 0 {
+                return; // root may inspect launchd's descriptors
+            }
+            let launchd = read_proc_stat(1).unwrap();
+            assert_eq!(launchd.ppid, 0);
+            let mut snapshot = ProcessSnapshot::default();
+            snapshot.stat.insert(1, launchd);
+            let scan = scan_sockets(&HashSet::from([1]), &snapshot, true);
+            assert!(scan.owners.is_empty());
+            assert_eq!(scan.errors.len(), 1);
+            assert!(
+                scan.errors[0]
+                    .1
+                    .contains("cannot list descriptors of PID 1")
+            );
+        }
+
+        #[test]
+        fn process_records_describe_the_running_process() {
+            let pid = std::process::id();
+            let stat = read_proc_stat(pid).unwrap();
+            assert_eq!(stat.identity.pid, pid);
+            // SAFETY: getppid has no preconditions.
+            assert_eq!(
+                u32::try_from(unsafe { libc::getppid() }).ok(),
+                Some(stat.ppid)
+            );
+            let exe = std::env::current_exe().unwrap();
+            let name = exe.file_name().unwrap().to_string_lossy().into_owned();
+            assert!(
+                !stat.comm.is_empty() && name.starts_with(&stat.comm),
+                "{stat:?} {name}"
+            );
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_micros();
+            let started = u128::from(stat.identity.start_time);
+            assert!(started <= now && now - started < 3_600_000_000, "{stat:?}");
+            assert_eq!(read_proc_stat(pid), Some(stat.clone()));
+            assert_eq!(
+                read_argv(pid).unwrap(),
+                std::env::args().collect::<Vec<_>>()
+            );
+            // The whole-table records equal the per-PID ones, other users' included.
+            let table = process_table();
+            assert_eq!(table.get(&pid), Some(&stat));
+            assert_eq!(table.get(&1), read_proc_stat(1).as_ref());
+            assert!(table.contains_key(&stat.ppid) && !table.contains_key(&0));
+            let snapshot = collect_process_snapshot(&ProviderMatcher::default());
+            assert_eq!(snapshot.stat.get(&pid), Some(&stat));
+            assert_eq!(
+                snapshot.meta[&pid].argv,
+                std::env::args().collect::<Vec<_>>()
+            );
+            assert!(snapshot.stat.contains_key(&1) && snapshot.stat.contains_key(&stat.ppid));
+            assert!(process_exists(pid) && process_exists(1));
+            assert!(!process_exists(0) && !process_exists(u32::MAX));
+            assert!(read_proc_stat(0).is_none() && read_proc_stat(u32::MAX).is_none());
+            check_backend().unwrap();
+        }
+
+        #[test]
+        fn session_host_names_this_mac_without_etc_hostname() {
+            assert_ne!(crate::hostname(), "unknown");
+        }
+
+        #[test]
+        fn procargs2_keeps_argument_boundaries_and_rejects_truncation() {
+            let record = |argc: i32, strings: &[u8]| {
+                let mut raw = argc.to_ne_bytes().to_vec();
+                raw.extend_from_slice(strings);
+                raw
+            };
+            let full = record(
+                3,
+                b"/usr/bin/claude\0\0\0\0\0claude\0\0--model opus\0HOME=/x\0",
+            );
+            assert_eq!(
+                parse_procargs2(&full).unwrap(),
+                ["claude", "", "--model opus"]
+            );
+            assert!(parse_procargs2(&record(0, b"")).unwrap().is_empty());
+            assert!(
+                parse_procargs2(&record(3, b"/usr/bin/claude\0\0claude\0\0--model o")).is_none()
+            );
+            assert!(parse_procargs2(&record(-1, b"/bin/x\0\0x\0")).is_none());
+            assert!(parse_procargs2(b"\x01\0").is_none());
+        }
+    }
 }
 
 // ============================================================================
@@ -11337,11 +12276,17 @@ mod tests {
 
     #[test]
     fn monitor_backend_rejects_unsupported_platforms_before_reading_proc() {
-        for platform in ["macos", "freebsd", "windows", "unknown"] {
+        // A macOS build has the libproc backend; every other build rejects "macos".
+        let platforms: &[&str] = if cfg!(target_os = "macos") {
+            &["freebsd", "windows", "unknown"]
+        } else {
+            &["macos", "freebsd", "windows", "unknown"]
+        };
+        for platform in platforms {
             let error =
                 check_monitor_backend(platform, Path::new("/nonexistent-proc"), true).unwrap_err();
             assert!(error.contains(platform));
-            assert!(error.contains("requires Linux /proc"));
+            assert!(error.contains("requires Linux /proc or macOS libproc"));
             assert!(error.contains("History and configuration commands"));
             assert!(!error.contains("NotFound"));
         }
@@ -11460,6 +12405,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn socket_row_parser_checks_addresses_states_and_inode_without_panicking() {
         let row = "0: 0100007F:3039 0200007F:01BB 01 0:0 0:0 0 1000 0 42";
         let entry = parse_net_entry(row, false).unwrap();
@@ -12351,7 +13297,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn current_status_requires_fresh_alive_identity_and_keeps_history_after_end() {
         let mut conn = setup_test_db();
         let mut ctx = RunContext::new(&MonitorArgs::default(), "off", None);
@@ -12817,8 +13763,17 @@ mod tests {
             ..MonitorArgs::default()
         };
         assert!(open_log_writer(&args, "ptr", LogFormat::Json).is_err());
+        #[cfg(target_os = "linux")]
+        let failing = OpenOptions::new().write(true).open("/dev/full").unwrap();
+        // /dev/full is Linux-only; a pipe without a reader fails every write too.
+        #[cfg(not(target_os = "linux"))]
+        let failing = {
+            let (reader, writer) = io::pipe().unwrap();
+            drop(reader);
+            fs::File::from(std::os::fd::OwnedFd::from(writer))
+        };
         let writer = LogWriter {
-            file: Mutex::new(OpenOptions::new().write(true).open("/dev/full").unwrap()),
+            file: Mutex::new(failing),
             format: LogFormat::Json,
             failed: AtomicBool::new(false),
         };
@@ -14127,6 +15082,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(target_os = "macos"))]
     fn socket_inode_requires_the_kernel_link_shape() {
         assert_eq!(parse_socket_inode("socket:[42]"), Some(42));
         assert_eq!(
@@ -14678,7 +15634,7 @@ mod tests {
     }
 
     #[test]
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn explicit_pid_snapshot_retains_real_ancestors_and_omits_unselected_children() {
         let mut child = ProcessCommand::new("sleep").arg("10").spawn().unwrap();
         let args = MonitorArgs {
