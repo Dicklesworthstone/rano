@@ -112,7 +112,7 @@ curl.write_text('#!/usr/bin/env python3\nimport json,os,sys\nopen(os.environ["CU
 capture=root/'resolution-curl.jsonl'
 run('resolution-failure',[],False,extra={'CURL_CAPTURE':str(capture)},path=str(transport)+os.pathsep+os.environ['PATH'])
 calls=list(map(json.loads,capture.read_text().splitlines()))
-assert len(calls)==2 and all('OpenAI File Downloader, XaiImageApiFetch/1.0' in call for call in calls),'resolution transport/user-agent policy wrong'
+assert len(calls)==2 and all('rano-installer (+https://github.com/Dicklesworthstone/rano)' in call for call in calls),'resolution transport/user-agent policy wrong'
 # GitHub serves the latest release as minified JSON, with quoted name/body after
 # tag_name. The tag must come from tag_name, not from the line's last quoted string.
 api=root/'api-transport';api.mkdir();api_curl=api/'curl'
@@ -170,7 +170,7 @@ git_calls=list(map(json.loads,git_capture.read_text().splitlines()))
 assert any('fetch' in call and call[-1]=='refs/heads/reviewed-branch' for call in git_calls),'selected source branch was ignored'
 assert any('rev-parse' in call and '--verify' in call and call[-1]=='FETCH_HEAD^{commit}' for call in git_calls),'source ref was not peeled to a verified commit'
 assert any('checkout' in call and call[-1]=='0123456789abcdef0123456789abcdef01234567' for call in git_calls),'resolved immutable source commit was not checked out'
-assert any('http.userAgent=OpenAI File Downloader, XaiImageApiFetch/1.0' in call for call in git_calls),'Git transport user agent missing'
+assert any('http.userAgent=rano-installer (+https://github.com/Dicklesworthstone/rano)' in call for call in git_calls),'Git transport user agent missing'
 cargo_calls=list(map(json.loads,cargo_capture.read_text().splitlines()))
 assert cargo_calls[-1]['args']==['build','--locked','--release','--message-format=json-render-diagnostics'],'source build flags changed'
 assert cargo_calls[-1]['target_dir']==str(root/'redirected target'),'Cargo target override lost'
@@ -212,7 +212,7 @@ for label,mode,installer_exit,success in [('success','success','0',True),('curl-
     assert (result.returncode==0)==success,f'{label}: exit {result.returncode}: {result.stderr}'
     downloaded=json.loads(curl_capture.read_text())
     assert 'https://raw.githubusercontent.com/audited-owner/audited-repo/feature/routing/install.sh' in downloaded['args'],'custom installer URL routing incorrect'
-    assert 'OpenAI File Downloader, XaiImageApiFetch/1.0' in downloaded['args'],'updater transport user agent missing'
+    assert any(arg.startswith('rano-updater/') and arg.endswith(' (+https://github.com/Dicklesworthstone/rano)') for arg in downloaded['args']),'updater transport user agent missing'
     if mode in ('failure','empty'):assert not capture.exists(),'installer started despite failed/empty download'
     else:
         installed=json.loads(capture.read_text())

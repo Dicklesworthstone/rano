@@ -36,7 +36,7 @@ CHECKSUM="${CHECKSUM:-}"
 CHECKSUM_URL="${CHECKSUM_URL:-}"
 ARTIFACT_URL="${ARTIFACT_URL:-}"
 NO_GUM=0
-USER_AGENT="OpenAI File Downloader, XaiImageApiFetch/1.0"
+USER_AGENT="rano-installer (+https://github.com/Dicklesworthstone/rano)"
 
 download() {
   curl -fsSL --user-agent "$USER_AGENT" --connect-timeout 10 --max-time 120 "$@"

@@ -6893,7 +6893,11 @@ fn self_update_unix(
         .args([
             "-fsSL",
             "--user-agent",
-            "OpenAI File Downloader, XaiImageApiFetch/1.0",
+            concat!(
+                "rano-updater/",
+                env!("CARGO_PKG_VERSION"),
+                " (+https://github.com/Dicklesworthstone/rano)"
+            ),
             "--url",
             &script_url,
         ])
