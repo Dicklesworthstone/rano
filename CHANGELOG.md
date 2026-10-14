@@ -3,8 +3,9 @@
 All notable changes to [rano](https://github.com/Dicklesworthstone/rano) are documented here.
 
 rano is a **network observer for AI CLI processes** (Claude Code, Codex CLI, Gemini CLI).
-It polls Linux `/proc`, maps observed sockets to PIDs, and prints observation events
-with provider tags while optionally logging the sampled history to SQLite.
+It polls Linux `/proc` or macOS libproc, maps observed sockets to PIDs, and prints
+observation events with provider tags while optionally logging the sampled history
+to SQLite.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
 This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
@@ -13,10 +14,41 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-The development source is `0.2.1`; the latest published release checked on
-2026-10-14 is [v0.2.0](https://github.com/Dicklesworthstone/rano/releases/tag/v0.2.0).
-These changes are not present in that published artifact. Independent companion
-verification and the final exact-revision qualification remain open.
+## [v0.2.1] -- 2026-10-14 (GitHub Release)
+
+### Added
+
+- **Native macOS monitoring** ([#45](https://github.com/Dicklesworthstone/rano/issues/45)).
+  The v0.2.0 Darwin binary had no observer backend. Monitoring a live PID that owned a
+  listener and two established sockets exited 0 with zero connections. 0.2.1 adds a
+  libproc backend:
+  - process records come from one `sysctl(KERN_PROC_ALL)` and arguments from
+    `KERN_PROCARGS2`;
+  - each target's TCP/UDP sockets come from `proc_pidinfo(PROC_PIDLISTFDS)` plus
+    `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`.
+
+  Events, SQLite rows and summaries take the same form as on Linux. The kernel's socket
+  handle stands in for the inode, and TCP states use the Linux codes.
+
+  Before monitoring, the backend decodes a loopback probe socket on the running kernel
+  and refuses (`backend_unavailable`) if the record layout differs. Other users'
+  processes are reported as observation errors, not as empty results.
+
+  `status` current activity, report/export/diff and the config commands run natively on
+  macOS.
+
+### Fixed
+
+- Session metadata recorded the host as `unknown` wherever `/etc/hostname` is absent and
+  `HOSTNAME` is not exported (macOS). The host now falls back to `gethostname(3)`.
+- `install.sh` read the latest release's tag from the last quoted string on the line
+  containing `"tag_name":`. GitHub serves that API response as minified JSON, so the
+  release name or body came back instead. Every default install, and `rano update`
+  without `--version`, failed with "Invalid version". The installer now extracts and
+  validates `tag_name`, falling back to the `releases/latest` redirect.
+- `install.sh` fell back to installing **v0.1.0** when it could not resolve the
+  latest release, silently delivering a six-month-old binary with only a warning.
+  The installer now fails when it cannot resolve the requested release.
 
 ### Changed
 
@@ -56,45 +88,14 @@ verification and the final exact-revision qualification remain open.
   actual Cargo executable path and portable checksum/version results, and
   propagates transport/install failures. Unsupported monitoring backends refuse
   before capture or output sinks; history/config dispatch stays available.
-- Public documentation separates Linux monitoring from Darwin packaging, corrects
-  preset/default/export contracts, and links the existing LICENSE including its
-  rider. General CI/distribution/release workflows remain disabled manually; the
-  active nonblocking perf workflow does not qualify the complete product.
-
-Installer/update and native command execution are still undergoing their
-required verification. Publishing `0.2.1`, native Darwin current-source execution,
-all-mode sustained resource limits and whole-project qualification are not
-claimed here.
-
-## [v0.2.1] -- PREPARED, NOT YET RELEASED
-
-> Historical maintenance preparation, not a published release. At `82ce51f`,
-> preparation lacked a `dsr` recipe and recorded fmt/clippy and a 197-test check.
-> Those historical checks do not qualify the later functional repairs. The
-> release requires current artifact/runtime evidence and publication through
-> the approved release authority. A Darwin build never establishes native
-> monitoring support; that backend remains Linux-only.
-
-The initial preparation was maintenance-only: an installer fix and dependency
-refresh without observer source changes at that preparation point. The current
-unreleased source has the functional changes listed above. The notes below
-preserve the original maintenance scope rather than describe today's HEAD.
-
-### Fixed
-
-- `install.sh` fell back to installing **v0.1.0** when it could not resolve the
-  latest release. Both resolution paths (the GitHub releases API, then the
-  `releases/latest` redirect) can fail on a rate limit or a transient API error,
-  and the last-resort constant had not been updated since v0.1.0 shipped in March.
-  A user hitting that path silently received a six-month-old binary with only a
-  warning. That preparation changed the fallback constant; the current
-  installer instead fails when it cannot resolve the requested release.
-
-### Changed
-
+- Public documentation describes both observer backends and their differences,
+  corrects preset/default/export contracts, and links the existing LICENSE
+  including its rider. General CI/distribution/release workflows remain disabled
+  manually; the active nonblocking perf workflow does not qualify the complete
+  product.
 - Dependencies refreshed to current within their existing semver ranges:
-  `libc` 0.2.186 → 0.2.189, `pcap` 2.4 → 2.5.0, `rusqlite` 0.40 → 0.40.2,
-  `serde` 1.0.228 → 1.0.229, `toml` 1.1.2 → 1.1.6, `tempfile` → 3.27.0.
+  `libc` 0.2.186 → 0.2.190, `pcap` 2.4 → 2.5.0, `rusqlite` 0.40 → 0.40.2,
+  `serde` 1.0.228 → 1.0.229, `toml` 1.1.2 → 1.1.8, `tempfile` → 3.27.0.
   No manifest constraint needed widening.
 - Toolchain pinned to a dated nightly (`nightly-2026-08-31`) rather than a
   floating channel, so the compiler cannot move under the repo between builds.
@@ -102,9 +103,7 @@ preserve the original maintenance scope rather than describe today's HEAD.
   `observer.sqlite` was removed from the repository and ignored; the bench harness
   in `scripts/bench.sh` was corrected.
 
-Historical gate recorded at `14de4c7c`: `cargo fmt --check` clean,
-`cargo clippy --all-targets -- -D warnings` clean, `cargo test` 197 tests with
-zero failures. This is not a current exact-revision qualification.
+Sustained all-mode resource limits remain unqualified; see `docs/perf.md`.
 
 ## [v0.2.0] -- 2026-08-25 (GitHub Release)
 

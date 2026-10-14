@@ -30,7 +30,7 @@ curl -fsSL https://raw.githubusercontent.com/Dicklesworthstone/rano/main/install
 
 **The Problem**: AI CLI tools spawn subprocesses and open sockets you can’t easily attribute back to a provider or process in real time.
 
-**The Solution**: rano polls `/proc`, maps sockets to PIDs, and prints observation events with provider tags while logging the observed history to SQLite. Connections that open and close between polls can be missed.
+**The Solution**: rano polls Linux `/proc` (or macOS libproc), maps sockets to PIDs, and prints observation events with provider tags while logging the observed history to SQLite. Connections that open and close between polls can be missed.
 
 ### Why Use rano?
 
@@ -71,7 +71,7 @@ sqlite3 observer.sqlite "select * from provider_counts;"
 ## Design Philosophy
 
 1. **Explicit attribution**: preserve observed socket owners, monitored roots and provider-match origins; a shared owner does not prove who initiated a socket.
-2. **Low overhead**: polling `/proc` avoids ptrace or intrusive hooks; workload measurements and their limits are documented below.
+2. **Low overhead**: polling `/proc` (Linux) or libproc (macOS) avoids ptrace or intrusive hooks; workload measurements and their limits are documented below.
 3. **Human-first output**: readable live output with clear provider tags and colors.
 4. **Durable observed history**: enabled SQLite logging reports persistence and loss explicitly; polling can miss sockets between observations.
 
@@ -126,22 +126,39 @@ Archive installation requires a valid SHA256 using `sha256sum` or stock macOS `s
 
 ### Platform support
 
-Native monitoring uses Linux `/proc`; there is no native macOS observer backend. The monitor checks this backend before starting capture or creating SQLite/file output. On Linux it requires readable self process identity, descriptors, network namespace and selected TCP/UDP tables. Missing or malformed procfs produces an actionable error (`backend_unavailable` in JSON diagnostics). Target-specific visibility failures during monitoring remain explicit observation errors and may coexist with valid observations of other targets.
+Native monitoring has two backends with the same events and output:
+
+- **Linux** reads `/proc`: process records, `/proc/<pid>/fd` socket links and the `/proc/net/{tcp,tcp6,udp,udp6}` tables.
+- **macOS** (since 0.2.1) reads the whole process table with `sysctl(KERN_PROC_ALL)` and arguments with `KERN_PROCARGS2`. For each target it lists socket descriptors with `proc_pidinfo(PROC_PIDLISTFDS)` and reads each socket's TCP/UDP endpoints and state with `proc_pidfdinfo(PROC_PIDFDSOCKETINFO)`.
+
+The monitor checks its backend before starting capture or creating SQLite/file output, and refuses with an actionable error (`backend_unavailable` in JSON diagnostics) if the check fails:
+
+- **Linux:** readable self process identity, descriptors, network namespace and the selected TCP/UDP tables.
+- **macOS:** its own process record, plus a loopback UDP probe socket (connected, never sent on) that must decode with the expected addresses, ports and protocol. A future kernel with a different socket record layout therefore fails closed instead of reporting zero sockets.
+
+Target-specific visibility failures during monitoring remain explicit observation errors and may coexist with valid observations of other targets. On macOS, an unprivileged observer cannot list the descriptors of other users' processes (root daemons, for example). Each such target is reported as an observation error, like an unreadable `/proc/<pid>/fd` on Linux.
 
 | Command | Linux | macOS |
 |---------|-------|-------|
-| Monitor (default command) | Requires readable Linux procfs and target visibility | Unsupported; use a Linux VM |
-| report/export/diff | SQLite history, independent of procfs | Intended for history queries; native execution qualification remains open |
-| status | Current activity requires a fresh observable Linux process; history remains available | History state only; no native current-activity backend |
-| config commands | Independent of procfs | Intended for configuration inspection; native execution qualification remains open |
+| Monitor (default command) | Requires readable Linux procfs and target visibility | libproc backend; targets must belong to the observing user (or run rano as root) |
+| report/export/diff | SQLite history, independent of procfs | SQLite history |
+| status | Current activity requires a fresh observable Linux process; history remains available | Same contract, with the macOS process record as the observer identity |
+| config commands | Independent of procfs | Same |
 
-Building or shipping a Darwin binary does not establish native monitoring support. WSL2 runs the Linux backend; targets must be visible inside that Linux environment and its network namespace.
+Backend differences in recorded fields:
+
+- The ownership JSON's `inode` field holds the kernel's opaque socket handle on macOS; there are no socket inodes there.
+- `start_time` is the process start time in clock ticks since boot on Linux, and in microseconds since the Unix epoch on macOS.
+- TCP states use the Linux codes on both platforms (`01` established, `0A` listen, ...).
+- An IPv6 socket carrying IPv4 traffic is reported as an IPv4-mapped IPv6 address, as Linux `tcp6`/`udp6` do.
+
+WSL2 runs the Linux backend; targets must be visible inside that Linux environment and its network namespace.
 
 ### Windows
 
-Windows is not supported. rano relies on Linux-only `/proc` filesystem APIs
-(`/proc/net/tcp`, `/proc/[pid]/fd`, etc.) and Unix libc functions (`getnameinfo`,
-`localtime_r`) that have no Windows equivalents. On Windows, use
+Windows is not supported. rano's observer backends use Linux `/proc` or macOS
+libproc, and Unix libc functions (`getnameinfo`, `localtime_r`) that have no
+Windows equivalents. On Windows, use
 [WSL 2](https://learn.microsoft.com/en-us/windows/wsl/) and install the Linux
 binary inside the WSL environment.
 
@@ -1203,7 +1220,7 @@ rano --pattern myprocess --once --json
                │
                ▼
 ┌──────────────────────────────┐
-│          /proc Poller         │
+│    /proc or libproc Poller    │
 │  sockets ↔ inodes ↔ PIDs      │
 └──────────────┬───────────────┘
                │
@@ -1406,8 +1423,8 @@ Logs:
 
 - **Perfect hostname attribution**: pcap relies on observed DNS/SNI; some flows still resolve via PTR or remain `unknown`.
 - **Packet-level inspection**: it’s not a packet sniffer; use tcpdump/wireshark for payloads.
-- **Windows not supported**: primary monitoring relies on `/proc` and Unix libc APIs; use WSL 2 on Windows.
-- **Native macOS monitoring unsupported**: use a Linux VM for observation; a Darwin binary is not evidence of an observer backend.
+- **Windows not supported**: monitoring relies on Linux `/proc` or macOS libproc and Unix libc APIs; use WSL 2 on Windows.
+- **macOS needs ownership for visibility**: an unprivileged observer sees the sockets of its own user's processes only; other users' targets are reported as observation errors.
 
 ---
 

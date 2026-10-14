@@ -113,6 +113,21 @@ capture=root/'resolution-curl.jsonl'
 run('resolution-failure',[],False,extra={'CURL_CAPTURE':str(capture)},path=str(transport)+os.pathsep+os.environ['PATH'])
 calls=list(map(json.loads,capture.read_text().splitlines()))
 assert len(calls)==2 and all('OpenAI File Downloader, XaiImageApiFetch/1.0' in call for call in calls),'resolution transport/user-agent policy wrong'
+# GitHub serves the latest release as minified JSON, with quoted name/body after
+# tag_name. The tag must come from tag_name, not from the line's last quoted string.
+api=root/'api-transport';api.mkdir();api_curl=api/'curl'
+api_curl.write_text('''#!/usr/bin/env python3
+import json,os,sys
+if any(arg.endswith('/releases/latest') for arg in sys.argv[1:]):
+    tag='v'+os.environ['API_VERSION']
+    print(json.dumps({'url':'https://api.github.com/repos/Dicklesworthstone/rano/releases/1','tag_name':tag,'name':'Release '+tag[1:],'body':'notes with "quotes"'},separators=(',',':')))
+    sys.exit(0)
+print('controlled unavailable asset',file=sys.stderr)
+sys.exit(22)
+''');api_curl.chmod(0o755)
+latest=run('minified-latest',['--no-gum'],False,extra={'API_VERSION':version},path=str(api)+os.pathsep+os.environ['PATH'])
+assert f'Resolved latest version: v{version}' in latest.stdout+latest.stderr,'latest tag not read from minified release JSON'
+assert 'Invalid version' not in latest.stdout+latest.stderr,'release name/body mistaken for the tag'
 baseline=os.environ.get('RANO_INSTALLER_BASELINE')
 if baseline:
     # The old installer reaches an unrequested source clone after inventing a

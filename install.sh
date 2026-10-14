@@ -123,11 +123,13 @@ resolve_version() {
   info "Resolving latest version..."
   local latest_url="https://api.github.com/repos/${OWNER}/${REPO}/releases/latest"
   local tag
-  if ! tag=$(download -H "Accept: application/vnd.github.v3+json" --url "$latest_url" | grep '"tag_name":' | sed -E 's/.*"([^"]+)".*/\1/'); then
+  # The API serves minified JSON: take the tag_name value itself, not the last
+  # quoted string on its line (the release name or body).
+  if ! tag=$(download -H "Accept: application/vnd.github.v3+json" --url "$latest_url" | grep -o '"tag_name": *"[^"]*"' | head -n 1 | sed -E 's/.*"([^"]*)"$/\1/'); then
     tag=""
   fi
 
-  if [ -n "$tag" ]; then
+  if [ -n "$tag" ] && [[ "$tag" =~ ^v[0-9] ]] && [[ "$tag" != *"/"* ]]; then
     VERSION="$tag"
     info "Resolved latest version: $VERSION"
   else
