@@ -1,136 +1,63 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# This test verifies that provider config override via rano.toml works correctly.
-# It creates a custom config that maps "probecli" pattern to "openai" provider,
-# then verifies that rano loads and reports this configuration.
-
-TMP_DIR=$(mktemp -d)
-cleanup() {
-  if [ -n "${CLIENT_PID:-}" ] && kill -0 "${CLIENT_PID}" 2>/dev/null; then
-    kill "${CLIENT_PID}" 2>/dev/null || true
-  fi
-  if [ -n "${SERVER_PID:-}" ] && kill -0 "${SERVER_PID}" 2>/dev/null; then
-    kill "${SERVER_PID}" 2>/dev/null || true
-  fi
-  rm -rf "${TMP_DIR}"
-}
-trap cleanup EXIT
-
-# Ensure binary is built before test
 RANO_BIN="${RANO_BIN:-${E2E_RANO_RELEASE}}"
-if [ ! -x "${RANO_BIN}" ]; then
-  e2e_section "Building rano"
-  cargo build --release --quiet
-fi
-
-CONFIG_PATH="${TMP_DIR}/rano.toml"
-cat <<'TOML' > "${CONFIG_PATH}"
-[providers]
-mode = "replace"
-openai = ["probecli"]
-TOML
-
-export E2E_FIXTURES="rano.toml override at ${CONFIG_PATH}"
-
-# Start a simple server
-server_port_file="${TMP_DIR}/server_port"
-python3 - <<'PY' >"${server_port_file}" 2>"${TMP_DIR}/server.err" &
-import socket
-import time
-
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-s.listen(1)
-port = s.getsockname()[1]
-print(port, flush=True)
-conn, _ = s.accept()
-time.sleep(10)  # Keep connection open long enough for rano to observe
-conn.close()
-s.close()
+[[ -x "$RANO_BIN" ]] || e2e_fail "Build the intended revision before provider override tests"
+e2e_section "Real held endpoints and exact provider override across durable sinks"
+python3 - "$RANO_BIN" "$E2E_OUTPUT_DIR" <<'PY' || e2e_fail "provider override observations or durable reconciliation failed"
+import json,os,pathlib,select,sqlite3,subprocess,sys,tempfile
+binary=str(pathlib.Path(sys.argv[1]).resolve())
+root=pathlib.Path(tempfile.mkdtemp(prefix='provider-override-',dir=sys.argv[2])).resolve()
+marker='probecli-'+root.name
+configuration=root/'rano.toml'
+configuration.write_text('[providers]\nmode = "replace"\nopenai = ["'+marker+'"]\n')
+empty_kv=root/'empty.conf';empty_kv.write_text('# isolated defaults\n')
+code=r'''
+import json,os,socket,sys
+listener=socket.socket();listener.bind(('127.0.0.1',0));listener.listen()
+client=socket.create_connection(listener.getsockname());server,_=listener.accept()
+print(json.dumps({'pid':os.getpid(),'port':listener.getsockname()[1]}),flush=True)
+sys.stdin.read(1)
+client.close();server.close();listener.close()
+'''
+env=os.environ.copy();env['XDG_CONFIG_HOME']=str(root/'xdg')
+env.pop('RANO_CONFIG_TOML',None)
+holder_error=open(root/'holder.stderr','w')
+holder=subprocess.Popen([sys.executable,'-u','-c',code,marker],stdin=subprocess.PIPE,stdout=subprocess.PIPE,stderr=holder_error,text=True)
+try:
+    assert select.select([holder.stdout],[],[],5)[0],'socket fixture never became ready'
+    ready=json.loads(holder.stdout.readline());assert ready['pid']==holder.pid and ready['port']>0,'invalid real fixture identity'
+    def validate(records,expected):
+        opens=[row for row in records if row.get('event')=='connect']
+        summaries=[row['summary'] for row in records if isinstance(row.get('summary'),dict)]
+        assert len(opens)==2 and len(summaries)==1,'empty or incomplete observations cannot prove an override'
+        assert all(row['provider']==expected and row['pid']==holder.pid for row in opens),'configured provider/owner differs from real endpoints'
+        summary=summaries[0]
+        assert summary['connects']==summary['active']==2 and summary['closes']==0 and summary['observation_errors']==0,'socket totals or observation health differ'
+        assert summary['sqlite_dropped']==0 and not summary['log_failed'],'sink failure'
+        return summary
+    for label,expected,extra in [('default','unknown',['--no-config']),('override','openai',['--config',str(empty_kv),'--config-toml',str(configuration)])]:
+        assert holder.poll() is None,'fixture exited before monitoring'
+        database=root/(label+'.sqlite');log=root/(label+'.jsonl')
+        args=[binary,'--pid',str(holder.pid),'--no-descendants','--once','--json','--no-banner','--no-dns',
+            '--sqlite',str(database),'--log-file',str(log),'--log-format','json',*extra]
+        result=subprocess.run(args,capture_output=True,text=True,env=env,timeout=20)
+        (root/(label+'.stdout')).write_text(result.stdout);(root/(label+'.stderr')).write_text(result.stderr)
+        assert result.returncode==0,result.stderr
+        records=list(map(json.loads,result.stdout.splitlines()));summary=validate(records,expected)
+        assert summary['sqlite']['observed']==summary['sqlite']['persisted']==2 and not summary['sqlite']['failed'],'enabled durable sink did not conserve two events'
+        validate(list(map(json.loads,log.read_text().splitlines())),expected)
+        with sqlite3.connect(database) as conn:
+            assert conn.execute('SELECT provider,pid,event FROM events ORDER BY id').fetchall()==[(expected,holder.pid,'connect')]*2,'SQLite override differs'
+        exported=subprocess.run([binary,'export','--sqlite',str(database),'--format','jsonl'],capture_output=True,text=True,env=env,timeout=10)
+        (root/(label+'-export.stdout')).write_text(exported.stdout);(root/(label+'-export.stderr')).write_text(exported.stderr)
+        exported_rows=list(map(json.loads,exported.stdout.splitlines()))
+        assert exported.returncode==0 and len(exported_rows)==2 and all(row['provider']==expected and row['pid']==holder.pid for row in exported_rows),'export override differs'
+    try:validate([{'summary':{'connects':0}}],'openai')
+    except AssertionError:pass
+    else:raise AssertionError('zero-observation negative control was accepted')
+    print('PASS same actual held endpoints unknown by default and openai through explicit TOML; live/file/SQLite/export exact two rows; zero-observation control rejects. Retained '+str(root),flush=True)
+finally:
+    if holder.poll() is None:holder.stdin.write('x');holder.stdin.flush();holder.wait(timeout=5)
+    holder_error.close()
 PY
-SERVER_PID=$!
-
-# Wait for server to start
-for _ in $(seq 1 50); do
-  if [ -s "${server_port_file}" ]; then
-    break
-  fi
-  sleep 0.1
-done
-
-PORT=$(cat "${server_port_file}")
-if [ -z "${PORT}" ]; then
-  e2e_fail "failed to read server port"
-fi
-
-# Start client with "probecli" in the command line (will match pattern)
-python3 - "${PORT}" probecli <<'PY' &
-import socket
-import sys
-import time
-
-port = int(sys.argv[1])
-s = socket.create_connection(("127.0.0.1", port))
-time.sleep(10)  # Keep connection open long enough for rano to observe
-s.close()
-PY
-CLIENT_PID=$!
-
-# Give client time to establish connection
-sleep 0.5
-
-e2e_section "Config"
-e2e_info "config_path=${CONFIG_PATH}"
-while IFS= read -r line; do
-  e2e_info "${line}"
-done < "${CONFIG_PATH}"
-
-e2e_section "Expectations"
-e2e_info "pattern=probecli"
-e2e_info "expected_provider=openai"
-
-# Run rano with the config override
-# Use pre-built binary for speed, override HOME/XDG to prevent loading other configs
-HOME="${TMP_DIR}/home" XDG_CONFIG_HOME="${TMP_DIR}/xdg" \
-  e2e_run "rano once with provider override" \
-  "${RANO_BIN}" \
-    --pattern probecli \
-    --no-descendants \
-    --once \
-    --json \
-    --no-dns \
-    --no-sqlite \
-    --no-banner \
-    --interval-ms 100 \
-    --config-toml "${CONFIG_PATH}"
-
-e2e_assert_last_status 0
-
-# The output should contain the configured provider
-# When connections are detected, they should be tagged with the provider from config
-# If no connections matched, check that the summary at least ran without error
-e2e_section "Actual output analysis"
-if grep -q "\"provider\":\"openai\"" "${E2E_LAST_OUTPUT_FILE}"; then
-  e2e_info "Found provider:openai - config override working"
-elif grep -q '"connects":0' "${E2E_LAST_OUTPUT_FILE}"; then
-  # No connections detected - timing issue, but config was loaded
-  # Check banner notes for config loading confirmation
-  e2e_info "No connections detected (timing), checking config was loaded..."
-  e2e_info "Test verifies config syntax is valid - connections may be timing-dependent"
-else
-  e2e_info "Unexpected output:"
-  cat "${E2E_LAST_OUTPUT_FILE}"
-fi
-
-e2e_section "Config loading verification"
-# Run rano with --help to verify it can load the config without errors
-HOME="${TMP_DIR}/home" XDG_CONFIG_HOME="${TMP_DIR}/xdg" \
-  e2e_run "rano with config (verify load)" \
-  "${RANO_BIN}" --help
-
-e2e_assert_last_status 0
-
-# Clean up background processes
-kill "${CLIENT_PID}" 2>/dev/null || true
-kill "${SERVER_PID}" 2>/dev/null || true

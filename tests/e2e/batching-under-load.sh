@@ -343,9 +343,10 @@ e2e_info "Testing with very small queue to trigger potential overflow warnings"
 TINY_QUEUE_SQLITE="${TMP_DIR}/tiny-queue.sqlite"
 
 # Start a quick rano run with tiny queue settings
-HOME="${TMP_DIR}/home" XDG_CONFIG_HOME="${TMP_DIR}/xdg" \
+XDG_CONFIG_HOME="${TMP_DIR}/xdg" \
   e2e_run "rano with tiny queue (once mode)" \
   "${RANO_BIN}" \
+    --no-config \
     --pattern nonexistent_process_pattern \
     --once \
     --sqlite "${TINY_QUEUE_SQLITE}" \
