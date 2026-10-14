@@ -41,6 +41,11 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - Session metadata recorded the host as `unknown` wherever `/etc/hostname` is absent and
   `HOSTNAME` is not exported (macOS). The host now falls back to `gethostname(3)`.
+- `install.sh` read the latest release's tag from the last quoted string on the line
+  containing `"tag_name":`. GitHub serves that API response as minified JSON, so the
+  release name or body came back instead. Every default install, and `rano update`
+  without `--version`, failed with "Invalid version". The installer now extracts and
+  validates `tag_name`, falling back to the `releases/latest` redirect.
 - `install.sh` fell back to installing **v0.1.0** when it could not resolve the
   latest release, silently delivering a six-month-old binary with only a warning.
   The installer now fails when it cannot resolve the requested release.
