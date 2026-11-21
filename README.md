@@ -12,7 +12,7 @@
 
 rano is a **network observer for AI CLI processes** that tracks observed sockets owned by Claude Code, Codex CLI, Gemini CLI, and their descendants—live in your terminal and durably in SQLite when logging is enabled.
 
-This README describes the development source. The latest published release checked on 2026-10-14 is [v0.2.0](https://github.com/Dicklesworthstone/rano/releases/tag/v0.2.0); the source version `0.2.1` is unreleased. The observation, durability, configuration and reporting repairs described here are not promises about the older release binary. Independent verification and whole-project qualification remain open; see [the dated reality check](docs/reality-check.md) for the original failures and proof requirements.
+This README describes the current `v0.2.2` release (and development source on `main`; see [GitHub Releases](https://github.com/Dicklesworthstone/rano/releases)). Independent verification and whole-project sustained resource qualification remain open; see [the dated reality check](docs/reality-check.md) for the original failures and proof requirements.
 
 <div align="center">
 

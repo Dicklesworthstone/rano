@@ -14,6 +14,41 @@ This project uses [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [v0.2.2] -- 2026-11-21 (GitHub Release)
+
+### Fixed
+
+- **Installer and self-updater HTTP identification:** replaced the generic crawler
+  `User-Agent` header in `install.sh` and `rano update` with honest project-named
+  identifiers (`rano-installer (+https://github.com/Dicklesworthstone/rano)` and
+  `rano-updater/<version> (+https://github.com/Dicklesworthstone/rano)`)
+  ([27d7eda](https://github.com/Dicklesworthstone/rano/commit/27d7edaa920fab11b4d81d40330cc0e94fa796fe)).
+
+### Security & Dependencies
+
+- Upgraded `rusqlite` `0.40.2` → `0.43.0` (pulls in SQLite bindings updates plus
+  `rusqlite` `0.43.0` use-after-free fixes in `ChangesetIter::start_strm`,
+  `Connection::column_metadata`, and `Filter::in_values`, and empty/comment-only SQL
+  rejection) ([b8a3732](https://github.com/Dicklesworthstone/rano/commit/b8a3732b94c4a8f27f96935ce5e076d164a5dfb2),
+  [48adf7a](https://github.com/Dicklesworthstone/rano/commit/48adf7a550d7c3de16f04e477ddf0dc413fec1c8)).
+- Refreshed direct and transitive lockfile dependencies with zero RustSec advisories:
+  `libc` `0.2.190` → `0.2.191`, `toml` `1.1.8` → `1.2.2+spec-1.1.0`, plus 15
+  semver-compatible transitive crates (`cc`, `equivalent`, `errno`, `find-msvc-tools`,
+  `regex`, `regex-automata`, `regex-syntax`, `rustix`, `smallvec`, `syn`, `thiserror`,
+  `thiserror-impl`, `toml_parser`, `unicode-ident`, `winnow`)
+  ([6c2c76a](https://github.com/Dicklesworthstone/rano/commit/6c2c76adaa5f69cdfff0f38a61ceffe1310b026d),
+  [b58a1a6](https://github.com/Dicklesworthstone/rano/commit/b58a1a659ec6ef48737fb40127b3c240bdca17f1)).
+- Explicitly pinned `[profile.release] opt-level = 3` in `Cargo.toml` to keep release
+  binaries performance-optimized.
+
+### Documentation & CI
+
+- Updated `AGENTS.md` HTTP request guidance
+  ([ce7dec1](https://github.com/Dicklesworthstone/rano/commit/ce7dec1f87a77e73ea368969c118c6dd3ce20c60)),
+  bumped `dtolnay/rust-toolchain` pin in CI workflow source
+  ([d3fac00](https://github.com/Dicklesworthstone/rano/commit/d3fac007a364692684031e6e1cd4c533d1e507b6)),
+  and refreshed stale `README.md` / `CHANGELOG.md` release links.
+
 ## [v0.2.1] -- 2026-10-14 (GitHub Release)
 
 ### Added
@@ -446,5 +481,8 @@ Full process-tree lineage for every connection.
 ---
 
 <!-- link definitions -->
-[Unreleased]: https://github.com/Dicklesworthstone/rano/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/Dicklesworthstone/rano/compare/v0.2.2...HEAD
+[v0.2.2]: https://github.com/Dicklesworthstone/rano/releases/tag/v0.2.2
+[v0.2.1]: https://github.com/Dicklesworthstone/rano/releases/tag/v0.2.1
+[v0.2.0]: https://github.com/Dicklesworthstone/rano/releases/tag/v0.2.0
 [v0.1.0]: https://github.com/Dicklesworthstone/rano/releases/tag/v0.1.0
